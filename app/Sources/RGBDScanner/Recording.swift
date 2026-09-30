@@ -223,8 +223,16 @@ final class Recording {
         (try? FileManager.default.contentsOfDirectory(at: workRoot, includingPropertiesForKeys: nil)) ?? []
     }
 
-    // Packs a work directory into Documents/<id>.tar with its sidecar Documents/<id>.json and removes the directory, resuming a pack that was cut short. Returns nil, removing the directory, when a stream has no frames; a failed pack leaves the directory to be packed at the next launch.
+    // Packs a work directory into Documents/<id>.tar with its sidecar Documents/<id>.json and removes the directory, resuming a pack that was cut short. Returns nil, removing the directory, when a stream has no frames; a failed pack leaves the directory to be packed at the next launch, and its error names the directory.
     static func pack(_ directory: URL, userName: String?, colorVideoError: String?, recovered: Bool) throws -> RecordingInfo? {
+        do {
+            return try packWorkDirectory(directory, userName: userName, colorVideoError: colorVideoError, recovered: recovered)
+        } catch {
+            throw RecorderError("work/\(directory.lastPathComponent): \(error.localizedDescription)")
+        }
+    }
+
+    private static func packWorkDirectory(_ directory: URL, userName: String?, colorVideoError: String?, recovered: Bool) throws -> RecordingInfo? {
         let pending = directory.appendingPathComponent("sidecar.json")
         if !FileManager.default.fileExists(atPath: pending.path) {
             guard let info = try writeMetadata(directory, userName: userName, colorVideoError: colorVideoError, recovered: recovered) else {
@@ -244,26 +252,47 @@ final class Recording {
         return info
     }
 
+    // The fields of start.json that packing relies on.
+    private struct Start: Decodable {
+        let camera: DepthCamera
+        let startTimeUtc: Date
+        let depthWidth: Int
+        let depthHeight: Int
+        let depthBytesPerPixel: Int
+    }
+
     // Writes metadata.json from start.json, calibration.json and the tables, and returns the recording's sidecar; nil when a stream has no frames.
     private static func writeMetadata(_ directory: URL, userName: String?, colorVideoError: String?, recovered: Bool) throws -> RecordingInfo? {
         let file = { (name: String) in directory.appendingPathComponent(name) }
-        var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: file("start.json"))) as! [String: Any]
-        let color = try Table(file("color.csv")), depth = try Table(file("depth.csv"))
+        let startData = try Data(contentsOf: file("start.json"))
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .iso8601
+        let start = try decoder.decode(Start.self, from: startData)
+        guard var metadata = try JSONSerialization.jsonObject(with: startData) as? [String: Any] else { throw RecorderError("start.json is not an object") }
+
+        var color = try Table(contentsOf: file("color.csv"))
+        let depth = try Table(contentsOf: file("depth.csv"))
+        // A writer that did not finish, because the app was closed or the writer failed, leaves color.mov holding only the frames up to its last fragment.
+        if recovered || colorVideoError != nil {
+            let movieFrames = try videoFrameCount(file("color.mov"))
+            guard movieFrames <= color.frames else { throw RecorderError("color.mov holds \(movieFrames) frames but color.csv only \(color.frames)") }
+            color = color.dropping(from: movieFrames, reason: recovered ? "lost_in_crash" : "lost_in_video_failure")
+            try color.text.write(to: file("color.csv"), atomically: true, encoding: .utf8)
+        }
         guard color.frames > 0, depth.frames > 0 else { return nil }
 
         // A depth map written just before the app was closed can lack its row.
-        let bytesPerFrame = (metadata["depth_width"] as! Int) * (metadata["depth_height"] as! Int) * (metadata["depth_bytes_per_pixel"] as! Int)
+        let bytesPerFrame = start.depthWidth * start.depthHeight * start.depthBytesPerPixel
         let bin = try FileHandle(forWritingTo: file("depth.bin"))
         guard try bin.seekToEnd() >= UInt64(depth.frames * bytesPerFrame) else { throw RecorderError("depth.bin holds fewer maps than depth.csv") }
         try bin.truncate(atOffset: UInt64(depth.frames * bytesPerFrame))
         try bin.close()
 
-        let startTime = ISO8601DateFormatter().date(from: metadata["start_time_utc"] as! String)!
-        let camera = DepthCamera(rawValue: metadata["camera"] as! String)!
         // An unnamed recording is named by its start date and time.
-        let info = RecordingInfo(id: id(startTime, camera, userName), name: userName ?? formatted(startTime, "yyyy-MM-dd HH:mm:ss"), namedByUser: userName != nil,
-                                 startTime: startTime, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
-                                 camera: camera, uploaded: false, colorVideoError: colorVideoError)
+        let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, userName), name: userName ?? formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss"),
+                                 namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
+                                 camera: start.camera, uploaded: false, colorVideoError: colorVideoError)
         metadata["format_version"] = 3
         metadata["id"] = info.id
         metadata["name"] = info.name
@@ -280,21 +309,25 @@ final class Recording {
         return info
     }
 
-    // The delivered frames of color.csv or depth.csv, and the first and last timestamps of all its rows.
-    private struct Table {
-        var frames = 0
-        var first = Double.infinity
-        var last = -Double.infinity
-
-        init(_ url: URL) throws {
-            for line in try String(contentsOf: url, encoding: .utf8).split(separator: "\n").dropFirst() {
-                let fields = line.split(separator: ",", maxSplits: 2, omittingEmptySubsequences: false)
-                guard fields.count == 3, let time = Double(fields[1]) else { throw RecorderError("bad row in \(url.lastPathComponent): \(line)") }
-                if fields[0] != "-1" { frames += 1 }
-                first = min(first, time)
-                last = max(last, time)
-            }
+    // The number of frames in a movie, counted from its samples without decoding them.
+    private static func videoFrameCount(_ movie: URL) throws -> Int {
+        let asset = AVURLAsset(url: movie)
+        let loaded = DispatchSemaphore(value: 0)
+        var tracks: Result<[AVAssetTrack], Error> = .failure(RecorderError("\(movie.lastPathComponent) did not load"))
+        asset.loadTracks(withMediaType: .video) { found, error in
+            tracks = found.map { .success($0) } ?? .failure(error ?? RecorderError("\(movie.lastPathComponent) has no tracks"))
+            loaded.signal()
         }
+        loaded.wait()
+        guard let track = try tracks.get().first else { throw RecorderError("\(movie.lastPathComponent) has no video track") }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? RecorderError("cannot read \(movie.lastPathComponent)") }
+        var frames = 0
+        while let sample = output.copyNextSampleBuffer() { frames += CMSampleBufferGetNumSamples(sample) }
+        guard reader.status == .completed else { throw reader.error ?? RecorderError("reading \(movie.lastPathComponent) stopped early") }
+        return frames
     }
 
     // rgbd_<start>_<camera>, then the user's name, if given, reduced to [A-Za-z0-9_-] and at most 40 characters.
