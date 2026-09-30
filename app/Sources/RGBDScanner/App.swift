@@ -43,15 +43,17 @@ struct RecordingInfo: Codable {
     let durationSeconds: Double
     let camera: DepthCamera
     var uploaded: Bool
+    // Set when the color video's writer failed; the depth stream and tables are complete regardless.
+    let colorVideoError: String?
 
     var tar: URL { Recording.documents.appendingPathComponent("\(id).tar") }
     var sidecar: URL { Recording.documents.appendingPathComponent("\(id).json") }
 
-    func save() throws {
+    func write(to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(self).write(to: sidecar, options: .atomic)
+        try encoder.encode(self).write(to: url, options: .atomic)
     }
 
     static func load(_ sidecar: URL) throws -> RecordingInfo {
@@ -75,6 +77,8 @@ final class AppModel: ObservableObject {
     @Published var camera: DepthCamera = .front
     @Published var formatSummary = ""
     @Published var stats = CaptureStats()
+    // From Start or Later until the recording is running.
+    @Published var isStarting = false
     @Published var isRecording = false
     // From Stop until the recording is packed, which waits for its name.
     @Published var isFinishing = false
@@ -100,8 +104,8 @@ final class AppModel: ObservableObject {
     private let uploader = Uploader()
     // The name given when the recording started; nil when naming was deferred.
     private var userName: String?
-    // A stopped recording waiting for its name.
-    private var unnamed: Recording?
+    // A stopped recording waiting for its name, with why it stopped when it was not the Stop button.
+    private var unnamed: (recording: Recording, stopNote: String?)?
 
     init() {
         server = UserDefaults.standard.string(forKey: "server") ?? Secrets.server
@@ -111,9 +115,22 @@ final class AppModel: ObservableObject {
             guard let self, self.showsDepth else { return }
             self.depthImage = image
         }
+        recorder.onInterruption = { [weak self] reason in self?.stopRecording(because: reason) }
         refreshFiles()
         // A recording left un-uploaded, e.g. by closing the app mid-upload, goes up now.
         files.filter { !$0.info.uploaded }.forEach { upload($0.id) }
+        recoverLeftovers()
+    }
+
+    // Packs, under their date and time, the recordings a closed app or a failed pack left unpacked.
+    private func recoverLeftovers() {
+        let directories = Recording.leftovers()
+        DispatchQueue.global(qos: .utility).async {
+            for directory in directories {
+                let result = Result { try Recording.pack(directory, userName: nil, colorVideoError: nil, recovered: true) }
+                DispatchQueue.main.async { self.packed(result, note: "Recovered an unfinished recording") }
+            }
+        }
     }
 
     func startPreview() {
@@ -133,7 +150,7 @@ final class AppModel: ObservableObject {
     }
 
     func recordTapped() {
-        if isRecording { return stopRecording() }
+        if isRecording { return stopRecording(because: nil) }
         nameDraft = ""
         asksNameBeforeStart = true
     }
@@ -141,7 +158,9 @@ final class AppModel: ObservableObject {
     // Starts recording once the start prompt is answered, by naming the recording or deferring its name.
     func startRecording(named: Bool) {
         userName = named ? enteredName : nil
+        isStarting = true
         recorder.startRecording { result in
+            self.isStarting = false
             switch result {
             case .success:
                 self.isRecording = true
@@ -154,14 +173,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // Stops capture at once; the recording is packed as soon as it has a name, asking for one if it has none yet.
-    private func stopRecording() {
+    // Stops capture at once, by the Stop button (reason nil) or because capture was cut off; the recording is packed as soon as it has a name, asking for one if it has none yet.
+    func stopRecording(because reason: String?) {
+        guard isRecording else { return }
         isRecording = false
         isFinishing = true
         UIApplication.shared.isIdleTimerDisabled = false
+        let stopNote = reason.map { "Stopped: \($0)" }
+        if let stopNote { message = stopNote }
         recorder.stopRecording { recording in
-            if let userName = self.userName { return self.pack(recording, userName: userName) }
-            self.unnamed = recording
+            if let userName = self.userName { return self.pack(recording, userName: userName, stopNote: stopNote) }
+            self.unnamed = (recording, stopNote)
             self.nameDraft = ""
             self.asksNameAfterStop = true
         }
@@ -169,9 +191,9 @@ final class AppModel: ObservableObject {
 
     // Packs the stopped recording once the stop prompt is answered, by naming it or keeping its date and time as its name.
     func nameStopped(named: Bool) {
-        guard let recording = unnamed else { return }
+        guard let (recording, stopNote) = unnamed else { return }
         unnamed = nil
-        pack(recording, userName: named ? enteredName : nil)
+        pack(recording, userName: named ? enteredName : nil, stopNote: stopNote)
     }
 
     // The name in the prompt's text field; nil when it is blank.
@@ -180,22 +202,30 @@ final class AppModel: ObservableObject {
         return name.isEmpty ? nil : name
     }
 
-    // Packs a stopped recording into the gallery and uploads it.
-    private func pack(_ recording: Recording, userName: String?) {
-        message = "Packaging…"
+    private func pack(_ recording: Recording, userName: String?, stopNote: String?) {
+        message = [stopNote, "Packaging…"].compactMap { $0 }.joined(separator: ". ")
         recording.pack(userName: userName) { result in
             DispatchQueue.main.async {
                 self.isFinishing = false
-                switch result {
-                case .success(let info):
-                    self.message = "Saved \(info.name)"
-                    self.refreshFiles()
-                    self.upload(info.id)
-                case .failure(let error):
-                    self.message = "Recording failed: \(error.localizedDescription)"
-                }
+                self.packed(result, note: stopNote)
             }
         }
+    }
+
+    // Adds a packed recording to the gallery and uploads it; a recording with no frames was not packed.
+    private func packed(_ result: Result<RecordingInfo?, Error>, note: String?) {
+        let outcome: String
+        switch result {
+        case .success(let info?):
+            outcome = info.colorVideoError.map { "Saved \(info.name), but its color video failed: \($0)" } ?? "Saved \(info.name)"
+            refreshFiles()
+            upload(info.id)
+        case .success(nil):
+            outcome = "Nothing was recorded"
+        case .failure(let error):
+            outcome = "Packing failed, to be retried at the next launch: \(error.localizedDescription)"
+        }
+        message = [note, outcome].compactMap { $0 }.joined(separator: ". ")
     }
 
     func upload(_ id: String) {
@@ -215,8 +245,8 @@ final class AppModel: ObservableObject {
     func delete(_ file: RecordingFile) {
         guard file.canDelete else { return }
         do {
-            try FileManager.default.removeItem(at: file.info.sidecar)
             try FileManager.default.removeItem(at: file.info.tar)
+            try FileManager.default.removeItem(at: file.info.sidecar)
         } catch {
             message = "Delete failed: \(error.localizedDescription)"
         }
@@ -231,7 +261,7 @@ final class AppModel: ObservableObject {
         setUpload(id, .uploaded)
         guard let i = files.firstIndex(where: { $0.id == id }) else { return }
         files[i].info.uploaded = true
-        do { try files[i].info.save() } catch { message = "Cannot record the upload of \(files[i].info.name): \(error.localizedDescription)" }
+        do { try files[i].info.write(to: files[i].info.sidecar) } catch { message = "Cannot record the upload of \(files[i].info.name): \(error.localizedDescription)" }
     }
 
     // Lists the recordings that have a sidecar and a .tar in Documents, newest first, keeping the state of uploads in flight.

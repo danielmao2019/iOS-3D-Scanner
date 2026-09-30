@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var pendingDelete: RecordingFile?
 
     var body: some View {
@@ -63,7 +64,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(model.isRecording ? .red : .accentColor)
-            .disabled(model.isFinishing || model.formatSummary.isEmpty)
+            .disabled(model.isStarting || model.isFinishing || model.formatSummary.isEmpty)
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 
@@ -82,6 +83,9 @@ struct ContentView: View {
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
                         ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
                     ].joined(separator: " · ")).font(.caption2.monospacedDigit())
+                    if let error = file.info.colorVideoError {
+                        Text("color video failed: \(error)").font(.caption2).foregroundStyle(.red)
+                    }
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()
@@ -99,6 +103,9 @@ struct ContentView: View {
         }
         .padding(.horizontal)
         .onAppear { model.startPreview() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { model.stopRecording(because: "the app went to the background") }
+        }
         .alert("Name this recording", isPresented: $model.asksNameBeforeStart) {
             TextField("Name", text: $model.nameDraft)
             Button("Later") { model.startRecording(named: false) }

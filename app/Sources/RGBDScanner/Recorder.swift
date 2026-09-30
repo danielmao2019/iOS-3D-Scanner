@@ -82,13 +82,29 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
     private var depthDelivered = 0
 
     var onStats: ((CaptureStats) -> Void)?
+    // Called on the main queue with the reason when capture is cut off: the session was interrupted or failed.
+    var onInterruption: ((String) -> Void)?
 
-    // Configures the session for a camera and starts it; returns a description of the chosen formats.
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { [weak self] notification in
+            let reason = (notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int).flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+            self?.onInterruption?(Self.describe(reason))
+        }
+        NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] notification in
+            let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+            self?.onInterruption?("the camera failed: \(error?.localizedDescription ?? "unknown error")")
+        }
+    }
+
+    // Configures the session for a camera and (re)starts it; returns a description of the chosen formats.
     func start(camera: DepthCamera, completion: @escaping (Result<String, Error>) -> Void) {
         sessionQueue.async {
             do {
+                // Intrinsic matrix delivery can be enabled only while the session is stopped.
+                if self.session.isRunning { self.session.stopRunning() }
                 let format = try self.configure(camera: camera)
-                if !self.session.isRunning { self.session.startRunning() }
+                self.session.startRunning()
                 self.dataQueue.sync {
                     self.camera = camera
                     self.format = format
@@ -158,6 +174,7 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         dataQueue.async {
             do {
                 guard let format = self.format else { throw RecorderError("camera not ready") }
+                guard self.active == nil else { throw RecorderError("already recording") }
                 self.active = try Recording(camera: self.camera, format: format)
                 (self.stats.colorFrames, self.stats.depthFrames, self.stats.droppedColor, self.stats.droppedDepth) = (0, 0, 0, 0)
                 self.publishStats()
@@ -181,9 +198,12 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let active else { return }
-        stats.colorFrames += 1
-        active.appendColor(sampleBuffer, orientation: orientation.snapshot())
-        if stats.colorFrames % 5 == 0 { publishStats() }
+        if active.appendColor(sampleBuffer, orientation: orientation.snapshot()) {
+            stats.colorFrames += 1
+            if stats.colorFrames % 5 == 0 { publishStats() }
+        } else {
+            stats.droppedColor += 1
+        }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -208,6 +228,16 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         guard let active else { return }
         stats.droppedDepth += 1
         active.recordDroppedDepth(at: timestamp, reason: Recording.describe(reason))
+    }
+
+    private static func describe(_ reason: AVCaptureSession.InterruptionReason?) -> String {
+        switch reason {
+        case .videoDeviceNotAvailableInBackground: return "the app went to the background"
+        case .videoDeviceInUseByAnotherClient: return "another app took the camera"
+        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "the camera is unavailable with several apps on screen"
+        case .videoDeviceNotAvailableDueToSystemPressure: return "the phone is under too much load or too hot"
+        default: return "the camera was interrupted"
+        }
     }
 
     private func publishStats() {

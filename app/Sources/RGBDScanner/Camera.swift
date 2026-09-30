@@ -25,6 +25,7 @@ struct CaptureFormat {
     var colorDimensions: CMVideoDimensions { CMVideoFormatDescriptionGetDimensions(color.formatDescription) }
     var depthDimensions: CMVideoDimensions { CMVideoFormatDescriptionGetDimensions(depth.formatDescription) }
     var depthPixelFormat: OSType { CMFormatDescriptionGetMediaSubType(depth.formatDescription) }
+    var depthBytesPerPixel: Int { [kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DisparityFloat16].contains(depthPixelFormat) ? 2 : 4 }
     var frameRate: Double { 1 / CMTimeGetSeconds(frameDuration) }
 
     // The pair with the largest depth map, then the most precise depth type, then the largest color frame, at the highest frame rate both formats support.
@@ -70,6 +71,7 @@ struct CaptureFormat {
             "depth_width": Int(depthDimensions.width),
             "depth_height": Int(depthDimensions.height),
             "depth_pixel_format": fourCC(depthPixelFormat),
+            "depth_bytes_per_pixel": depthBytesPerPixel,
             "frame_rate": frameRate,
             "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
                 let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)

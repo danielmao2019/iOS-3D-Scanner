@@ -12,7 +12,7 @@ import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Type
+from typing import Any, Dict, Type
 
 NAME = re.compile(r"^/upload/([A-Za-z0-9_.-]+\.tar)$")
 CHUNK = 8 << 20
@@ -20,13 +20,22 @@ CHUNK = 8 << 20
 
 def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        def reply(self, code: int, body: dict) -> None:
+        def reply(self, code: int, body: Dict[str, Any]) -> None:
             data = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def reject(self, code: int, body: Dict[str, Any], length: int) -> None:
+            """Replies with an error after reading and discarding the request body, so a client still sending it receives the reply instead of a connection reset."""
+            while length > 0:
+                chunk = self.rfile.read(min(length, CHUNK))
+                if not chunk:
+                    break
+                length -= len(chunk)
+            self.reply(code, body)
 
         def do_GET(self) -> None:
             if self.path == "/ping":
@@ -35,14 +44,16 @@ def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
                 self.reply(404, {"error": "not found"})
 
         def do_PUT(self) -> None:
-            match = NAME.match(self.path)
-            if match is None:
-                return self.reply(404, {"error": "bad path"})
-            if self.headers.get("X-Upload-Token") != token:
-                return self.reply(403, {"error": "bad token"})
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0:
+                # A body of unknown length cannot be read past, so the connection closes after the reply.
+                self.close_connection = True
                 return self.reply(411, {"error": "length required"})
+            match = NAME.match(self.path)
+            if match is None:
+                return self.reject(404, {"error": "bad path"}, length)
+            if self.headers.get("X-Upload-Token") != token:
+                return self.reject(403, {"error": "bad token"}, length)
             expected = self.headers.get("X-Content-SHA256", "")
 
             out_dir.mkdir(parents=True, exist_ok=True)
