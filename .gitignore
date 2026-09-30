@@ -1,0 +1,9 @@
+__pycache__
+/app/.build/
+/app/.bsp/
+/app/xtool/
+/app/Sources/RGBDScanner/Secrets.swift
+/app/*.log
+/server/token
+/server/url
+/server/*.log
