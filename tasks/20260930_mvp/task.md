@@ -13,7 +13,7 @@ goal: get the bare minimal version working
 
 ### 1.1. App Spec
 
-The app should be able to collect RGB-D video, with timestamp (for each of color stream and depth stream if they are separate, or the timestamp of synced color and depth frames).
+The app should be able to collect RGB-D video, with timestamp (for each of color stream and depth stream if they are separate, or the timestamp of synced color and depth frames). Per-frame and per-stream camera intrinsics should also be bundled.
 
 Once start recording is clicked there should be a prompt asking for a name for the recording. The user has the option to decline (defer) the naming.
 
