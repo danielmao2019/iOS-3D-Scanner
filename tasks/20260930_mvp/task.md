@@ -15,7 +15,11 @@ goal: get the bare minimal version working
 
 The app should be able to collect RGB-D video, with timestamp (for each of color stream and depth stream if they are separate, or the timestamp of synced color and depth frames).
 
-Upon recording finish, the data should be able to be sent as a single-file package to this machine, and put under this folder.
+Once start recording is clicked there should be a prompt asking for a name for the recording. The user has the option to decline (defer) the naming.
+
+Upon recording finish, if the recording wasn't named before it started, prompt again for name.
+
+After the recording is named or the naming is declined (by default name it by date and time), the data should be able to be sent as a single-file package to this machine, and put under this folder.
 
 ### 1.2. References
 
