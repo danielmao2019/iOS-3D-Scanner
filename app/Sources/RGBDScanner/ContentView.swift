@@ -4,7 +4,6 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
-    @State private var pendingDelete: RecordingFile?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -93,7 +92,7 @@ struct ContentView: View {
                         if case .failed = file.upload {
                             Button("Retry") { model.upload(file.id) }.font(.caption).buttonStyle(.bordered)
                         }
-                        Button { pendingDelete = file } label: { Image(systemName: "trash") }
+                        Button { model.pendingDelete = file } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless).foregroundStyle(.red)
                             .disabled(!file.canDelete)
                     }
@@ -116,7 +115,7 @@ struct ContentView: View {
             Button("Use date and time") { model.nameStopped(named: false) }
             Button("Save") { model.nameStopped(named: true) }
         }
-        .alert("Delete recording?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), presenting: pendingDelete) { file in
+        .alert("Delete recording?", isPresented: Binding(get: { model.pendingDelete != nil }, set: { if !$0 { model.pendingDelete = nil } }), presenting: model.pendingDelete) { file in
             Button("Delete", role: .destructive) { model.delete(file) }
             Button("Cancel", role: .cancel) {}
         } message: { file in

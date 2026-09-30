@@ -98,6 +98,8 @@ final class AppModel: ObservableObject {
     @Published var asksNameBeforeStart = false
     @Published var asksNameAfterStop = false
     @Published var nameDraft = ""
+    // The recording whose delete is awaiting confirmation.
+    @Published var pendingDelete: RecordingFile?
 
     let availableCameras = DepthCamera.allCases.filter { $0.device != nil }
     let recorder = Recorder()
