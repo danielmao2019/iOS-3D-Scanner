@@ -1,6 +1,6 @@
 """Reads an RGBD Scanner recording (.tar, format_version 3): metadata, the color and depth tables, the depth maps, and the color frames.
 
-Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal. Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels.
+Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal; a color frame that was dropped, or lost when the app was closed mid-recording, keeps its timestamp as a dropped row (index -1). Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels.
 """
 
 import csv
@@ -47,8 +47,8 @@ class Recording:
             yield frame
 
     def pairs(self) -> List[Tuple[Dict[str, str], Dict[str, str]]]:
-        """Color and depth rows captured at the same instant, matched by timestamp."""
-        by_time = {round(float(r["timestamp"]) / SAME_INSTANT_S): r for r in self.colors}
+        """Each depth row with the color.csv row, delivered or dropped, captured at the same instant, matched by timestamp."""
+        by_time = {round(float(r["timestamp"]) / SAME_INSTANT_S): r for r in self.color_rows}
         out = []
         for d in self.depths:
             c = by_time.get(round(float(d["timestamp"]) / SAME_INSTANT_S))
