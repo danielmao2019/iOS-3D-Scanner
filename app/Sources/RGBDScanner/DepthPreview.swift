@@ -2,15 +2,22 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
-// Renders the live depth view: depth maps colorized by distance, turned upright, and mirrored for the front camera as the color preview is, on a queue of its own; the capture queue only offers maps, and a map is dropped while the view is off, too soon after the last one, or while one is still rendering.
+// One rendered depth view frame: the colorized map and the depth range its colors span.
+struct DepthFrame {
+    let image: UIImage
+    let nearMeters: Float
+    let farMeters: Float
+}
+
+// Renders the live depth view: each depth map colorized across a fixed depth range, turned upright, and mirrored for the front camera as the color preview is, on a queue of its own; the capture queue only offers maps, and a map is dropped while the view is off, too soon after the last one, or while one is still rendering.
 final class DepthPreview {
-    static let nearMeters: Float = 0.2
-    static let farMeters: Float = 3.0
+    // The depth range the colors span, fixed so colors do not shift from frame to frame.
+    static let displayRangeMeters: ClosedRange<Float> = 0.2...3.0
     // Just under 1/15 s, so a 30 fps stream yields every second map.
     private static let minInterval = 1.0 / 16
 
     // Called on the main queue.
-    var onImage: ((UIImage) -> Void)?
+    var onFrame: ((DepthFrame) -> Void)?
 
     private let queue = DispatchQueue(label: "depth.preview", qos: .userInitiated)
     private let lock = NSLock()
@@ -40,29 +47,32 @@ final class DepthPreview {
         lock.unlock()
         guard take else { return }
         queue.async {
-            let image = Self.render(depthData, uprightRotationDegrees: uprightRotationDegrees, camera: camera)
+            let frame = Self.render(depthData, uprightRotationDegrees: uprightRotationDegrees, camera: camera)
             self.lock.lock()
             self.busy = false
             self.lock.unlock()
-            DispatchQueue.main.async { self.onImage?(image) }
+            DispatchQueue.main.async { self.onFrame?(frame) }
         }
     }
 
-    private static func render(_ depthData: AVDepthData, uprightRotationDegrees: Int, camera: DepthCamera) -> UIImage {
+    private static func render(_ depthData: AVDepthData, uprightRotationDegrees: Int, camera: DepthCamera) -> DepthFrame {
         let map = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap
         CVPixelBufferLockBaseAddress(map, .readOnly)
         let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(map)
         let base = CVPixelBufferGetBaseAddress(map)!
+        let range = Self.displayRangeMeters
+        let scale = 255 / (range.upperBound - range.lowerBound)
         // Pixels without a reading stay black.
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        let scale = 255 / (farMeters - nearMeters)
-        for y in 0..<height {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: Float32.self)
-            for x in 0..<width where row[x].isFinite && row[x] > 0 {
-                let (r, g, b) = palette[Int(min(max((row[x] - nearMeters) * scale, 0), 255))]
-                let i = (y * width + x) * 4
-                (pixels[i], pixels[i + 1], pixels[i + 2]) = (r, g, b)
+        pixels.withUnsafeMutableBufferPointer { out in
+            for y in 0..<height {
+                let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: Float32.self)
+                for x in 0..<width where row[x].isFinite && row[x] > 0 {
+                    let (r, g, b) = palette[Int(min(max((row[x] - range.lowerBound) * scale, 0), 255))]
+                    let i = (y * width + x) * 4
+                    (out[i], out[i + 1], out[i + 2]) = (r, g, b)
+                }
             }
         }
         CVPixelBufferUnlockBaseAddress(map, .readOnly)
@@ -70,7 +80,8 @@ final class DepthPreview {
         let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
                             provider: CGDataProvider(data: Data(pixels) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
-        return UIImage(cgImage: image, scale: 1, orientation: displayOrientation(uprightRotationDegrees, mirrored: camera == .front))
+        let upright = UIImage(cgImage: image, scale: 1, orientation: displayOrientation(uprightRotationDegrees, mirrored: camera == .front))
+        return DepthFrame(image: upright, nearMeters: range.lowerBound, farMeters: range.upperBound)
     }
 
     // The UIImage orientation that displays a sensor-oriented image rotated clockwise by the given degrees, then, when mirrored, flipped left to right; AVCaptureVideoPreviewLayer mirrors the front camera by default.
@@ -89,15 +100,17 @@ final class DepthPreview {
     }
 }
 
-// The depth view's color scale.
+// The depth view's color scale, labelled with the depth range of the frame on screen.
 struct DepthLegend: View {
+    let frame: DepthFrame
+
     var body: some View {
         HStack(spacing: 4) {
-            Text(String(format: "%.1f m", DepthPreview.nearMeters))
+            Text(String(format: "%.2f m", frame.nearMeters))
             LinearGradient(colors: stride(from: 0.0, through: 1.0, by: 0.25).map { Color(hue: DepthPreview.hue(atFraction: $0), saturation: 1, brightness: 1) },
                            startPoint: .leading, endPoint: .trailing)
                 .frame(width: 80, height: 8)
-            Text(String(format: "%.1f m", DepthPreview.farMeters))
+            Text(String(format: "%.2f m", frame.farMeters))
         }
         .font(.caption2.monospacedDigit()).foregroundStyle(.white)
         .padding(4).background(.black.opacity(0.6)).clipShape(RoundedRectangle(cornerRadius: 4))

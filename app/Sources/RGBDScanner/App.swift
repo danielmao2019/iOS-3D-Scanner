@@ -91,10 +91,10 @@ final class AppModel: ObservableObject {
     @Published var showsDepth = false {
         didSet {
             recorder.depthPreview.isEnabled = showsDepth
-            if !showsDepth { depthImage = nil }
+            if !showsDepth { depthFrame = nil }
         }
     }
-    @Published var depthImage: UIImage?
+    @Published var depthFrame: DepthFrame?
     @Published var asksNameBeforeStart = false
     @Published var asksNameAfterStop = false
     @Published var nameDraft = ""
@@ -113,9 +113,9 @@ final class AppModel: ObservableObject {
         server = UserDefaults.standard.string(forKey: "server") ?? Secrets.server
         if let first = availableCameras.first { camera = first }
         recorder.onStats = { [weak self] in self?.stats = $0 }
-        recorder.depthPreview.onImage = { [weak self] image in
+        recorder.depthPreview.onFrame = { [weak self] frame in
             guard let self, self.showsDepth else { return }
-            self.depthImage = image
+            self.depthFrame = frame
         }
         recorder.onInterruption = { [weak self] reason in self?.stopRecording(because: reason) }
         refreshFiles()

@@ -12,4 +12,5 @@ token_file=../server/token
 [ -s "$token_file" ] || python3 -c "import secrets; print(secrets.token_hex(16))" > "$token_file"
 printf 'enum Secrets {\n    static let server = "%s"\n    static let uploadToken = "%s"\n}\n' "$(tr -d '\n' < "$url_file")" "$(tr -d '\n' < "$token_file")" > Sources/RGBDScanner/Secrets.swift
 
-xtool dev "${1:-build}"
+# Release: the app runs its per-frame work (encoding, depth copies, the depth view) optimized.
+xtool dev "${1:-build}" --configuration release

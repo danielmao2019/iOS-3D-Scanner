@@ -22,8 +22,8 @@ struct ContentView: View {
                 PreviewView(session: model.recorder.session)
                 if model.showsDepth {
                     Color.black
-                    if let image = model.depthImage {
-                        Image(uiImage: image).resizable().interpolation(.none).aspectRatio(contentMode: .fit)
+                    if let frame = model.depthFrame {
+                        Image(uiImage: frame.image).resizable().interpolation(.none).aspectRatio(contentMode: .fit)
                     }
                 }
             }
@@ -42,7 +42,7 @@ struct ContentView: View {
             }
             .overlay(alignment: .bottom) {
                 HStack {
-                    if model.showsDepth { DepthLegend() }
+                    if model.showsDepth, let frame = model.depthFrame { DepthLegend(frame: frame) }
                     Spacer()
                     Button(model.showsDepth ? "Color" : "Depth") { model.showsDepth.toggle() }
                         .font(.caption.bold()).buttonStyle(.borderedProminent).tint(.black.opacity(0.6))
