@@ -11,7 +11,7 @@ from typing import Dict, List
 import cv2
 import numpy as np
 
-from rgbd_recording import Recording, valid
+from rgbd_recording import INTRINSICS, Recording, valid
 
 
 def alignment_offset(rec: Recording, grads: List[np.ndarray]) -> Dict[int, float]:
@@ -58,7 +58,7 @@ def main() -> None:
 
         print(f"device {meta['device_model']} iOS {meta['system_version']} camera {meta['camera']}")
         print(f"color {meta['color_width']}x{meta['color_height']}, depth {w}x{h} {meta['depth_pixel_format']}, filtering_enabled={meta['depth_filtering_enabled']}")
-        print(f"color {len(rec.colors)} frames at {(len(color_ts) - 1) / (color_ts[-1] - color_ts[0]):.2f} fps; depth {len(rec.depths)} frames at {(len(depth_ts) - 1) / (depth_ts[-1] - depth_ts[0]):.2f} fps; {len(pairs)} pairs by timestamp")
+        print(f"configured {meta['frame_rate']:.2f} fps; color {len(rec.colors)} frames at {(len(color_ts) - 1) / (color_ts[-1] - color_ts[0]):.2f} fps; depth {len(rec.depths)} frames at {(len(depth_ts) - 1) / (depth_ts[-1] - depth_ts[0]):.2f} fps; {len(pairs)} pairs by timestamp")
         print(f"dropped: color {len(rec.color_rows) - len(rec.colors)}, depth {len(rec.depth_rows) - len(rec.depths)}")
         print(f"upright rotations used: {sorted({r['upright_rotation_deg'] for r in rec.colors})}; |gravity| mean {np.linalg.norm(gravity, axis=1).mean():.3f} g")
         print("depth valid % per frame: min {:.1f} p5 {:.1f} p25 {:.1f} median {:.1f} p75 {:.1f} p95 {:.1f} max {:.1f}".format(coverage.min(), *np.percentile(coverage, [5, 25, 50, 75, 95]), coverage.max()))
@@ -73,6 +73,8 @@ def main() -> None:
             "depth aligns best with its same-instant color frame": best_offset == 0,
             "no depth map filtered": all(r["filtered"] == "0" for r in rec.depths),
             "every frame has orientation and gravity": len(gravity) == len(rec.colors) and all(r["gravity_x"] for r in rec.depths),
+            "every color and depth frame has intrinsics": all(r[k] for r in rec.colors + rec.depths for k in INTRINSICS),
+            "metadata has a name and a duration": all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0,
         }
         for name, ok in checks.items():
             print(f"[{'PASS' if ok else 'FAIL'}] {name}")

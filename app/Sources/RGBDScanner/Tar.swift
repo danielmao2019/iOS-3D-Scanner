@@ -1,6 +1,6 @@
 import Foundation
 
-// Writes a POSIX ustar archive holding one directory's regular files, streamed in chunks.
+// Writes a POSIX ustar archive holding one directory's regular files, streamed in chunks, under a top directory named after the archive.
 enum Tar {
     static func pack(directory: URL, into archive: URL) throws {
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
@@ -9,10 +9,11 @@ enum Tar {
         let out = try FileHandle(forWritingTo: archive)
         defer { out.closeFile() }
         let mtime = Int(Date().timeIntervalSince1970)
+        let root = archive.deletingPathExtension().lastPathComponent
 
         for file in files {
             let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            let path = directory.lastPathComponent + "/" + file.lastPathComponent
+            let path = root + "/" + file.lastPathComponent
             out.write(header(path: path, size: size, mtime: mtime))
             let input = try FileHandle(forReadingFrom: file)
             var written = 0

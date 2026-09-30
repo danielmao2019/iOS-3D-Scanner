@@ -48,7 +48,7 @@ def main() -> None:
         lo, hi = np.percentile(rec.depth[valid(rec.depth)][::97], [2, 98])
         depth_at = {c["index"]: d for c, d in rec.pairs()}
         writer = None
-        for row, frame in zip(rec.colors, rec.color_frames()):
+        for row, frame in zip(rec.colors, rec.color_frames(), strict=True):
             color = fit(upright(frame, row["upright_rotation_deg"]), cv2.INTER_AREA)
             d = depth_at.get(row["index"])
             if d is None:

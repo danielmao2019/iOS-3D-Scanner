@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @State private var pendingDelete: RecordingFile?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -17,19 +18,37 @@ struct ContentView: View {
                 Text(only.label).font(.headline)
             }
 
-            PreviewView(session: model.recorder.session)
-                .aspectRatio(3.0 / 4.0, contentMode: .fit)
-                .frame(maxHeight: 360)
-                .overlay(alignment: .topLeading) {
-                    if model.isRecording {
-                        TimelineView(.periodic(from: .now, by: 1)) { context in
-                            let s = Int(context.date.timeIntervalSince(model.recordingStart))
-                            Text(String(format: "● REC %d:%02d", s / 60, s % 60))
-                                .font(.caption.monospacedDigit()).padding(4)
-                                .background(.red).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 4)).padding(6)
-                        }
+            ZStack {
+                PreviewView(session: model.recorder.session)
+                if model.showsDepth {
+                    Color.black
+                    if let image = model.depthImage {
+                        Image(uiImage: image).resizable().interpolation(.none).aspectRatio(contentMode: .fit)
                     }
                 }
+            }
+            .aspectRatio(3.0 / 4.0, contentMode: .fit)
+            .frame(maxHeight: 360)
+            .clipped()
+            .overlay(alignment: .topLeading) {
+                if model.isRecording {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        let s = Int(context.date.timeIntervalSince(model.recordingStart))
+                        Text(String(format: "● REC %d:%02d", s / 60, s % 60))
+                            .font(.caption.monospacedDigit()).padding(4)
+                            .background(.red).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 4)).padding(6)
+                    }
+                }
+            }
+            .overlay(alignment: .bottom) {
+                HStack {
+                    if model.showsDepth { DepthLegend() }
+                    Spacer()
+                    Button(model.showsDepth ? "Color" : "Depth") { model.showsDepth.toggle() }
+                        .font(.caption.bold()).buttonStyle(.borderedProminent).tint(.black.opacity(0.6))
+                }
+                .padding(6)
+            }
 
             Text(model.formatSummary).font(.caption)
             Text(String(format: "depth valid %.0f%% · median %.2f m", model.stats.depthValidFraction * 100, model.stats.depthMedianMeters))
@@ -38,7 +57,7 @@ struct ContentView: View {
                         model.stats.colorFrames, model.stats.depthFrames, model.stats.droppedColor, model.stats.droppedDepth))
                 .font(.caption2.monospacedDigit())
 
-            Button(action: model.toggleRecording) {
+            Button(action: model.recordTapped) {
                 Text(model.isRecording ? "Stop" : (model.isFinishing ? "Packaging…" : "Record"))
                     .font(.title2.bold()).frame(maxWidth: .infinity).padding(.vertical, 10)
             }
@@ -55,27 +74,47 @@ struct ContentView: View {
                     .keyboardType(.URL).autocorrectionDisabled().textInputAutocapitalization(.never)
             }
 
-            List {
-                ForEach(model.files) { file in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(file.id).font(.caption.bold())
-                        HStack {
-                            Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)).font(.caption2)
-                            Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
-                            Spacer()
-                            // Every recording uploads when it is stopped; a failed upload can be retried.
-                            if case .failed = file.upload {
-                                Button("Retry") { model.upload(file.url) }.font(.caption).buttonStyle(.bordered)
-                            }
+            List(model.files) { file in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(file.info.name).font(.caption.bold())
+                    Text([
+                        file.info.startTime.formatted(date: .abbreviated, time: .standard),
+                        Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
+                        ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
+                    ].joined(separator: " · ")).font(.caption2.monospacedDigit())
+                    HStack {
+                        Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
+                        Spacer()
+                        // Every recording uploads once it is named; a failed upload can be retried.
+                        if case .failed = file.upload {
+                            Button("Retry") { model.upload(file.id) }.font(.caption).buttonStyle(.bordered)
                         }
+                        Button { pendingDelete = file } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless).foregroundStyle(.red)
+                            .disabled(!file.canDelete)
                     }
                 }
-                .onDelete { indexSet in indexSet.map { model.files[$0] }.forEach(model.delete) }
             }
             .listStyle(.plain)
         }
         .padding(.horizontal)
         .onAppear { model.startPreview() }
+        .alert("Name this recording", isPresented: $model.asksNameBeforeStart) {
+            TextField("Name", text: $model.nameDraft)
+            Button("Later") { model.startRecording(named: false) }
+            Button("Start") { model.startRecording(named: true) }
+        }
+        .alert("Name this recording", isPresented: $model.asksNameAfterStop) {
+            TextField("Name", text: $model.nameDraft)
+            Button("Use date and time") { model.nameStopped(named: false) }
+            Button("Save") { model.nameStopped(named: true) }
+        }
+        .alert("Delete recording?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), presenting: pendingDelete) { file in
+            Button("Delete", role: .destructive) { model.delete(file) }
+            Button("Cancel", role: .cancel) {}
+        } message: { file in
+            Text("\(file.info.name) is deleted from this iPhone. The copy on the server is kept.")
+        }
     }
 }
 

@@ -69,6 +69,7 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
     private let videoOutput = AVCaptureVideoDataOutput()
     private let depthOutput = AVCaptureDepthDataOutput()
     private let orientation = OrientationTracker()
+    let depthPreview = DepthPreview()
     private let sessionQueue = DispatchQueue(label: "recorder.session")
     // Both outputs deliver on this one queue, so a recording sees its frames in arrival order.
     private let dataQueue = DispatchQueue(label: "recorder.data")
@@ -94,7 +95,7 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
                     self.stats = CaptureStats()
                 }
                 let color = format.colorDimensions, depth = format.depthDimensions
-                let summary = "color \(color.width)×\(color.height) · depth \(depth.width)×\(depth.height) \(fourCC(format.depthPixelFormat))"
+                let summary = "color \(color.width)×\(color.height) · depth \(depth.width)×\(depth.height) \(fourCC(format.depthPixelFormat)) · \(String(format: "%.0f", format.frameRate)) fps"
                 DispatchQueue.main.async { completion(.success(summary)) }
             } catch {
                 DispatchQueue.main.async { completion(.failure(error)) }
@@ -130,13 +131,12 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
         // Depth formats can be chosen only once the depth output is attached.
         guard let format = CaptureFormat.best(for: device) else { throw RecorderError("no format with depth") }
-        let frameDuration = CMTime(value: 1, timescale: CaptureFormat.frameRate)
         try device.lockForConfiguration()
         device.activeFormat = format.color
         device.activeDepthDataFormat = format.depth
-        device.activeVideoMinFrameDuration = frameDuration
-        device.activeVideoMaxFrameDuration = frameDuration
-        device.activeDepthDataMinFrameDuration = frameDuration
+        device.activeVideoMinFrameDuration = format.frameDuration
+        device.activeVideoMaxFrameDuration = format.frameDuration
+        device.activeDepthDataMinFrameDuration = format.frameDuration
         device.unlockForConfiguration()
 
         // Frames are kept in the sensor's own orientation and unmirrored, the orientation Apple's calibration describes; how the phone was held is recorded with each frame instead.
@@ -145,6 +145,9 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = false
             }
+        }
+        if let video = videoOutput.connection(with: .video), video.isCameraIntrinsicMatrixDeliverySupported {
+            video.isCameraIntrinsicMatrixDeliveryEnabled = true
         }
         orientation.track(device: device)
         return format
@@ -165,13 +168,14 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         }
     }
 
-    // Stops the active recording and packages it into a single .tar file.
-    func stopRecording(completion: @escaping (Result<URL, Error>) -> Void) {
+    // Stops the active recording and hands it over to be named and packed.
+    func stopRecording(completion: @escaping (Recording) -> Void) {
         dataQueue.async {
             guard let recording = self.active else { return }
             self.active = nil
             self.publishStats()
-            recording.finish { result in DispatchQueue.main.async { completion(result) } }
+            recording.stop()
+            DispatchQueue.main.async { completion(recording) }
         }
     }
 
@@ -190,6 +194,7 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
         depthDelivered += 1
+        depthPreview.offer(depthData, at: timestamp, uprightRotationDegrees: orientation.snapshot().uprightRotationDegrees, camera: camera)
         if depthDelivered % 15 == 1 {
             (stats.depthValidFraction, stats.depthMedianMeters) = Self.depthSummary(depthData)
             if active == nil { publishStats() }

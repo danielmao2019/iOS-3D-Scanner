@@ -1,6 +1,6 @@
-"""Reads an RGBD Scanner recording (.tar, format_version 2): metadata, the color and depth tables, the depth maps, and the color frames.
+"""Reads an RGBD Scanner recording (.tar, format_version 3): metadata, the color and depth tables, the depth maps, and the color frames.
 
-Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal.
+Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal. Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels.
 """
 
 import csv
@@ -15,6 +15,7 @@ import numpy as np
 
 DEPTH_DTYPES = {"fdep": "<f4", "hdep": "<f2"}
 FILES = {"color.mov", "color.csv", "depth.bin", "depth.csv", "metadata.json"}
+INTRINSICS = ("fx", "fy", "cx", "cy")
 SAME_INSTANT_S = 0.0005
 
 
@@ -29,7 +30,7 @@ class Recording:
             raw = tar.extractfile(members["depth.bin"]).read()
             self.mov = work_dir / "color.mov"
             self.mov.write_bytes(tar.extractfile(members["color.mov"]).read())
-        assert self.meta["format_version"] == 2, self.meta["format_version"]
+        assert self.meta["format_version"] == 3, self.meta["format_version"]
         shape = (-1, self.meta["depth_height"], self.meta["depth_width"])
         self.depth = np.frombuffer(raw, dtype=DEPTH_DTYPES[self.meta["depth_pixel_format"]]).reshape(shape).astype(np.float32)
         self.colors = [r for r in self.color_rows if r["index"] != "-1"]

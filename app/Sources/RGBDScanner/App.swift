@@ -34,12 +34,41 @@ enum UploadState: Equatable {
     }
 }
 
-// A finished recording in Documents.
+// A finished recording's sidecar, Documents/<id>.json, next to its Documents/<id>.tar.
+struct RecordingInfo: Codable {
+    let id: String
+    let name: String
+    let namedByUser: Bool
+    let startTime: Date
+    let durationSeconds: Double
+    let camera: DepthCamera
+    var uploaded: Bool
+
+    var tar: URL { Recording.documents.appendingPathComponent("\(id).tar") }
+    var sidecar: URL { Recording.documents.appendingPathComponent("\(id).json") }
+
+    func save() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: sidecar, options: .atomic)
+    }
+
+    static func load(_ sidecar: URL) throws -> RecordingInfo {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(RecordingInfo.self, from: Data(contentsOf: sidecar))
+    }
+}
+
+// A gallery entry: a finished recording with its size and where its upload stands.
 struct RecordingFile: Identifiable {
-    let url: URL
-    var id: String { url.lastPathComponent }
+    var info: RecordingInfo
     let size: Int64
     var upload: UploadState
+    var id: String { info.id }
+    // Not while its upload is in flight.
+    var canDelete: Bool { upload.canStart || upload == .uploaded }
 }
 
 final class AppModel: ObservableObject {
@@ -47,6 +76,7 @@ final class AppModel: ObservableObject {
     @Published var formatSummary = ""
     @Published var stats = CaptureStats()
     @Published var isRecording = false
+    // From Stop until the recording is packed, which waits for its name.
     @Published var isFinishing = false
     @Published var recordingStart = Date()
     @Published var message = ""
@@ -54,18 +84,36 @@ final class AppModel: ObservableObject {
     @Published var server: String {
         didSet { UserDefaults.standard.set(server, forKey: "server") }
     }
+    @Published var showsDepth = false {
+        didSet {
+            recorder.depthPreview.isEnabled = showsDepth
+            if !showsDepth { depthImage = nil }
+        }
+    }
+    @Published var depthImage: UIImage?
+    @Published var asksNameBeforeStart = false
+    @Published var asksNameAfterStop = false
+    @Published var nameDraft = ""
 
     let availableCameras = DepthCamera.allCases.filter { $0.device != nil }
     let recorder = Recorder()
     private let uploader = Uploader()
+    // The name given when the recording started; nil when naming was deferred.
+    private var userName: String?
+    // A stopped recording waiting for its name.
+    private var unnamed: Recording?
 
     init() {
         server = UserDefaults.standard.string(forKey: "server") ?? Secrets.server
         if let first = availableCameras.first { camera = first }
         recorder.onStats = { [weak self] in self?.stats = $0 }
+        recorder.depthPreview.onImage = { [weak self] image in
+            guard let self, self.showsDepth else { return }
+            self.depthImage = image
+        }
         refreshFiles()
         // A recording left un-uploaded, e.g. by closing the app mid-upload, goes up now.
-        files.filter { $0.upload == .notUploaded }.forEach { upload($0.url) }
+        files.filter { !$0.info.uploaded }.forEach { upload($0.id) }
     }
 
     func startPreview() {
@@ -84,11 +132,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func toggleRecording() {
-        isRecording ? stopRecording() : startRecording()
+    func recordTapped() {
+        if isRecording { return stopRecording() }
+        nameDraft = ""
+        asksNameBeforeStart = true
     }
 
-    private func startRecording() {
+    // Starts recording once the start prompt is answered, by naming the recording or deferring its name.
+    func startRecording(named: Bool) {
+        userName = named ? enteredName : nil
         recorder.startRecording { result in
             switch result {
             case .success:
@@ -102,62 +154,101 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // Stops, packages, and uploads the new recording.
+    // Stops capture at once; the recording is packed as soon as it has a name, asking for one if it has none yet.
     private func stopRecording() {
         isRecording = false
         isFinishing = true
         UIApplication.shared.isIdleTimerDisabled = false
+        recorder.stopRecording { recording in
+            if let userName = self.userName { return self.pack(recording, userName: userName) }
+            self.unnamed = recording
+            self.nameDraft = ""
+            self.asksNameAfterStop = true
+        }
+    }
+
+    // Packs the stopped recording once the stop prompt is answered, by naming it or keeping its date and time as its name.
+    func nameStopped(named: Bool) {
+        guard let recording = unnamed else { return }
+        unnamed = nil
+        pack(recording, userName: named ? enteredName : nil)
+    }
+
+    // The name in the prompt's text field; nil when it is blank.
+    private var enteredName: String? {
+        let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    // Packs a stopped recording into the gallery and uploads it.
+    private func pack(_ recording: Recording, userName: String?) {
         message = "Packaging…"
-        recorder.stopRecording { result in
-            self.isFinishing = false
-            switch result {
-            case .success(let tar):
-                self.message = "Saved \(tar.lastPathComponent)"
-                self.refreshFiles()
-                self.upload(tar)
-            case .failure(let error):
-                self.message = "Recording failed: \(error.localizedDescription)"
+        recording.pack(userName: userName) { result in
+            DispatchQueue.main.async {
+                self.isFinishing = false
+                switch result {
+                case .success(let info):
+                    self.message = "Saved \(info.name)"
+                    self.refreshFiles()
+                    self.upload(info.id)
+                case .failure(let error):
+                    self.message = "Recording failed: \(error.localizedDescription)"
+                }
             }
         }
     }
 
-    func upload(_ url: URL) {
-        guard let file = files.first(where: { $0.url == url }), file.upload.canStart else { return }
-        setUpload(url, .inProgress("hashing…"))
-        uploader.upload(file: url, server: server, onProgress: { fraction in
-            self.setUpload(url, .inProgress(String(format: "uploading %.0f%%", fraction * 100)))
+    func upload(_ id: String) {
+        guard let file = files.first(where: { $0.id == id }), file.upload.canStart else { return }
+        setUpload(id, .inProgress("hashing…"))
+        uploader.upload(file: file.info.tar, server: server, onProgress: { fraction in
+            self.setUpload(id, .inProgress(String(format: "uploading %.0f%%", fraction * 100)))
         }, completion: { result in
             switch result {
-            case .success: self.setUpload(url, .uploaded)
-            case .failure(let error): self.setUpload(url, .failed(error.localizedDescription))
+            case .success: self.markUploaded(id)
+            case .failure(let error): self.setUpload(id, .failed(error.localizedDescription))
             }
         })
     }
 
+    // Deletes the recording from this phone only; the copy on the server is kept.
     func delete(_ file: RecordingFile) {
-        guard file.upload.canStart || file.upload == .uploaded else { return }
-        try? FileManager.default.removeItem(at: file.url)
-        UserDefaults.standard.removeObject(forKey: Self.uploadedKey(file.url))
+        guard file.canDelete else { return }
+        do {
+            try FileManager.default.removeItem(at: file.info.sidecar)
+            try FileManager.default.removeItem(at: file.info.tar)
+        } catch {
+            message = "Delete failed: \(error.localizedDescription)"
+        }
         refreshFiles()
     }
 
-    private func setUpload(_ url: URL, _ state: UploadState) {
-        if let i = files.firstIndex(where: { $0.url == url }) { files[i].upload = state }
-        UserDefaults.standard.set(state == .uploaded, forKey: Self.uploadedKey(url))
+    private func setUpload(_ id: String, _ state: UploadState) {
+        if let i = files.firstIndex(where: { $0.id == id }) { files[i].upload = state }
     }
 
-    private static func uploadedKey(_ url: URL) -> String { "uploaded." + url.lastPathComponent }
+    private func markUploaded(_ id: String) {
+        setUpload(id, .uploaded)
+        guard let i = files.firstIndex(where: { $0.id == id }) else { return }
+        files[i].info.uploaded = true
+        do { try files[i].info.save() } catch { message = "Cannot record the upload of \(files[i].info.name): \(error.localizedDescription)" }
+    }
 
-    // Lists Documents/*.tar, keeping the state of uploads in flight.
+    // Lists the recordings that have a sidecar and a .tar in Documents, newest first, keeping the state of uploads in flight.
     func refreshFiles() {
-        let inFlight = Dictionary(uniqueKeysWithValues: files.map { ($0.url, $0.upload) })
-        let urls = (try? FileManager.default.contentsOfDirectory(at: Recording.documents, includingPropertiesForKeys: [.fileSizeKey])) ?? []
-        files = urls.filter { $0.pathExtension == "tar" }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
-            .map { url in
-                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 } ?? 0
-                let stored: UploadState = UserDefaults.standard.bool(forKey: Self.uploadedKey(url)) ? .uploaded : .notUploaded
-                return RecordingFile(url: url, size: Int64(size), upload: inFlight[url] ?? stored)
+        let inFlight = Dictionary(uniqueKeysWithValues: files.map { ($0.id, $0.upload) })
+        let urls = (try? FileManager.default.contentsOfDirectory(at: Recording.documents, includingPropertiesForKeys: nil)) ?? []
+        var listed: [RecordingFile] = []
+        for sidecar in urls where sidecar.pathExtension == "json" {
+            do {
+                let info = try RecordingInfo.load(sidecar)
+                // The .tar can be removed through the Files app, which shows Documents.
+                guard let size = try? info.tar.resourceValues(forKeys: [.fileSizeKey]).fileSize else { continue }
+                listed.append(RecordingFile(info: info, size: Int64(size), upload: inFlight[info.id] ?? (info.uploaded ? .uploaded : .notUploaded)))
+            } catch {
+                message = "Unreadable \(sidecar.lastPathComponent): \(error.localizedDescription)"
             }
+        }
+        files = listed.sorted { $0.info.startTime > $1.info.startTime }
     }
 }
