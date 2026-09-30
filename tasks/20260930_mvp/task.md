@@ -17,6 +17,8 @@ The app should be able to collect RGB-D video, with timestamp (for each of color
 
 Once start recording is clicked there should be a prompt asking for a name for the recording. The user has the option to decline (defer) the naming.
 
+During recording, there should be a button to switch between color stream and depth stream to display on the screen.
+
 Upon recording finish, if the recording wasn't named before it started, prompt again for name.
 
 After the recording is named or the naming is declined (by default name it by date and time), the data should be able to be sent as a single-file package to this machine, and put under this folder.
