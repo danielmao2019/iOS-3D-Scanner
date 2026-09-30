@@ -15,6 +15,8 @@ goal: get the bare minimal version working
 
 The app should be able to collect RGB-D video, with timestamp (for each of color stream and depth stream if they are separate, or the timestamp of synced color and depth frames). Per-frame and per-stream camera intrinsics should also be bundled.
 
+The app selects no resolution for neither color stream or depth stream, and always uses the highest resolution possible for each. If the choice of color resolution and depth resolution are dependent on each other, prioritize higher depth resolution.
+
 Once start recording is clicked there should be a prompt asking for a name for the recording. The user has the option to decline (defer) the naming.
 
 During recording, there should be a button to switch between color stream and depth stream to display on the screen.
