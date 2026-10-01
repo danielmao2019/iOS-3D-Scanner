@@ -101,8 +101,8 @@ final class AppModel: ObservableObject {
     // The recording whose delete is awaiting confirmation.
     @Published var pendingDelete: RecordingFile?
 
-    let availableCameras = DepthCamera.allCases.filter { $0.device != nil }
-    let recorder = Recorder()
+    let availableCameras: [DepthCamera]
+    let recorder: Recorder
     private let uploader = Uploader()
     // The name given when the recording started; nil when naming was deferred.
     private var userName: String?
@@ -111,6 +111,8 @@ final class AppModel: ObservableObject {
 
     init() {
         server = UserDefaults.standard.string(forKey: "server") ?? Secrets.server
+        availableCameras = DepthCamera.allCases.filter(\.isAvailable)
+        recorder = Recorder(cameras: availableCameras)
         if let first = availableCameras.first { camera = first }
         recorder.onStats = { [weak self] in self?.stats = $0 }
         recorder.depthPreview.onFrame = { [weak self] frame in

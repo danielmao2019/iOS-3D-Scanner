@@ -1,6 +1,8 @@
+import ARKit
 import AVFoundation
+import UIKit
 
-// A depth camera the phone may have: the front TrueDepth camera or the rear LiDAR camera.
+// A depth camera the phone may have: the front TrueDepth camera, recorded through AVFoundation, or the rear LiDAR camera, recorded through ARKit.
 enum DepthCamera: String, CaseIterable, Identifiable, Codable {
     case front, rear
 
@@ -8,77 +10,111 @@ enum DepthCamera: String, CaseIterable, Identifiable, Codable {
 
     var label: String { self == .front ? "Front (TrueDepth)" : "Rear (LiDAR)" }
 
-    var device: AVCaptureDevice? {
-        self == .front
-            ? AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
-            : AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back)
+    var isAvailable: Bool {
+        switch self {
+        case .front: return AVFoundationSource.frontDevice != nil
+        case .rear: return ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        }
     }
 }
 
-// The color and depth formats a recording uses, and the frame duration both streams share.
-struct CaptureFormat {
-    let color: AVCaptureDevice.Format
-    let depth: AVCaptureDevice.Format
-    // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
-    let frameDuration: CMTime
+// The streams a capture source delivers, as a recording writes and describes them.
+struct StreamFormat {
+    let colorWidth: Int
+    let colorHeight: Int
+    let colorPixelFormat: OSType
+    let depthWidth: Int
+    let depthHeight: Int
+    let depthPixelFormat: OSType
+    // The pixel format of the per-pixel confidence maps, the size of the depth maps; nil when the source delivers none.
+    let confidencePixelFormat: OSType?
+    let frameRate: Double
+    // "avfoundation_truedepth" or "arkit_scene_depth".
+    let depthSource: String
+    // Source-specific entries for metadata.json.
+    let details: [String: Any]
 
-    var colorDimensions: CMVideoDimensions { CMVideoFormatDescriptionGetDimensions(color.formatDescription) }
-    var depthDimensions: CMVideoDimensions { CMVideoFormatDescriptionGetDimensions(depth.formatDescription) }
-    var depthPixelFormat: OSType { CMFormatDescriptionGetMediaSubType(depth.formatDescription) }
     var depthBytesPerPixel: Int { [kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DisparityFloat16].contains(depthPixelFormat) ? 2 : 4 }
-    var frameRate: Double { 1 / CMTimeGetSeconds(frameDuration) }
 
-    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, at the highest frame rate both formats support.
-    static func best(for device: AVCaptureDevice) -> CaptureFormat? {
-        let depthTypeRank: [OSType: Int] = [
-            kCVPixelFormatType_DepthFloat32: 3,
-            kCVPixelFormatType_DepthFloat16: 2,
-            kCVPixelFormatType_DisparityFloat32: 1,
-            kCVPixelFormatType_DisparityFloat16: 0,
-        ]
-        var best: (CaptureFormat, [Int])?
-        for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-            let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
-            for depth in color.supportedDepthDataFormats {
-                guard let rank = depthTypeRank[CMFormatDescriptionGetMediaSubType(depth.formatDescription)],
-                      let frameDuration = shortestCommonFrameDuration(color, depth) else { continue }
-                let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                let key = [Int(depthDims.width) * Int(depthDims.height), rank, Int(colorDims.width) * Int(colorDims.height)]
-                if best == nil || best!.1.lexicographicallyPrecedes(key) {
-                    best = (CaptureFormat(color: color, depth: depth, frameDuration: frameDuration), key)
-                }
-            }
-        }
-        return best?.0
+    var summary: String {
+        "color \(colorWidth)×\(colorHeight) · depth \(depthWidth)×\(depthHeight) \(fourCC(depthPixelFormat)) · \(String(format: "%.0f", frameRate)) fps"
     }
 
-    // The shortest frame duration inside a supported range of both formats.
-    private static func shortestCommonFrameDuration(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format) -> CMTime? {
-        func supports(_ format: AVCaptureDevice.Format, _ duration: CMTime) -> Bool {
-            format.videoSupportedFrameRateRanges.contains { $0.minFrameDuration <= duration && duration <= $0.maxFrameDuration }
-        }
-        return (color.videoSupportedFrameRateRanges + depth.videoSupportedFrameRateRanges).map(\.minFrameDuration)
-            .filter { supports(color, $0) && supports(depth, $0) }
-            .min()
-    }
-
-    // Describes the formats for metadata.json.
+    // Describes the streams for metadata.json.
     func describe() -> [String: Any] {
-        [
-            "color_width": Int(colorDimensions.width),
-            "color_height": Int(colorDimensions.height),
-            "color_pixel_format": fourCC(CMFormatDescriptionGetMediaSubType(color.formatDescription)),
-            "depth_width": Int(depthDimensions.width),
-            "depth_height": Int(depthDimensions.height),
+        var described: [String: Any] = [
+            "color_width": colorWidth,
+            "color_height": colorHeight,
+            "color_pixel_format": fourCC(colorPixelFormat),
+            "depth_width": depthWidth,
+            "depth_height": depthHeight,
             "depth_pixel_format": fourCC(depthPixelFormat),
             "depth_bytes_per_pixel": depthBytesPerPixel,
+            "depth_source": depthSource,
             "frame_rate": frameRate,
-            "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
-                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                return "\(d.width)x\(d.height) \(fourCC(CMFormatDescriptionGetMediaSubType(f.formatDescription)))"
-            },
         ]
+        if let confidencePixelFormat {
+            precondition(confidencePixelFormat == kCVPixelFormatType_OneComponent8, "confidence pixel format \(fourCC(confidencePixelFormat)) is not one byte per pixel")
+            described["confidence_pixel_format"] = fourCC(confidencePixelFormat)
+            described["confidence_bytes_per_pixel"] = 1
+            described["confidence_description"] = "confidence.bin: one map per depth map, in depth.bin's order and layout (map n occupies bytes [n*depth_width*depth_height, (n+1)*depth_width*depth_height), rows tightly packed), UInt8 per pixel, ARConfidenceLevel of the depth pixel: 0 low, 1 medium, 2 high"
+        }
+        described.merge(details) { _, _ in preconditionFailure("source details repeat a stream key") }
+        return described
     }
+}
+
+// A depth map as a source delivers it, with what the recording writes about it.
+struct DepthSample {
+    let time: CMTime
+    // As delivered, never converted.
+    let map: CVPixelBuffer
+    // The same depth as Float32 metres, for the depth view and the stats.
+    let metres: CVPixelBuffer
+    // One UInt8 confidence per depth pixel, when the source delivers confidence.
+    let confidence: CVPixelBuffer?
+    // In depth-map pixels; nil when the map came without calibration.
+    let intrinsics: matrix_float3x3?
+    // The full calibration, described for metadata.json, computed only for the recording's first depth map.
+    let calibration: (() -> [String: Any])?
+    // The depth.csv cells filtered, accuracy and quality.
+    let filtered: String
+    let accuracy: String
+    let quality: String
+    // ARKit's camera-to-world pose of the frame and its tracking state; nil for a source without tracking.
+    let pose: simd_float4x4?
+    let tracking: String?
+}
+
+// Where a capture source delivers frames, on the queue it was given; a color frame comes before a depth frame with the same timestamp.
+protocol CaptureSink: AnyObject {
+    func captured(color: CMSampleBuffer, intrinsics: matrix_float3x3?)
+    func droppedColor(at time: CMTime, reason: String)
+    func captured(depth: DepthSample)
+    func droppedDepth(at time: CMTime, reason: String)
+    // Called on any queue, when capture is cut off: the camera was interrupted or failed.
+    func interrupted(_ reason: String)
+}
+
+// A camera's capture pipeline, started and stopped from one serial queue.
+protocol CaptureSource: AnyObject {
+    // Shows the live color stream; made on the main queue.
+    var preview: UIView { get }
+    // The capture device whose rotation gives each frame's upright rotation.
+    var device: AVCaptureDevice { get }
+    // Starts delivering frames; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
+    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void)
+    func stop()
+}
+
+// An intrinsic matrix with x scaled by scaleX and y by scaleY, e.g. from one image size to another.
+func scaled(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3x3 {
+    var s = k
+    s.columns.0.x *= scaleX
+    s.columns.2.x *= scaleX
+    s.columns.1.y *= scaleY
+    s.columns.2.y *= scaleY
+    return s
 }
 
 struct RecorderError: LocalizedError {

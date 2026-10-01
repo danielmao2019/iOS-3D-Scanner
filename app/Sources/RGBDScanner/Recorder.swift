@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import CoreMotion
 import Foundation
+import UIKit
 
 // What the screen shows about the stream: depth coverage all the time, frame counts while recording.
 struct CaptureStats {
@@ -63,110 +64,72 @@ final class OrientationTracker {
     }
 }
 
-// Runs the capture session and hands every color frame and every depth frame, each with its own timestamp, to the active recording.
-final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
-    let session = AVCaptureSession()
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let depthOutput = AVCaptureDepthDataOutput()
+// Runs the chosen camera's capture source and hands every color frame and every depth frame, each with its own timestamp, to the active recording.
+final class Recorder: CaptureSink {
     private let orientation = OrientationTracker()
     let depthPreview = DepthPreview()
-    private let sessionQueue = DispatchQueue(label: "recorder.session")
-    // Both outputs deliver on this one queue, so a recording sees its frames in arrival order.
+    // Starts and stops the sources, one at a time.
+    private let controlQueue = DispatchQueue(label: "recorder.control")
+    // Every source delivers on this one queue, so a recording sees its frames in arrival order.
     private let dataQueue = DispatchQueue(label: "recorder.data")
+    // One source per camera this phone has; made on the main queue, as their previews are views.
+    private var sources: [DepthCamera: CaptureSource] = [:]
+    // Owned by controlQueue.
+    private var running: CaptureSource?
 
     // Owned by dataQueue.
     private var camera: DepthCamera = .front
-    private var format: CaptureFormat?
+    private var format: StreamFormat?
     private var active: Recording?
     private var stats = CaptureStats()
     private var depthDelivered = 0
 
     var onStats: ((CaptureStats) -> Void)?
-    // Called on the main queue with the reason when capture is cut off: the session was interrupted or failed.
+    // Called on the main queue with the reason when capture is cut off: the camera was interrupted or failed.
     var onInterruption: ((String) -> Void)?
 
-    override init() {
-        super.init()
-        NotificationCenter.default.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { [weak self] notification in
-            let reason = (notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int).flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
-            self?.onInterruption?(Self.describe(reason))
-        }
-        NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] notification in
-            let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
-            self?.onInterruption?("the camera failed: \(error?.localizedDescription ?? "unknown error")")
+    init(cameras: [DepthCamera]) {
+        for camera in cameras {
+            switch camera {
+            case .front:
+                guard let device = AVFoundationSource.frontDevice else { preconditionFailure("the front TrueDepth camera is not available") }
+                sources[camera] = AVFoundationSource(device: device, sink: self, queue: dataQueue)
+            case .rear:
+                sources[camera] = ARKitSource(sink: self, queue: dataQueue)
+            }
         }
     }
 
-    // Configures the session for a camera and (re)starts it; returns a description of the chosen formats.
+    // The view showing the camera's live color stream.
+    func preview(for camera: DepthCamera) -> UIView {
+        source(camera).preview
+    }
+
+    private func source(_ camera: DepthCamera) -> CaptureSource {
+        guard let source = sources[camera] else { preconditionFailure("\(camera.label) is not available on this phone") }
+        return source
+    }
+
+    // Stops the running source and starts the camera's; completion gets a description of the stream format.
     func start(camera: DepthCamera, completion: @escaping (Result<String, Error>) -> Void) {
-        sessionQueue.async {
-            do {
-                // Intrinsic matrix delivery can be enabled only while the session is stopped.
-                if self.session.isRunning { self.session.stopRunning() }
-                let format = try self.configure(camera: camera)
-                self.session.startRunning()
-                self.dataQueue.sync {
-                    self.camera = camera
-                    self.format = format
-                    self.stats = CaptureStats()
+        let source = source(camera)
+        controlQueue.async {
+            if let running = self.running, running !== source { running.stop() }
+            self.running = source
+            // No recording starts until the new source's format is known.
+            self.dataQueue.sync { self.format = nil }
+            self.orientation.track(device: source.device)
+            source.start { result in
+                self.dataQueue.async {
+                    if case .success(let format) = result {
+                        self.camera = camera
+                        self.format = format
+                        self.stats = CaptureStats()
+                    }
+                    DispatchQueue.main.async { completion(result.map(\.summary)) }
                 }
-                let color = format.colorDimensions, depth = format.depthDimensions
-                let summary = "color \(color.width)×\(color.height) · depth \(depth.width)×\(depth.height) \(fourCC(format.depthPixelFormat)) · \(String(format: "%.0f", format.frameRate)) fps"
-                DispatchQueue.main.async { completion(.success(summary)) }
-            } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
             }
         }
-    }
-
-    private func configure(camera: DepthCamera) throws -> CaptureFormat {
-        guard let device = camera.device else { throw RecorderError("\(camera.label) is not available on this phone") }
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
-
-        session.inputs.forEach { session.removeInput($0) }
-        session.outputs.forEach { session.removeOutput($0) }
-        session.sessionPreset = .inputPriority
-
-        let input = try AVCaptureDeviceInput(device: device)
-        guard session.canAddInput(input) else { throw RecorderError("cannot add camera input") }
-        session.addInput(input)
-
-        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
-        videoOutput.alwaysDiscardsLateVideoFrames = false
-        videoOutput.setSampleBufferDelegate(self, queue: dataQueue)
-        guard session.canAddOutput(videoOutput) else { throw RecorderError("cannot add video output") }
-        session.addOutput(videoOutput)
-
-        // Raw sensor depth: Apple's filter smooths the stream over time and interpolates missing values.
-        depthOutput.isFilteringEnabled = false
-        depthOutput.alwaysDiscardsLateDepthData = false
-        depthOutput.setDelegate(self, callbackQueue: dataQueue)
-        guard session.canAddOutput(depthOutput) else { throw RecorderError("cannot add depth output") }
-        session.addOutput(depthOutput)
-
-        // Depth formats can be chosen only once the depth output is attached.
-        guard let format = CaptureFormat.best(for: device) else { throw RecorderError("no format with depth") }
-        try device.lockForConfiguration()
-        device.activeFormat = format.color
-        device.activeDepthDataFormat = format.depth
-        device.activeVideoMinFrameDuration = format.frameDuration
-        device.activeVideoMaxFrameDuration = format.frameDuration
-        device.activeDepthDataMinFrameDuration = format.frameDuration
-        device.unlockForConfiguration()
-
-        // Frames are kept in the sensor's own orientation and unmirrored, the orientation Apple's calibration describes; how the phone was held is recorded with each frame instead.
-        for connection in [videoOutput.connection(with: .video), depthOutput.connection(with: .depthData)].compactMap({ $0 }) {
-            if connection.isVideoMirroringSupported {
-                connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = false
-            }
-        }
-        if let video = videoOutput.connection(with: .video), video.isCameraIntrinsicMatrixDeliverySupported {
-            video.isCameraIntrinsicMatrixDeliveryEnabled = true
-        }
-        orientation.track(device: device)
-        return format
     }
 
     // Starts writing frames to a new recording.
@@ -196,9 +159,9 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         }
     }
 
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    func captured(color: CMSampleBuffer, intrinsics: matrix_float3x3?) {
         guard let active else { return }
-        if active.appendColor(sampleBuffer, orientation: orientation.snapshot()) {
+        if active.appendColor(color, intrinsics: intrinsics, orientation: orientation.snapshot()) {
             stats.colorFrames += 1
             if stats.colorFrames % 5 == 0 { publishStats() }
         } else {
@@ -206,38 +169,32 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         }
     }
 
-    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    func droppedColor(at time: CMTime, reason: String) {
         guard let active else { return }
         stats.droppedColor += 1
-        active.recordDroppedColor(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), reason: "dropped")
+        active.recordDroppedColor(at: time, reason: reason)
     }
 
-    func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
+    func captured(depth: DepthSample) {
         depthDelivered += 1
-        depthPreview.offer(depthData, at: timestamp, uprightRotationDegrees: orientation.snapshot().uprightRotationDegrees, camera: camera)
+        depthPreview.offer(depth.metres, at: depth.time, uprightRotationDegrees: orientation.snapshot().uprightRotationDegrees, camera: camera)
         if depthDelivered % 15 == 1 {
-            (stats.depthValidFraction, stats.depthMedianMeters) = Self.depthSummary(depthData)
+            (stats.depthValidFraction, stats.depthMedianMeters) = Self.depthSummary(depth.metres)
             if active == nil { publishStats() }
         }
         guard let active else { return }
         stats.depthFrames += 1
-        active.appendDepth(depthData, at: timestamp, orientation: orientation.snapshot())
+        active.appendDepth(depth, orientation: orientation.snapshot())
     }
 
-    func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection, reason: AVCaptureOutput.DataDroppedReason) {
+    func droppedDepth(at time: CMTime, reason: String) {
         guard let active else { return }
         stats.droppedDepth += 1
-        active.recordDroppedDepth(at: timestamp, reason: Recording.describe(reason))
+        active.recordDroppedDepth(at: time, reason: reason)
     }
 
-    private static func describe(_ reason: AVCaptureSession.InterruptionReason?) -> String {
-        switch reason {
-        case .videoDeviceNotAvailableInBackground: return "the app went to the background"
-        case .videoDeviceInUseByAnotherClient: return "another app took the camera"
-        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "the camera is unavailable with several apps on screen"
-        case .videoDeviceNotAvailableDueToSystemPressure: return "the phone is under too much load or too hot"
-        default: return "the camera was interrupted"
-        }
+    func interrupted(_ reason: String) {
+        DispatchQueue.main.async { self.onInterruption?(reason) }
     }
 
     private func publishStats() {
@@ -245,9 +202,9 @@ final class Recorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AV
         DispatchQueue.main.async { self.onStats?(snapshot) }
     }
 
-    // Fraction of pixels with a reading and their median depth in metres, from every 4th pixel of every 4th row.
-    private static func depthSummary(_ depthData: AVDepthData) -> (Double, Double) {
-        let map = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap
+    // Fraction of pixels with a reading and their median depth in metres, from every 4th pixel of every 4th row of a Float32 metres map.
+    private static func depthSummary(_ map: CVPixelBuffer) -> (Double, Double) {
+        precondition(CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat32, "depth summary of a map that is not Float32 metres")
         CVPixelBufferLockBaseAddress(map, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
         let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)

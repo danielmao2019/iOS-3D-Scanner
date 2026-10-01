@@ -1,4 +1,3 @@
-import AVFoundation
 import SwiftUI
 
 struct ContentView: View {
@@ -19,7 +18,9 @@ struct ContentView: View {
             }
 
             ZStack {
-                PreviewView(session: model.recorder.session)
+                if model.availableCameras.contains(model.camera) {
+                    PreviewView(view: model.recorder.preview(for: model.camera)).id(model.camera)
+                }
                 if model.showsDepth {
                     Color.black
                     if let frame = model.depthFrame {
@@ -124,22 +125,11 @@ struct ContentView: View {
     }
 }
 
-// Shows the capture session's color stream.
+// Shows a capture source's live color stream, a view the source owns.
 struct PreviewView: UIViewRepresentable {
-    let session: AVCaptureSession
+    let view: UIView
 
-    final class LayerView: UIView {
-        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-        var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
-    }
+    func makeUIView(context: Context) -> UIView { view }
 
-    func makeUIView(context: Context) -> LayerView {
-        let view = LayerView()
-        view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspect
-        view.backgroundColor = .black
-        return view
-    }
-
-    func updateUIView(_ uiView: LayerView, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }

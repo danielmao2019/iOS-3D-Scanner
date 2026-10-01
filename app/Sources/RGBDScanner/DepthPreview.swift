@@ -39,7 +39,8 @@ final class DepthPreview {
         return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
     }
 
-    func offer(_ depthData: AVDepthData, at time: CMTime, uprightRotationDegrees: Int, camera: DepthCamera) {
+    // Takes a depth map of Float32 metres, shown as delivered.
+    func offer(_ map: CVPixelBuffer, at time: CMTime, uprightRotationDegrees: Int, camera: DepthCamera) {
         let seconds = CMTimeGetSeconds(time)
         lock.lock()
         let take = enabled && !busy && seconds - lastTime >= Self.minInterval
@@ -47,7 +48,7 @@ final class DepthPreview {
         lock.unlock()
         guard take else { return }
         queue.async {
-            let frame = Self.render(depthData, uprightRotationDegrees: uprightRotationDegrees, camera: camera)
+            let frame = Self.render(map, uprightRotationDegrees: uprightRotationDegrees, camera: camera)
             self.lock.lock()
             self.busy = false
             self.lock.unlock()
@@ -55,8 +56,8 @@ final class DepthPreview {
         }
     }
 
-    private static func render(_ depthData: AVDepthData, uprightRotationDegrees: Int, camera: DepthCamera) -> DepthFrame {
-        let map = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap
+    private static func render(_ map: CVPixelBuffer, uprightRotationDegrees: Int, camera: DepthCamera) -> DepthFrame {
+        precondition(CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat32, "depth view of a map that is not Float32 metres")
         CVPixelBufferLockBaseAddress(map, .readOnly)
         let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(map)
