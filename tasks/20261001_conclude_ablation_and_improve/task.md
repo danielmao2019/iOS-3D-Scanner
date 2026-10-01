@@ -12,4 +12,4 @@ goal: conclude ablation and improve app
 2. depth filter is supported for both front and rear camera but neither should turn it on.
 3. confidence map from arkit for rear camera depth should be recorded.
 4. color stream was lossy. this is wrong and must be fixed.
-5. i want the camera poses be exported when possible as well, just for the sake of making comparisons.
+5. i want the camera poses be exported when possible as well, just for the sake of making comparisons (do NOT understand as I trust the quality of the camera poses).
