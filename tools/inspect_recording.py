@@ -13,8 +13,6 @@ import numpy as np
 
 from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, SAME_INSTANT_S, Recording, valid
 
-POSE = tuple(f"pose_{r}{c}" for r in range(4) for c in range(4))
-
 
 def alignment_offset(rec: Recording, grads: List[np.ndarray]) -> Dict[int, float]:
     """For each timestamp pair, how strongly the depth map's edges sit on color edges of the color frame `offset` frames away; the true pairing scores highest at offset 0."""
@@ -115,7 +113,6 @@ def main() -> None:
             )
         if rec.confidence is not None:
             checks["confidence maps in confidence.bin == depth maps, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
-            checks["every depth frame has a tracking state and a pose"] = all(r["tracking"] and all(r[k] for k in POSE) for r in rec.depths)
         for name, ok in checks.items():
             print(f"[{'PASS' if ok else 'FAIL'}] {name}")
 

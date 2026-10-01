@@ -16,7 +16,7 @@ import UIKit
 //   depth.bin       depth maps exactly as the source delivered them (filtered by Apple only when metadata.json's depth_filtering_enabled: AVFoundation's depth filter, or ARKit's smoothed scene depth), concatenated with no header: map n occupies bytes [n*size, (n+1)*size), size = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
 //   depth8_h264_w512.mov, depth8_h264_w480_stridewidth.mov, depth8_h264_w480.mov   avfoundation_truedepth only: the depth maps again, as three commits of an earlier app encoded them (see Depth8Track and metadata.json's depth8_h264), for ablations; the n-th sample is depth map n, at depth.csv's timestamp minus the first depth map's
 //   confidence.bin  arkit_scene_depth only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
-//   depth.csv       one row per depth map delivered or dropped, with its intrinsics in depth-map pixels, scaled from the color camera's intrinsics (the depth is registered to the color camera): avfoundation_truedepth and avfoundation_lidar from the calibration's intrinsic reference dimensions, arkit_scene_depth from the captured image's; filtered/accuracy/quality are AVDepthData's, and for ARKit "1" when smoothed else "0"/"absolute"/empty; bytes_per_row is the delivered map's row stride, which depth.bin drops; arkit_scene_depth rows also carry the tracking state and the 4x4 camera-to-world pose pose_00..pose_33, row-major, in metadata.json's pose_convention
+//   depth.csv       one row per depth map delivered or dropped, with its intrinsics in depth-map pixels, scaled from the color camera's intrinsics (the depth is registered to the color camera): avfoundation_truedepth and avfoundation_lidar from the calibration's intrinsic reference dimensions, arkit_scene_depth from the captured image's; filtered/accuracy/quality are AVDepthData's, and for ARKit "1" when smoothed else "0"/"absolute"/empty; bytes_per_row is the delivered map's row stride, which depth.bin drops
 //   metadata.json   id, name, duration, device, depth source, formats and frame rate, conventions, the first depth map's calibration at the intrinsic reference dimensions, counts, whether it was recovered after the app stopped, the color video's error if its writer failed, and, for avfoundation_truedepth, how the 8-bit depth tracks were made (depth8_h264) and their writers' error (depth8_h264_error)
 //
 // The work directory holds everything packing needs, so a directory left by a closed app or a failed pack is packed at the next launch:
@@ -34,8 +34,7 @@ final class Recording {
     static let intrinsicsColumns = "fx,fy,cx,cy"
     static let orientationColumns = "upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts"
     static let colorHeader = "index,timestamp,dropped," + intrinsicsColumns + "," + orientationColumns
-    static let poseColumns = "tracking," + (0..<4).flatMap { r in (0..<4).map { c in "pose_\(r)\(c)" } }.joined(separator: ",")
-    static let depthHeader = "index,timestamp,dropped,filtered,accuracy,quality," + intrinsicsColumns + "," + orientationColumns + "," + poseColumns + ",bytes_per_row"
+    static let depthHeader = "index,timestamp,dropped,filtered,accuracy,quality," + intrinsicsColumns + "," + orientationColumns + ",bytes_per_row"
 
     private let directory: URL
     private let format: StreamFormat
@@ -192,12 +191,12 @@ final class Recording {
             }
         }
         append([String(depthCount), seconds(depth.time), "", depth.filtered, depth.accuracy, depth.quality]
-               + Self.columns(depth.intrinsics) + [Self.columns(orientation), Self.columns(tracking: depth.tracking, pose: depth.pose), String(bytesPerRow)], to: depthTable)
+               + Self.columns(depth.intrinsics) + [Self.columns(orientation), String(bytesPerRow)], to: depthTable)
         depthCount += 1
     }
 
     func recordDroppedDepth(at time: CMTime, reason: String) {
-        append(["-1", seconds(time), reason] + Array(repeating: "", count: 7) + [Self.columns(nil), Self.columns(tracking: nil, pose: nil), ""], to: depthTable)
+        append(["-1", seconds(time), reason] + Array(repeating: "", count: 7) + [Self.columns(nil), ""], to: depthTable)
     }
 
     // Copies the map's rows without their padding, then writes them off the capture queue; returns the copy and the map's bytes per row.
@@ -444,16 +443,6 @@ final class Recording {
     private static func columns(_ k: matrix_float3x3?) -> [String] {
         guard let k else { return ["", "", "", ""] }
         return [k.columns.0.x, k.columns.1.y, k.columns.2.x, k.columns.2.y].map { String($0) }
-    }
-
-    // The tracking state and the pose, row-major; empty for a source without tracking and on a dropped row.
-    private static func columns(tracking: String?, pose: simd_float4x4?) -> String {
-        guard let tracking, let pose else {
-            precondition(tracking == nil && pose == nil, "a pose without its tracking state, or the reverse")
-            return String(repeating: ",", count: 16)
-        }
-        let m = [pose.columns.0, pose.columns.1, pose.columns.2, pose.columns.3]
-        return ([tracking] + (0..<4).flatMap { r in (0..<4).map { c in String(m[c][r]) } }).joined(separator: ",")
     }
 
     // A dropped frame has no orientation.

@@ -24,7 +24,7 @@ enum DepthSource: String, CaseIterable, Decodable {
     case avfoundationTrueDepth = "avfoundation_truedepth"
     // The LiDAR depth camera through AVFoundation, at its highest depth resolution.
     case avfoundationLiDAR = "avfoundation_lidar"
-    // ARKit's scene depth, densified by Apple, down to about 0.2 m, with confidence and pose; with the depth filter on, its temporally smoothed variant.
+    // ARKit's scene depth, densified by Apple, down to about 0.2 m, with confidence; with the depth filter on, its temporally smoothed variant.
     case arkitSceneDepth = "arkit_scene_depth"
 
     var camera: DepthCamera { self == .avfoundationTrueDepth ? .front : .rear }
@@ -95,9 +95,6 @@ struct DepthSample {
     let filtered: String
     let accuracy: String
     let quality: String
-    // ARKit's camera-to-world pose of the frame and its tracking state; nil for a source without tracking.
-    let pose: simd_float4x4?
-    let tracking: String?
 }
 
 // Where a capture source delivers frames, on the queue it was given; a color frame comes before a depth frame with the same timestamp.

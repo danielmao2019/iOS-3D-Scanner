@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// The rear LiDAR camera through an ARSession running world tracking with scene depth: each ARFrame carries the color image, the LiDAR depth registered to it, unsmoothed (sceneDepth) or, with the depth filter on, smoothed over time (smoothedSceneDepth), the depth's confidence and the camera's pose, all at the frame's timestamp.
+// The rear LiDAR camera through an ARSession running world tracking with scene depth: each ARFrame carries the color image, the LiDAR depth registered to it, unsmoothed (sceneDepth) or, with the depth filter on, smoothed over time (smoothedSceneDepth) and the depth's confidence, all at the frame's timestamp.
 final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     let device: AVCaptureDevice
     var preview: UIView { display }
@@ -92,9 +92,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             },
             filtered: smoothed ? "1" : "0",
             accuracy: "absolute",
-            quality: "",
-            pose: camera.transform,
-            tracking: Self.describe(camera.trackingState)))
+            quality: ""))
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
@@ -125,7 +123,6 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             depthSource: .arkitSceneDepth,
             details: [
                 "arkit_frame_semantics": [smoothed ? "smoothedSceneDepth" : "sceneDepth"],
-                "pose_convention": "depth.csv pose_00..pose_33 is ARFrame.camera.transform, row-major (pose_rc is row r, column c): camera-to-world, metres; world is ARKit's session frame (y up against gravity, origin where the session started); camera axes are ARKit's, fixed to the captured image in the sensor's native orientation: x toward increasing pixel column, y toward decreasing pixel row, z backward, away from the scene; tracking is ARFrame.camera.trackingState, and the pose is unreliable unless it is normal",
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),
             ]))
@@ -133,18 +130,6 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     private static func describe(_ format: ARConfiguration.VideoFormat) -> String {
         "\(Int(format.imageResolution.width))x\(Int(format.imageResolution.height)) \(format.framesPerSecond) fps \(format.captureDeviceType.rawValue)"
-    }
-
-    private static func describe(_ state: ARCamera.TrackingState) -> String {
-        switch state {
-        case .normal: return "normal"
-        case .notAvailable: return "not_available"
-        case .limited(.initializing): return "limited_initializing"
-        case .limited(.excessiveMotion): return "limited_excessive_motion"
-        case .limited(.insufficientFeatures): return "limited_insufficient_features"
-        case .limited(.relocalizing): return "limited_relocalizing"
-        case .limited: return "limited_unknown"
-        }
     }
 
     // The captured image as a sample buffer at the frame's timestamp, for the video writer.

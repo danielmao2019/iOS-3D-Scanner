@@ -127,9 +127,7 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             calibration: cal.map { cal in { Self.describe(cal) } },
             filtered: depthData.isDepthDataFiltered ? "1" : "0",
             accuracy: depthData.depthDataAccuracy == .absolute ? "absolute" : "relative",
-            quality: depthData.depthDataQuality == .high ? "high" : "low",
-            pose: nil,
-            tracking: nil))
+            quality: depthData.depthDataQuality == .high ? "high" : "low"))
     }
 
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection, reason: AVCaptureOutput.DataDroppedReason) {
