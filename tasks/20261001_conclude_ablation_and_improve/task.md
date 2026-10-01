@@ -15,7 +15,7 @@ goal: conclude ablation and improve app
    2. camera focus
 3. wrong data:
    1. depth filter is supported for both front and rear camera but neither should turn it on.
-   2. intrinsics
+   2. per-frame camera intrinsics matching the color and depth frames are not obtainable during data collection.
 4. additional data:
    1. confidence map from arkit for rear camera depth should be recorded.
    2. i want the camera poses be exported when possible as well, just for the sake of making comparisons (do NOT understand as I trust the quality of the camera poses).
