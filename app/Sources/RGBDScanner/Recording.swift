@@ -413,12 +413,12 @@ final class Recording {
         return frames
     }
 
-    // The depth configuration, as the id spells it and as the default name says it: the rear camera's depth source, lidar or arkit, then filteroff or filteron.
+    // The depth configuration, as the id spells it and as the default name says it: the rear camera's depth source, avfoundation or arkit (both read the LiDAR sensor), then filteroff or filteron.
     private static func depthConfig(_ depthSource: DepthSource, filtered: Bool) -> (id: String, name: String) {
         let filter = filtered ? (id: "filteron", name: "filter on") : (id: "filteroff", name: "filter off")
         switch depthSource {
         case .avfoundationTrueDepth: return (filter.id, "Front \(filter.name)")
-        case .avfoundationLiDAR: return ("lidar_\(filter.id)", "Rear LiDAR \(filter.name)")
+        case .avfoundationLiDAR: return ("avfoundation_\(filter.id)", "Rear AVFoundation \(filter.name)")
         case .arkitSceneDepth: return ("arkit_\(filter.id)", "Rear ARKit \(filter.name)")
         }
     }

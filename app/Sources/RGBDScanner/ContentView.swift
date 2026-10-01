@@ -19,7 +19,7 @@ struct ContentView: View {
 
             if model.camera == .rear {
                 Picker("Depth source", selection: $model.rearDepthSource) {
-                    Text("Depth source LiDAR").tag(DepthSource.avfoundationLiDAR)
+                    Text("Depth source AVFoundation").tag(DepthSource.avfoundationLiDAR)
                     Text("Depth source ARKit").tag(DepthSource.arkitSceneDepth)
                 }
                 .pickerStyle(.segmented)
