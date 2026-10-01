@@ -75,6 +75,8 @@ struct RecordingFile: Identifiable {
 
 final class AppModel: ObservableObject {
     @Published var camera: DepthCamera = .front
+    // Apple's depth filter for the front camera; the rear camera has none.
+    @Published var depthFiltering = false
     @Published var formatSummary = ""
     @Published var stats = CaptureStats()
     // From Start or Later until the recording is running.
@@ -131,7 +133,7 @@ final class AppModel: ObservableObject {
         let directories = Recording.leftovers()
         DispatchQueue.global(qos: .utility).async {
             for directory in directories {
-                let result = Result { try Recording.pack(directory, userName: nil, colorVideoError: nil, recovered: true) }
+                let result = Result { try Recording.pack(directory, userName: nil, colorVideoError: nil, depth8Error: nil, recovered: true) }
                 DispatchQueue.main.async { self.packed(result, note: "Recovered an unfinished recording") }
             }
         }
@@ -143,7 +145,7 @@ final class AppModel: ObservableObject {
                 guard granted else { self.message = "Camera access denied"; return }
                 guard !self.availableCameras.isEmpty else { self.message = "This phone has no depth camera"; return }
                 self.formatSummary = ""
-                self.recorder.start(camera: self.camera) { result in
+                self.recorder.start(camera: self.camera, depthFiltering: self.camera == .front && self.depthFiltering) { result in
                     switch result {
                     case .success(let summary): self.formatSummary = summary
                     case .failure(let error): self.message = error.localizedDescription

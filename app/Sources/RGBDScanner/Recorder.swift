@@ -110,8 +110,8 @@ final class Recorder: CaptureSink {
         return source
     }
 
-    // Stops the running source and starts the camera's; completion gets a description of the stream format.
-    func start(camera: DepthCamera, completion: @escaping (Result<String, Error>) -> Void) {
+    // Stops the running source and starts the camera's, depth filtered or not; completion gets a description of the stream format.
+    func start(camera: DepthCamera, depthFiltering: Bool, completion: @escaping (Result<String, Error>) -> Void) {
         let source = source(camera)
         controlQueue.async {
             if let running = self.running, running !== source { running.stop() }
@@ -119,7 +119,7 @@ final class Recorder: CaptureSink {
             // No recording starts until the new source's format is known.
             self.dataQueue.sync { self.format = nil }
             self.orientation.track(device: source.device)
-            source.start { result in
+            source.start(depthFiltering: depthFiltering) { result in
                 self.dataQueue.async {
                     if case .success(let format) = result {
                         self.camera = camera

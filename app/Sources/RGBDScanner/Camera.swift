@@ -29,6 +29,8 @@ struct StreamFormat {
     // The pixel format of the per-pixel confidence maps, the size of the depth maps; nil when the source delivers none.
     let confidencePixelFormat: OSType?
     let frameRate: Double
+    // Whether the source smooths depth over time and fills holes: AVCaptureDepthDataOutput.isFilteringEnabled for the front camera, always false for the rear.
+    let depthFilteringEnabled: Bool
     // "avfoundation_truedepth" or "arkit_scene_depth".
     let depthSource: String
     // Source-specific entries for metadata.json.
@@ -37,7 +39,7 @@ struct StreamFormat {
     var depthBytesPerPixel: Int { [kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DisparityFloat16].contains(depthPixelFormat) ? 2 : 4 }
 
     var summary: String {
-        "color \(colorWidth)×\(colorHeight) · depth \(depthWidth)×\(depthHeight) \(fourCC(depthPixelFormat)) · \(String(format: "%.0f", frameRate)) fps"
+        "color \(colorWidth)×\(colorHeight) · depth \(depthWidth)×\(depthHeight) \(fourCC(depthPixelFormat))\(depthFilteringEnabled ? " filtered" : "") · \(String(format: "%.0f", frameRate)) fps"
     }
 
     // Describes the streams for metadata.json.
@@ -51,6 +53,7 @@ struct StreamFormat {
             "depth_pixel_format": fourCC(depthPixelFormat),
             "depth_bytes_per_pixel": depthBytesPerPixel,
             "depth_source": depthSource,
+            "depth_filtering_enabled": depthFilteringEnabled,
             "frame_rate": frameRate,
         ]
         if let confidencePixelFormat {
@@ -102,8 +105,8 @@ protocol CaptureSource: AnyObject {
     var preview: UIView { get }
     // The capture device whose rotation gives each frame's upright rotation.
     var device: AVCaptureDevice { get }
-    // Starts delivering frames; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
-    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void)
+    // Starts delivering frames, depth filtered or not; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
+    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void)
     func stop()
 }
 

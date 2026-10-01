@@ -34,7 +34,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         session.delegateQueue = queue
     }
 
-    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+        precondition(!depthFiltering, "the rear camera has no depth filter setting")
         let configuration = ARWorldTrackingConfiguration()
         configuration.videoFormat = videoFormat
         // Not .smoothedSceneDepth, which ARKit smooths over time.
@@ -115,6 +116,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             depthWidth: depthWidth, depthHeight: depthHeight, depthPixelFormat: CVPixelBufferGetPixelFormatType(map),
             confidencePixelFormat: CVPixelBufferGetPixelFormatType(confidence),
             frameRate: Double(videoFormat.framesPerSecond),
+            depthFilteringEnabled: false,
             depthSource: "arkit_scene_depth",
             details: [
                 "arkit_frame_semantics": ["sceneDepth"],

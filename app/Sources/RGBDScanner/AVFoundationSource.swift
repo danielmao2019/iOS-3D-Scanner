@@ -1,7 +1,7 @@
 import AVFoundation
 import UIKit
 
-// The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp, unfiltered.
+// The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered unless the start asks for Apple's filter.
 final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
     static var frontDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) }
 
@@ -34,13 +34,13 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         }
     }
 
-    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
         ready(Result {
             // Intrinsic matrix delivery can be enabled only while the session is stopped.
             if session.isRunning { session.stopRunning() }
-            let format = try configure()
+            let format = try configure(depthFiltering: depthFiltering)
             session.startRunning()
-            return format.stream
+            return format.stream(depthFiltering: depthFiltering)
         })
     }
 
@@ -48,7 +48,7 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         session.stopRunning()
     }
 
-    private func configure() throws -> CaptureFormat {
+    private func configure(depthFiltering: Bool) throws -> CaptureFormat {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
@@ -66,8 +66,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         guard session.canAddOutput(videoOutput) else { throw RecorderError("cannot add video output") }
         session.addOutput(videoOutput)
 
-        // Raw sensor depth: Apple's filter smooths the stream over time and interpolates missing values.
-        depthOutput.isFilteringEnabled = false
+        // Off gives raw sensor depth; Apple's filter smooths the stream over time and interpolates missing values.
+        depthOutput.isFilteringEnabled = depthFiltering
         depthOutput.alwaysDiscardsLateDepthData = false
         depthOutput.setDelegate(self, callbackQueue: queue)
         guard session.canAddOutput(depthOutput) else { throw RecorderError("cannot add depth output") }
@@ -192,7 +192,7 @@ private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     let frameDuration: CMTime
 
-    var stream: StreamFormat {
+    func stream(depthFiltering: Bool) -> StreamFormat {
         let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
         let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
         return StreamFormat(
@@ -200,6 +200,7 @@ private struct CaptureFormat {
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
             frameRate: 1 / CMTimeGetSeconds(frameDuration),
+            depthFilteringEnabled: depthFiltering,
             depthSource: "avfoundation_truedepth",
             details: [
                 "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in

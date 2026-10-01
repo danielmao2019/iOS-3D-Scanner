@@ -17,6 +17,16 @@ struct ContentView: View {
                 Text(only.label).font(.headline)
             }
 
+            if model.camera == .front {
+                Picker("Depth filter", selection: $model.depthFiltering) {
+                    Text("Depth filter Off").tag(false)
+                    Text("Depth filter On").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.isStarting || model.isRecording || model.isFinishing)
+                .onChange(of: model.depthFiltering) { _, _ in model.startPreview() }
+            }
+
             ZStack {
                 if model.availableCameras.contains(model.camera) {
                     PreviewView(view: model.recorder.preview(for: model.camera)).id(model.camera)
