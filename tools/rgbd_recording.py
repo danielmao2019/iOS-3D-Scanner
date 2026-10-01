@@ -1,8 +1,8 @@
 """Reads an RGBD Scanner recording (.tar): metadata, the color and depth tables, the depth maps, their confidence maps when the depth source has them, the color frames, and a front recording's 8-bit H.264 depth tracks. `read` opens any format_version: 1 through FramesRecording, 2 to 5 through Recording.
 
-Format history: 1 holds one frames.csv row per color/depth synchronizer pair instead of color.csv and depth.csv; 2 has color.csv and depth.csv without intrinsics in color.csv; 3 adds per-stream intrinsics; 4 adds metadata.json's depth_source and, for "arkit_scene_depth", confidence.bin; 5 adds the 8-bit depth tracks of "avfoundation_truedepth" recordings.
+Format history: 1 holds one frames.csv row per color/depth synchronizer pair instead of color.csv and depth.csv; 2 has color.csv and depth.csv without intrinsics in color.csv; 3 adds per-stream intrinsics; 4 adds metadata.json's depth_source and, for "arkit_scene_depth", confidence.bin; 5 adds the 8-bit depth tracks of "avfoundation_truedepth" recordings and the rear "avfoundation_lidar" depth source.
 
-Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal; a color frame that was dropped, or lost when the app was closed mid-recording, keeps its timestamp as a dropped row (index -1). Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels. metadata.json's depth_source says where the depth came from: "avfoundation_truedepth" (front) or "arkit_scene_depth" (rear), whose recordings also hold confidence.bin (UInt8 ARConfidenceLevel per depth pixel: 0 low, 1 medium, 2 high) and a camera pose per depth row. Each delivered depth row has the delivered map's row stride, bytes_per_row, which depth.bin drops. "avfoundation_truedepth" recordings also hold the depth maps as an earlier app encoded them, 8-bit H.264 tracks described by metadata.json's depth8_h264, in the earlier app's portrait mirrored layout (track pixel (r, c) is depth map pixel (c, r)); depth8_metres turns a track's codes back into metres in the sensor's orientation.
+Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal; a color frame that was dropped, or lost when the app was closed mid-recording, keeps its timestamp as a dropped row (index -1). Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels. metadata.json's depth_source says where the depth came from: "avfoundation_truedepth" (front), "avfoundation_lidar" (rear, the LiDAR depth camera through AVFoundation) or "arkit_scene_depth" (rear), whose recordings alone also hold confidence.bin (UInt8 ARConfidenceLevel per depth pixel: 0 low, 1 medium, 2 high) and a camera pose per depth row. Each delivered depth row has the delivered map's row stride, bytes_per_row, which depth.bin drops. "avfoundation_truedepth" recordings also hold the depth maps as an earlier app encoded them, 8-bit H.264 tracks described by metadata.json's depth8_h264, in the earlier app's portrait mirrored layout (track pixel (r, c) is depth map pixel (c, r)); depth8_metres turns a track's codes back into metres in the sensor's orientation.
 """
 
 import csv
@@ -19,7 +19,7 @@ DEPTH_DTYPES = {"fdep": "<f4", "hdep": "<f2"}
 FILES = {"color.mov", "color.csv", "depth.bin", "depth.csv", "metadata.json"}
 FRAMES_FILES = {"color.mov", "depth.bin", "frames.csv", "metadata.json"}
 CONFIDENCE_FILE = "confidence.bin"
-DEPTH_SOURCES = ("avfoundation_truedepth", "arkit_scene_depth")
+DEPTH_SOURCES = ("avfoundation_truedepth", "avfoundation_lidar", "arkit_scene_depth")
 HIGH_CONFIDENCE = 2
 INTRINSICS = ("fx", "fy", "cx", "cy")
 SAME_INSTANT_S = 0.0005
@@ -37,6 +37,8 @@ class Recording:
             assert ("depth_source" in self.meta) == (version >= 4), (version, sorted(self.meta))
             depth_source = self.meta["depth_source"] if version >= 4 else None
             assert depth_source is None or depth_source in DEPTH_SOURCES, depth_source
+            # The rear LiDAR depth camera through AVFoundation came with format 5.
+            assert depth_source != "avfoundation_lidar" or version == 5, (version, depth_source)
             # The depth source's metadata describes its confidence maps exactly when it delivers them.
             self.has_confidence = "confidence_pixel_format" in self.meta
             assert self.has_confidence == (depth_source == "arkit_scene_depth"), (depth_source, self.has_confidence)

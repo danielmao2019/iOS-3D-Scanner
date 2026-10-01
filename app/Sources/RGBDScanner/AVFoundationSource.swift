@@ -1,11 +1,13 @@
 import AVFoundation
 import UIKit
 
-// The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered unless the start asks for Apple's filter.
+// The front TrueDepth camera or the rear LiDAR depth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered unless the start asks for Apple's filter.
 final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
     static var frontDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) }
+    static var rearDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) }
 
     let device: AVCaptureDevice
+    private let depthSource: DepthSource
     let preview: UIView
     private let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -14,8 +16,10 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     private let queue: DispatchQueue
 
     // Both outputs deliver on queue, so the sink sees the frames in arrival order.
-    init(device: AVCaptureDevice, sink: CaptureSink, queue: DispatchQueue) {
+    init(device: AVCaptureDevice, depthSource: DepthSource, sink: CaptureSink, queue: DispatchQueue) {
+        precondition(depthSource != .arkitSceneDepth, "ARKit's scene depth is not an AVFoundation source")
         self.device = device
+        self.depthSource = depthSource
         self.sink = sink
         self.queue = queue
         let view = PreviewLayerView()
@@ -40,7 +44,7 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             if session.isRunning { session.stopRunning() }
             let format = try configure(depthFiltering: depthFiltering)
             session.startRunning()
-            return format.stream(depthFiltering: depthFiltering)
+            return format.stream(depthFiltering: depthFiltering, depthSource: depthSource)
         })
     }
 
@@ -192,7 +196,7 @@ private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     let frameDuration: CMTime
 
-    func stream(depthFiltering: Bool) -> StreamFormat {
+    func stream(depthFiltering: Bool, depthSource: DepthSource) -> StreamFormat {
         let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
         let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
         return StreamFormat(
@@ -201,7 +205,7 @@ private struct CaptureFormat {
             confidencePixelFormat: nil,
             frameRate: 1 / CMTimeGetSeconds(frameDuration),
             depthFilteringEnabled: depthFiltering,
-            depthSource: "avfoundation_truedepth",
+            depthSource: depthSource,
             details: [
                 "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
                     let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)

@@ -8,15 +8,15 @@ import UIKit
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal.
 // All pixels, and the intrinsics, are in the sensor's native orientation, unrotated and unmirrored; each frame records how the phone was held.
 // Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels; they are empty on a dropped row, and on a color row whose frame came without them.
-// The depth comes from metadata.json's depth_source: "avfoundation_truedepth" (front: the TrueDepth camera through AVFoundation, color and depth from separate outputs) or "arkit_scene_depth" (rear: ARKit's LiDAR scene depth, not its temporally smoothed variant, with color and depth from the same ARFrame and so always at the same timestamp).
+// The depth comes from metadata.json's depth_source: "avfoundation_truedepth" (front: the TrueDepth camera through AVFoundation, color and depth from separate outputs), "avfoundation_lidar" (rear: the LiDAR depth camera through AVFoundation, color and depth from separate outputs) or "arkit_scene_depth" (rear: ARKit's LiDAR scene depth, its temporally smoothed variant when depth_filtering_enabled (metadata.json's arkit_frame_semantics), with color and depth from the same ARFrame and so always at the same timestamp).
 //
 // The archive (format_version 5):
 //   color.mov       HEVC color video; its n-th frame is the row with index n in color.csv. Its display transform is the first frame's upright rotation, so players show it upright.
 //   color.csv       one row per color frame delivered or dropped, with the frame's intrinsics in color-frame pixels
-//   depth.bin       depth maps exactly as the source delivered them (filtered by Apple only when metadata.json's depth_filtering_enabled), concatenated with no header: map n occupies bytes [n*size, (n+1)*size), size = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
+//   depth.bin       depth maps exactly as the source delivered them (filtered by Apple only when metadata.json's depth_filtering_enabled: AVFoundation's depth filter, or ARKit's smoothed scene depth), concatenated with no header: map n occupies bytes [n*size, (n+1)*size), size = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
 //   depth8_h264_w512.mov, depth8_h264_w480_stridewidth.mov, depth8_h264_w480.mov   avfoundation_truedepth only: the depth maps again, as three commits of an earlier app encoded them (see Depth8Track and metadata.json's depth8_h264), for ablations; the n-th sample is depth map n, at depth.csv's timestamp minus the first depth map's
 //   confidence.bin  arkit_scene_depth only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
-//   depth.csv       one row per depth map delivered or dropped, with its intrinsics in depth-map pixels, scaled from the color camera's intrinsics (the depth is registered to the color camera): avfoundation_truedepth from the calibration's intrinsic reference dimensions, arkit_scene_depth from the captured image's; filtered/accuracy/quality are AVDepthData's, and "0"/"absolute"/empty for ARKit; bytes_per_row is the delivered map's row stride, which depth.bin drops; arkit_scene_depth rows also carry the tracking state and the 4x4 camera-to-world pose pose_00..pose_33, row-major, in metadata.json's pose_convention
+//   depth.csv       one row per depth map delivered or dropped, with its intrinsics in depth-map pixels, scaled from the color camera's intrinsics (the depth is registered to the color camera): avfoundation_truedepth and avfoundation_lidar from the calibration's intrinsic reference dimensions, arkit_scene_depth from the captured image's; filtered/accuracy/quality are AVDepthData's, and for ARKit "1" when smoothed else "0"/"absolute"/empty; bytes_per_row is the delivered map's row stride, which depth.bin drops; arkit_scene_depth rows also carry the tracking state and the 4x4 camera-to-world pose pose_00..pose_33, row-major, in metadata.json's pose_convention
 //   metadata.json   id, name, duration, device, depth source, formats and frame rate, conventions, the first depth map's calibration at the intrinsic reference dimensions, counts, whether it was recovered after the app stopped, the color video's error if its writer failed, and, for avfoundation_truedepth, how the 8-bit depth tracks were made (depth8_h264) and their writers' error (depth8_h264_error)
 //
 // The work directory holds everything packing needs, so a directory left by a closed app or a failed pack is packed at the next launch:
@@ -69,6 +69,7 @@ final class Recording {
         directory = Self.workRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        precondition(camera == format.depthSource.camera, "a \(camera.rawValue) recording of \(format.depthSource.rawValue) depth")
         var systemInfo = utsname()
         uname(&systemInfo)
         if camera == .front {
@@ -313,6 +314,7 @@ final class Recording {
     // The fields of start.json that packing relies on.
     private struct Start: Decodable {
         let camera: DepthCamera
+        let depthSource: DepthSource
         let startTimeUtc: Date
         let depthWidth: Int
         let depthHeight: Int
@@ -361,7 +363,8 @@ final class Recording {
         }
 
         // An unnamed recording is named by its start date and time, its camera and its depth configuration.
-        let config = depthConfig(start.camera, filtered: start.depthFilteringEnabled)
+        precondition(start.camera == start.depthSource.camera, "a \(start.camera.rawValue) recording of \(start.depthSource.rawValue) depth")
+        let config = depthConfig(start.depthSource, filtered: start.depthFilteringEnabled)
         let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, config: config.id, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(config.name)",
                                  namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
                                  camera: start.camera, uploaded: false, colorVideoError: colorVideoError)
@@ -411,13 +414,13 @@ final class Recording {
         return frames
     }
 
-    // The depth configuration, as the id spells it and as the default name says it: filteroff or filteron for the front camera, arkit for the rear.
-    private static func depthConfig(_ camera: DepthCamera, filtered: Bool) -> (id: String, name: String) {
-        switch camera {
-        case .front: return filtered ? ("filteron", "Front filter on") : ("filteroff", "Front filter off")
-        case .rear:
-            precondition(!filtered, "a rear recording with its depth filtered")
-            return ("arkit", "Rear ARKit")
+    // The depth configuration, as the id spells it and as the default name says it: the rear camera's depth source, lidar or arkit, then filteroff or filteron.
+    private static func depthConfig(_ depthSource: DepthSource, filtered: Bool) -> (id: String, name: String) {
+        let filter = filtered ? (id: "filteron", name: "filter on") : (id: "filteroff", name: "filter off")
+        switch depthSource {
+        case .avfoundationTrueDepth: return (filter.id, "Front \(filter.name)")
+        case .avfoundationLiDAR: return ("lidar_\(filter.id)", "Rear LiDAR \(filter.name)")
+        case .arkitSceneDepth: return ("arkit_\(filter.id)", "Rear ARKit \(filter.name)")
         }
     }
 

@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// The rear LiDAR camera through an ARSession running world tracking with scene depth: each ARFrame carries the color image, the LiDAR depth registered to it, unsmoothed, the depth's confidence and the camera's pose, all at the frame's timestamp.
+// The rear LiDAR camera through an ARSession running world tracking with scene depth: each ARFrame carries the color image, the LiDAR depth registered to it, unsmoothed (sceneDepth) or, with the depth filter on, smoothed over time (smoothedSceneDepth), the depth's confidence and the camera's pose, all at the frame's timestamp.
 final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     let device: AVCaptureDevice
     var preview: UIView { display }
@@ -14,6 +14,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     // Owned by queue: the start's ready, until the first frame with scene depth gives the stream format.
     private var pendingReady: ((Result<StreamFormat, Error>) -> Void)?
+    // Owned by queue: whether the running session delivers smoothedSceneDepth instead of sceneDepth.
+    private var smoothed = false
 
     // The session delivers its frames on queue.
     init(sink: CaptureSink, queue: DispatchQueue) {
@@ -35,12 +37,14 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     }
 
     func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
-        precondition(!depthFiltering, "the rear camera has no depth filter setting")
         let configuration = ARWorldTrackingConfiguration()
         configuration.videoFormat = videoFormat
-        // Not .smoothedSceneDepth, which ARKit smooths over time.
-        configuration.frameSemantics = [.sceneDepth]
-        queue.sync { pendingReady = ready }
+        // .smoothedSceneDepth is ARKit's depth smoothed over time, the counterpart of AVFoundation's depth filter.
+        configuration.frameSemantics = depthFiltering ? [.smoothedSceneDepth] : [.sceneDepth]
+        queue.sync {
+            pendingReady = ready
+            smoothed = depthFiltering
+        }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -52,16 +56,17 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let time = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000_000)
         let image = frame.capturedImage
+        let sceneDepth = smoothed ? frame.smoothedSceneDepth : frame.sceneDepth
         if let ready = pendingReady {
             // The first frames of a session can come before scene depth.
-            guard let depth = frame.sceneDepth else { return }
+            guard let depth = sceneDepth else { return }
             pendingReady = nil
             ready(streamFormat(image: image, depth: depth))
         }
         display.show(image, at: time)
         let camera = frame.camera
         sink?.captured(color: Self.sampleBuffer(image, at: time), intrinsics: camera.intrinsics)
-        guard let depth = frame.sceneDepth else {
+        guard let depth = sceneDepth else {
             sink?.droppedDepth(at: time, reason: "no_scene_depth")
             return
         }
@@ -85,7 +90,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
                     "intrinsic_reference_height": Int(resolution.height),
                 ]
             },
-            filtered: "0",
+            filtered: smoothed ? "1" : "0",
             accuracy: "absolute",
             quality: "",
             pose: camera.transform,
@@ -116,10 +121,10 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             depthWidth: depthWidth, depthHeight: depthHeight, depthPixelFormat: CVPixelBufferGetPixelFormatType(map),
             confidencePixelFormat: CVPixelBufferGetPixelFormatType(confidence),
             frameRate: Double(videoFormat.framesPerSecond),
-            depthFilteringEnabled: false,
-            depthSource: "arkit_scene_depth",
+            depthFilteringEnabled: smoothed,
+            depthSource: .arkitSceneDepth,
             details: [
-                "arkit_frame_semantics": ["sceneDepth"],
+                "arkit_frame_semantics": [smoothed ? "smoothedSceneDepth" : "sceneDepth"],
                 "pose_convention": "depth.csv pose_00..pose_33 is ARFrame.camera.transform, row-major (pose_rc is row r, column c): camera-to-world, metres; world is ARKit's session frame (y up against gravity, origin where the session started); camera axes are ARKit's, fixed to the captured image in the sensor's native orientation: x toward increasing pixel column, y toward decreasing pixel row, z backward, away from the scene; tracking is ARFrame.camera.trackingState, and the pose is unreliable unless it is normal",
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),

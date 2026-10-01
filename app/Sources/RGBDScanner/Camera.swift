@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// A depth camera the phone may have: the front TrueDepth camera, recorded through AVFoundation, or the rear LiDAR camera, recorded through ARKit.
+// A depth camera the phone may have: the front TrueDepth camera, recorded through AVFoundation, or the rear LiDAR camera, recorded through AVFoundation or ARKit as the rear depth-source setting chooses.
 enum DepthCamera: String, CaseIterable, Identifiable, Codable {
     case front, rear
 
@@ -13,9 +13,21 @@ enum DepthCamera: String, CaseIterable, Identifiable, Codable {
     var isAvailable: Bool {
         switch self {
         case .front: return AVFoundationSource.frontDevice != nil
-        case .rear: return ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        case .rear: return AVFoundationSource.rearDevice != nil && ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
         }
     }
+}
+
+// Where a recording's depth comes from, as metadata.json's depth_source names it: the front camera has one source, the rear camera two.
+enum DepthSource: String, CaseIterable, Decodable {
+    // The TrueDepth camera through AVFoundation.
+    case avfoundationTrueDepth = "avfoundation_truedepth"
+    // The LiDAR depth camera through AVFoundation, at its highest depth resolution.
+    case avfoundationLiDAR = "avfoundation_lidar"
+    // ARKit's scene depth, densified by Apple, down to about 0.2 m, with confidence and pose; with the depth filter on, its temporally smoothed variant.
+    case arkitSceneDepth = "arkit_scene_depth"
+
+    var camera: DepthCamera { self == .avfoundationTrueDepth ? .front : .rear }
 }
 
 // The streams a capture source delivers, as a recording writes and describes them.
@@ -29,10 +41,9 @@ struct StreamFormat {
     // The pixel format of the per-pixel confidence maps, the size of the depth maps; nil when the source delivers none.
     let confidencePixelFormat: OSType?
     let frameRate: Double
-    // Whether the source smooths depth over time and fills holes: AVCaptureDepthDataOutput.isFilteringEnabled for the front camera, always false for the rear.
+    // Whether the source smooths depth over time and fills holes: AVCaptureDepthDataOutput.isFilteringEnabled through AVFoundation, smoothedSceneDepth instead of sceneDepth through ARKit.
     let depthFilteringEnabled: Bool
-    // "avfoundation_truedepth" or "arkit_scene_depth".
-    let depthSource: String
+    let depthSource: DepthSource
     // Source-specific entries for metadata.json.
     let details: [String: Any]
 
@@ -52,7 +63,7 @@ struct StreamFormat {
             "depth_height": depthHeight,
             "depth_pixel_format": fourCC(depthPixelFormat),
             "depth_bytes_per_pixel": depthBytesPerPixel,
-            "depth_source": depthSource,
+            "depth_source": depthSource.rawValue,
             "depth_filtering_enabled": depthFilteringEnabled,
             "frame_rate": frameRate,
         ]
