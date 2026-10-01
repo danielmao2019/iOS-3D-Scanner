@@ -11,7 +11,7 @@ goal: conclude ablation and improve app
 1. lost data:
    1. use avfoundation for front camera, because that's the only choice. use arkit for rear and not use avfoundation, based on ablation results.
 2. bad data:
-   1. color stream was lossy. this is wrong and must be fixed.
+   1. color stream was lossy. this is wrong and must be fixed. why compress? you must never ever compress.
    2. camera focus
 3. wrong data:
    1. depth filter is supported for both front and rear camera but neither should turn it on.
