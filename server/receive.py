@@ -88,7 +88,8 @@ def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
 def main() -> None:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path, default=here.parent / "tasks" / "20260930_ios_3d_scanner_mvp" / "outputs" / "recordings")
+    # One folder per app version, e.g. tasks/20260930_ios_3d_scanner_mvp/outputs/v3 for scans made with v3.
+    parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     token = (here / "token").read_text().strip()
