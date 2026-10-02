@@ -14,13 +14,14 @@ goal: conclude ablation and improve app
    1. use avfoundation for front camera, because that's the only choice. use arkit for rear and not use avfoundation, based on ablation results.
 2. bad data:
    1. color stream was lossy. this is wrong and must be fixed. why compress? you must never ever compress.
-   2. camera focus
+   2. camera focus: choose autofocus.
 3. wrong data:
    1. depth filter is supported for both front and rear camera but neither should turn it on.
-   2. per-frame camera intrinsics matching the color and depth frames are not obtainable during data collection. stop exporting those.
+   2. make sure per-frame depth intrinsics and depth frame data do match.
 4. additional data:
    1. confidence map from arkit for rear camera depth should be recorded.
-   2. i want the camera poses be exported when possible as well, just for the sake of making comparisons (do NOT understand as I trust the quality of the camera poses).
+   2. make sure you export per-frame camera intrinsics for both color and depth.
+   3. i want the camera poses be exported when possible as well, just for the sake of making comparisons (do NOT understand as I trust the quality of the camera poses).
 
 ## 2. Definition of Done
 
@@ -28,6 +29,5 @@ The above problems fixed in the app, and the app tested and built and installed 
 
 ## 3. Future Work
 
-1. Figure out how to obtain correct intrinsics that actually matches the color and depth frames.
-2. Frame axes data convention issue involving apple's libraries understood and code cleaned up.
-3. When and why frames are dropped are understood and code cleaned up.
+1. Frame axes data convention issue involving apple's libraries understood and code cleaned up.
+2. When and why frames are dropped are understood and code cleaned up.
