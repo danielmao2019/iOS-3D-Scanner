@@ -72,8 +72,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             map: map,
             metres: map,
             confidence: depth.confidenceMap,
-            // ARKit's intrinsics are in capturedImage pixels, measured from the center of the upper-left pixel; the depth map covers the same view at a lower resolution.
-            intrinsics: resampled(camera.intrinsics, scaleX: Float(CVPixelBufferGetWidth(map)) / Float(resolution.width), scaleY: Float(CVPixelBufferGetHeight(map)) / Float(resolution.height)),
+            // ARKit's intrinsics are in capturedImage pixels, measured from the center of the upper-left pixel; the depth map covers the same view at a lower resolution, its grid laid on the image as arkitDepthIntrinsics describes.
+            intrinsics: arkitDepthIntrinsics(camera.intrinsics, scaleX: Float(CVPixelBufferGetWidth(map)) / Float(resolution.width), scaleY: Float(CVPixelBufferGetHeight(map)) / Float(resolution.height)),
             sourceCells: [],
             calibration: nil))
     }
@@ -120,7 +120,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             frameRate: Double(videoFormat.framesPerSecond),
             details: [
                 "focus": "autofocus",
-                "intrinsics_convention": "color.csv's fx,fy,cx,cy are each frame's ARCamera.intrinsics, in color pixels, the principal point measured, as ARCamera.h says, from the center of the upper-left pixel; depth.csv's carry them to the depth map, which covers the same view at a lower resolution: with sx = depth_width / color_width and sy = depth_height / color_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = (cx + 0.5) * sx - 0.5, cy_d = (cy + 0.5) * sy - 0.5",
+                "intrinsics_convention": "color.csv's fx,fy,cx,cy are each frame's ARCamera.intrinsics, in color pixels, the principal point measured, as ARCamera.h says, from the center of the upper-left pixel; depth.csv's carry them to the depth map, which covers the same view at a lower resolution, as its grid lies on the color image, which six rear scans (2026-09-30 to 2026-10-02) measured from where depth edges land on color edges, x and y differing: along x the depth grid's first column center sits on the color image's first column center, along y the depth rows span the color image's rows edge to edge, so with sx = depth_width / color_width and sy = depth_height / color_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = (cy + 0.5) * sy - 0.5",
                 "pose_convention": "color.csv's world_from_camera_<row><column> are rows 0-2 of ARCamera.transform, row-major (the constant bottom row 0,0,0,1 omitted): the transform from ARKit's camera frame to its world frame, in metres; the camera frame, as Apple defines it, has its origin at the camera, +x toward increasing column of the sensor-oriented color image, +y toward decreasing row, +z out of the lens toward the viewer, the camera looking along -z; the world frame is gravity-aligned with +y up, its origin and heading where tracking started, and each session start resets tracking; the poses are ARKit's estimates, and tracking_state says under which tracking state each was made",
                 "arkit_frame_semantics": ["sceneDepth"],
                 "arkit_video_format": Self.describe(videoFormat),

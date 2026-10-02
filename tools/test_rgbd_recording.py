@@ -1,4 +1,4 @@
-"""Tests the format_version 7 tools on tiny synthetic front and rear recordings laid out exactly as the app archives them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, decode_recording's output files, and that inspect_recording runs with every check passing but the edge alignment, which needs real images.
+"""Tests the format_version 7 tools on tiny synthetic front and rear recordings laid out exactly as the app archives them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from decode_recording import decode
-from inspect_recording import inspect
+from inspect_recording import inspect, spatial_alignment
 from rgbd_recording import COLOR_HEADERS, DEPTH_HEADERS, YCBCR_MATRICES, Recording
 
 COLOR_WIDTH, COLOR_HEIGHT = 8, 6
@@ -27,6 +27,14 @@ COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
+SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
+# The spatial alignment recording: a rear recording big enough to have structure, ALIGNED_PAIRS same-instant pairs, its depth a quarter of its color each way, each pair showing RECTANGLES random rectangles at NEAR_M before a background at FAR_M.
+ALIGNED_COLOR_WIDTH, ALIGNED_COLOR_HEIGHT = 512, 384
+ALIGNED_DEPTH_WIDTH, ALIGNED_DEPTH_HEIGHT = 128, 96
+ALIGNED_SCALE = np.array([ALIGNED_DEPTH_WIDTH, ALIGNED_DEPTH_HEIGHT], np.float32) / np.array([ALIGNED_COLOR_WIDTH, ALIGNED_COLOR_HEIGHT], np.float32)
+ALIGNED_PAIRS = 12
+RECTANGLES = 8
+NEAR_M, FAR_M = 0.6, 2.4
 
 # Color frame 0's first 2x2 block has Y 100, 101 / 102, 103 with Cb 150, Cr 90; its second has Y 250 with Cb 128, Cr 255.
 # ITU_R_601_4, Kr 0.299, Kb 0.114: R = Y + 1.402 * -38 = Y - 53.276, B = Y + 1.772 * 22 = Y + 38.984, G = Y - (0.299 * -53.276 + 0.114 * 38.984) / 0.587 = Y + 19.566; second block R = 250 + 1.402 * 127 = 428.054 clipped to 255, B = 250, G = 250 - 0.299 * 178.054 / 0.587 = 159.305.
@@ -81,12 +89,16 @@ def calibration_intrinsics(instant: int) -> np.ndarray:
     return np.array([13.8 + 0.02 * instant, 13.9 + 0.02 * instant, 7.7, 5.6], np.float32)
 
 
+def arkit_depth_intrinsics(k: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """ARKit color intrinsics fx, fy, cx, cy carried to a depth map s = (sx, sy) times the color frame's size, in Float32 as the app does, as ARKit's depth grid lies on the color image: f * s, cx * sx and (cy + 0.5) * sy - 0.5."""
+    half = np.float32(0.5)
+    return np.concatenate([k[:2] * s, k[2:3] * s[0], (k[3:] + half) * s[1] - half])
+
+
 def depth_intrinsics(camera: str, instant: int) -> np.ndarray:
-    """fx, fy, cx, cy of the depth map at `instant` as the app computes them in Float32: the rear's color intrinsics carried with the pixel-center origin, the front's calibration scaled with the corner origin."""
+    """fx, fy, cx, cy of the depth map at `instant` as the app computes them in Float32: the rear's color intrinsics carried as ARKit's depth grid lies on the color image, the front's calibration scaled with the corner origin."""
     if camera == "rear":
-        s = np.array([DEPTH_WIDTH, DEPTH_HEIGHT], np.float32) / np.array([COLOR_WIDTH, COLOR_HEIGHT], np.float32)
-        k, half = color_intrinsics(instant), np.float32(0.5)
-        return np.concatenate([k[:2] * s, (k[2:] + half) * s - half])
+        return arkit_depth_intrinsics(color_intrinsics(instant), np.array([DEPTH_WIDTH, DEPTH_HEIGHT], np.float32) / np.array([COLOR_WIDTH, COLOR_HEIGHT], np.float32))
     s = np.array([DEPTH_WIDTH, DEPTH_HEIGHT], np.float32) / np.array([REFERENCE_WIDTH, REFERENCE_HEIGHT], np.float32)
     return calibration_intrinsics(instant) * np.concatenate([s, s])
 
@@ -231,6 +243,87 @@ def synthetic_tar(folder: Path, camera: str, matrix: str) -> Path:
     return write_tar(folder / f"{recording_id(camera)}.tar", recording_id(camera), members(camera, matrix))
 
 
+def aligned_color_intrinsics(instant: int) -> np.ndarray:
+    """fx, fy, cx, cy of the spatial alignment recording's color frame at `instant`, in color pixels, its principal point off the frame's center."""
+    return np.array([400 + 2 * instant, 402 + 2 * instant, 251.3 + 0.2 * instant, 194.6 - 0.1 * instant], np.float32)
+
+
+def rectangles(instant: int) -> np.ndarray:
+    """The RECTANGLES random rectangles seen at `instant`, each as x0, x1, y0, y1 in view directions x / z and y / z."""
+    rng = np.random.default_rng(10 + instant)
+    centers = rng.uniform([-0.4, -0.3], [0.4, 0.3], (RECTANGLES, 2))
+    halves = rng.uniform(0.04, 0.15, (RECTANGLES, 2))
+    return np.concatenate([centers - halves, centers + halves], axis=1)[:, [0, 2, 1, 3]]
+
+
+def overlap(size: int, f: float, c: float, lo: float, hi: float) -> np.ndarray:
+    """How much of each of `size` pixels lies between view directions lo and hi seen through focal length f and principal point c, pixel i spanning i - 0.5 to i + 0.5 under ARKit's pixel-center origin."""
+    i = np.arange(size)
+    return np.clip(np.minimum(i + 0.5, c + f * hi) - np.maximum(i - 0.5, c + f * lo), 0, 1)
+
+
+def rectangle_cover(instant: int, width: int, height: int, k: np.ndarray) -> np.ndarray:
+    """How much of each pixel of a width x height frame with intrinsics k the rectangles at `instant` cover, each laid over those before it."""
+    fx, fy, cx, cy = (float(v) for v in k)
+    cover = np.zeros((height, width))
+    for x0, x1, y0, y1 in rectangles(instant):
+        a = np.outer(overlap(height, fy, cy, y0, y1), overlap(width, fx, cx, x0, x1))
+        cover = cover + a * (1 - cover)
+    return cover
+
+
+def aligned_members(fattening: int) -> Dict[str, bytes]:
+    """The spatial alignment recording's members under <id>/: ALIGNED_PAIRS instants at 30 fps, each with a delivered color frame, its luma bright where the rectangles are, and a delivered depth map, near where they are grown by `fattening` depth px, each rasterized through its own recorded intrinsics."""
+    color_lines, depth_lines = [",".join(COLOR_HEADERS["rear"])], [",".join(DEPTH_HEADERS["rear"])]
+    frames, maps = [], []
+    for instant in range(ALIGNED_PAIRS):
+        time = f"{200 + instant / 30:.9f}"
+        orient = ["90", "0.01000", "-0.99000", "0.05000", time]
+        color_k = aligned_color_intrinsics(instant)
+        # Rasterized through these, the depth grid lies on the color image as ARKit's does: first column centers together along x, rows edge to edge along y.
+        depth_k = arkit_depth_intrinsics(color_k, ALIGNED_SCALE)
+        color_lines.append(",".join([str(instant), time, "", *(f32(v) for v in color_k), *orient, "normal", *(f32(v) for v in pose(instant).ravel())]))
+        depth_lines.append(",".join([str(instant), time, "", *(f32(v) for v in depth_k), *orient, str(ALIGNED_DEPTH_WIDTH * 4)]))
+        luma = np.rint(60 + 140 * rectangle_cover(instant, ALIGNED_COLOR_WIDTH, ALIGNED_COLOR_HEIGHT, color_k))
+        assert luma.dtype == np.float64, luma.dtype
+        frames.append(np.concatenate([luma.astype(np.uint8), np.full((ALIGNED_COLOR_HEIGHT // 2, ALIGNED_COLOR_WIDTH), 128, np.uint8)]))
+        # Inverse depth is blended by coverage like the luma, so a depth edge lies where the color edge does to a fraction of a depth pixel; its grey dilation then moves every edge `fattening` px out of the near region, as real depth maps fatten foreground objects.
+        inverse = 1 / FAR_M + (1 / NEAR_M - 1 / FAR_M) * rectangle_cover(instant, ALIGNED_DEPTH_WIDTH, ALIGNED_DEPTH_HEIGHT, depth_k)
+        inverse = cv2.dilate(inverse, np.ones((2 * fattening + 1, 2 * fattening + 1), np.uint8))
+        assert inverse.dtype == np.float64, inverse.dtype
+        maps.append((1 / inverse).astype(np.float32))
+    meta = metadata("rear", "ITU_R_709_2") | {
+        "duration_s": (ALIGNED_PAIRS - 1) / 30,
+        "color_width": ALIGNED_COLOR_WIDTH,
+        "color_height": ALIGNED_COLOR_HEIGHT,
+        "color_bytes_per_frame": ALIGNED_COLOR_WIDTH * ALIGNED_COLOR_HEIGHT * 3 // 2,
+        "depth_width": ALIGNED_DEPTH_WIDTH,
+        "depth_height": ALIGNED_DEPTH_HEIGHT,
+        "depth_bytes_per_frame": ALIGNED_DEPTH_WIDTH * ALIGNED_DEPTH_HEIGHT * 4,
+        "color_frames": ALIGNED_PAIRS,
+        "depth_frames": ALIGNED_PAIRS,
+    }
+    return {
+        "metadata.json": json.dumps(meta, indent=2, sort_keys=True).encode(),
+        "color.bin": np.stack(frames).tobytes(),
+        "color.csv": ("\n".join(color_lines) + "\n").encode(),
+        "depth.bin": np.stack(maps).tobytes(),
+        "depth.csv": ("\n".join(depth_lines) + "\n").encode(),
+        "confidence.bin": np.full((ALIGNED_PAIRS, ALIGNED_DEPTH_HEIGHT, ALIGNED_DEPTH_WIDTH), 2, np.uint8).tobytes(),
+    }
+
+
+def pixel_center_intrinsics(depth_row: Dict[str, str]) -> List[float]:
+    """The spatial alignment recording's color intrinsics at a depth row's instant carried with the pixel-center origin on both axes, f * s and (c + 0.5) * s - 0.5."""
+    k, half = aligned_color_intrinsics(int(depth_row["index"])), np.float32(0.5)
+    return [float(v) for v in np.concatenate([k[:2] * ALIGNED_SCALE, (k[2:] + half) * ALIGNED_SCALE - half])]
+
+
+def plain_intrinsics(depth_row: Dict[str, str]) -> List[float]:
+    """The spatial alignment recording's color intrinsics at a depth row's instant scaled plainly on both axes, f * s and c * s."""
+    return [float(v) for v in aligned_color_intrinsics(int(depth_row["index"])) * np.tile(ALIGNED_SCALE, 2)]
+
+
 @pytest.mark.parametrize("matrix", sorted(YCBCR_MATRICES))
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
@@ -316,5 +409,29 @@ def test_decode(tmp_path: Path, camera: str) -> None:
 def test_inspect(tmp_path: Path, camera: str) -> None:
     checks = inspect(synthetic_tar(tmp_path, camera, "ITU_R_601_4"))
 
-    # The synthetic frames are too few and too small for the edge alignment, which may fail; every other check holds on a recording laid out as the format says.
-    assert {name for name, ok in checks.items() if not ok} <= {ALIGNMENT_CHECK}, checks
+    # The synthetic frames are too few and too small for the two edge alignments, which may fail; every other check holds on a recording laid out as the format says.
+    assert {name for name, ok in checks.items() if not ok} <= {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK}, checks
+
+
+def test_spatial_alignment(tmp_path: Path) -> None:
+    rec = Recording(write_tar(tmp_path / "aligned.tar", recording_id("rear"), aligned_members(0)))
+    fattened_rec = Recording(write_tar(tmp_path / "fattened.tar", recording_id("rear"), aligned_members(1)))
+
+    recorded = spatial_alignment(rec)
+    # The pixel-center origin on both axes puts cx_d 0.5 * (1 - sx) = 0.375 depth px before the recorded one, which dx = -0.375 takes back, and leaves cy_d as recorded.
+    pixel_center = spatial_alignment(rec, pixel_center_intrinsics)
+    # Plain scaling on both axes leaves cx_d as recorded and puts cy_d 0.5 * (1 - sy) = 0.375 depth px past the recorded one, which dy = +0.375 takes back.
+    plain = spatial_alignment(rec, plain_intrinsics)
+    # A depth focal length 2% too long maps each depth pixel 2% too near the color principal point, which the scale k = 1.02 takes back.
+    long_focal = spatial_alignment(rec, lambda d: [1.02 * float(d["fx"]), 1.02 * float(d["fy"]), float(d["cx"]), float(d["cy"])])
+    # Near rectangles grown by one depth px move each + edge (far to near) back one px, taken back by d = +1, and each - edge forward one, taken back by d = -1: fattening +1 on both axes and no shift.
+    fattened = spatial_alignment(fattened_rec)
+
+    assert recorded["frames"] == ALIGNED_PAIRS and recorded["aligned"], recorded
+    assert abs(recorded["k_median"] - 1) <= 0.005 and abs(recorded["dx_median"]) <= 0.15 and abs(recorded["dy_median"]) <= 0.15, recorded
+    assert abs(recorded["fattening_x_median"]) <= 0.1 and abs(recorded["fattening_y_median"]) <= 0.1, recorded
+    assert abs(pixel_center["dx_median"] + 0.375) <= 0.1 and abs(pixel_center["dy_median"]) <= 0.1 and not pixel_center["aligned"], pixel_center
+    assert abs(plain["dx_median"]) <= 0.1 and abs(plain["dy_median"] - 0.375) <= 0.1 and not plain["aligned"], plain
+    assert abs(long_focal["k_median"] - 1.02) <= 0.005 and not long_focal["aligned"], long_focal
+    assert abs(fattened["dx_median"]) <= 0.1 and abs(fattened["dy_median"]) <= 0.1, fattened
+    assert abs(fattened["fattening_x_median"] - 1) <= 0.2 and abs(fattened["fattening_y_median"] - 1) <= 0.2, fattened

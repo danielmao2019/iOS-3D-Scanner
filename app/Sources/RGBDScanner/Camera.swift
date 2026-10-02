@@ -137,11 +137,13 @@ func scaled(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3
     return s
 }
 
-// An intrinsic matrix whose principal point is measured from the center of the upper-left pixel (ARKit's convention), carried to an image of the same view scaleX times as wide and scaleY times as tall: the focal lengths scale, and the principal point keeps its place in the view, c' = (c + 0.5) * scale - 0.5.
-func resampled(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3x3 {
-    var s = scaled(k, scaleX: scaleX, scaleY: scaleY)
-    s.columns.2.x += 0.5 * scaleX - 0.5
-    s.columns.2.y += 0.5 * scaleY - 0.5
+// ARKit's intrinsics, in capturedImage pixels with the principal point measured from the center of the upper-left pixel, carried to its scene depth map, scaleX times as wide and scaleY times as tall, as the depth grid lies on the image, which six rear scans (2026-09-30 to 2026-10-02) measured from where depth edges land on color edges, x and y differing: along x the depth grid's first column center sits on the image's first column center, cx' = cx * scaleX; along y the depth rows span the image rows edge to edge, cy' = (cy + 0.5) * scaleY - 0.5; the focal lengths scale, f' = f * scale.
+func arkitDepthIntrinsics(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3x3 {
+    var s = k
+    s.columns.0.x *= scaleX
+    s.columns.1.y *= scaleY
+    s.columns.2.x *= scaleX
+    s.columns.2.y = (k.columns.2.y + 0.5) * scaleY - 0.5
     return s
 }
 
