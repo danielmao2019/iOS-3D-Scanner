@@ -17,27 +17,9 @@ struct ContentView: View {
                 Text(only.label).font(.headline)
             }
 
-            if model.camera == .rear {
-                Picker("Depth source", selection: $model.rearDepthSource) {
-                    Text("Depth source AVFoundation").tag(DepthSource.avfoundationLiDAR)
-                    Text("Depth source ARKit").tag(DepthSource.arkitSceneDepth)
-                }
-                .pickerStyle(.segmented)
-                .disabled(model.isStarting || model.isRecording || model.isFinishing)
-                .onChange(of: model.rearDepthSource) { _, _ in model.startPreview() }
-            }
-
-            Picker("Depth filter", selection: $model.depthFiltering) {
-                Text("Depth filter Off").tag(false)
-                Text("Depth filter On").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .disabled(model.isStarting || model.isRecording || model.isFinishing)
-            .onChange(of: model.depthFiltering) { _, _ in model.startPreview() }
-
             ZStack {
                 if model.availableCameras.contains(model.camera) {
-                    PreviewView(view: model.recorder.preview(for: model.depthSource)).id(model.depthSource)
+                    PreviewView(view: model.recorder.preview(for: model.camera)).id(model.camera)
                 }
                 if model.showsDepth {
                     Color.black
@@ -101,9 +83,6 @@ struct ContentView: View {
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
                         ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
                     ].joined(separator: " · ")).font(.caption2.monospacedDigit())
-                    if let error = file.info.colorVideoError {
-                        Text("color video failed: \(error)").font(.caption2).foregroundStyle(.red)
-                    }
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()

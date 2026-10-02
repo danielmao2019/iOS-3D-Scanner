@@ -18,11 +18,12 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         let handle = try FileHandle(forReadingFrom: file)
         defer { handle.closeFile() }
         var hasher = SHA256()
-        while true {
+        // Each chunk is released before the next is read: a file of several GB would otherwise stay in memory until iOS stops the app.
+        while autoreleasepool(invoking: { () -> Bool in
             let chunk = handle.readData(ofLength: 8 << 20)
-            if chunk.isEmpty { break }
             hasher.update(data: chunk)
-        }
+            return !chunk.isEmpty
+        }) {}
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 

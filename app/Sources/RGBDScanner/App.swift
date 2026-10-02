@@ -43,8 +43,6 @@ struct RecordingInfo: Codable {
     let durationSeconds: Double
     let camera: DepthCamera
     var uploaded: Bool
-    // Set when the color video's writer failed; the depth stream and tables are complete regardless.
-    let colorVideoError: String?
 
     var tar: URL { Recording.documents.appendingPathComponent("\(id).tar") }
     var sidecar: URL { Recording.documents.appendingPathComponent("\(id).json") }
@@ -75,10 +73,6 @@ struct RecordingFile: Identifiable {
 
 final class AppModel: ObservableObject {
     @Published var camera: DepthCamera = .front
-    // Apple's depth filter, for every depth source: AVFoundation's isFilteringEnabled, or ARKit's smoothed scene depth.
-    @Published var depthFiltering = false
-    // The rear camera's depth source: the LiDAR depth camera at its highest resolution, or ARKit's scene depth for near-range scans down to about 0.2 m.
-    @Published var rearDepthSource: DepthSource = .avfoundationLiDAR
     @Published var formatSummary = ""
     @Published var stats = CaptureStats()
     // From Start or Later until the recording is running.
@@ -106,7 +100,6 @@ final class AppModel: ObservableObject {
     @Published var pendingDelete: RecordingFile?
 
     let availableCameras: [DepthCamera]
-    var depthSource: DepthSource { camera == .front ? .avfoundationTrueDepth : rearDepthSource }
     let recorder: Recorder
     private let uploader = Uploader()
     // The name given when the recording started; nil when naming was deferred.
@@ -136,7 +129,7 @@ final class AppModel: ObservableObject {
         let directories = Recording.leftovers()
         DispatchQueue.global(qos: .utility).async {
             for directory in directories {
-                let result = Result { try Recording.pack(directory, userName: nil, colorVideoError: nil, depth8Error: nil, recovered: true) }
+                let result = Result { try Recording.pack(directory, userName: nil, recovered: true) }
                 DispatchQueue.main.async { self.packed(result, note: "Recovered an unfinished recording") }
             }
         }
@@ -148,7 +141,7 @@ final class AppModel: ObservableObject {
                 guard granted else { self.message = "Camera access denied"; return }
                 guard !self.availableCameras.isEmpty else { self.message = "This phone has no depth camera"; return }
                 self.formatSummary = ""
-                self.recorder.start(depthSource: self.depthSource, depthFiltering: self.depthFiltering) { result in
+                self.recorder.start(camera: self.camera) { result in
                     switch result {
                     case .success(let summary): self.formatSummary = summary
                     case .failure(let error): self.message = error.localizedDescription
@@ -226,7 +219,7 @@ final class AppModel: ObservableObject {
         let outcome: String
         switch result {
         case .success(let info?):
-            outcome = info.colorVideoError.map { "Saved \(info.name), but its color video failed: \($0)" } ?? "Saved \(info.name)"
+            outcome = "Saved \(info.name)"
             refreshFiles()
             upload(info.id)
         case .success(nil):

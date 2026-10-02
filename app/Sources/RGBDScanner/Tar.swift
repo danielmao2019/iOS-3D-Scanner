@@ -50,10 +50,13 @@ enum Tar {
         try out.write(contentsOf: header(path: path, size: size, mtime: Int(Date().timeIntervalSince1970)))
         let input = try FileHandle(forReadingFrom: file)
         var written = 0
-        while let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty {
+        // Each chunk is released before the next is read: a file of several GB would otherwise stay in memory until iOS stops the app.
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
             try out.write(contentsOf: chunk)
             written += chunk.count
-        }
+            return true
+        }) {}
         try input.close()
         guard written == size else { throw RecorderError("\(file.lastPathComponent) changed while packing") }
         try out.write(contentsOf: Data(count: padded(size) - size))

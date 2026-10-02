@@ -72,8 +72,8 @@ final class Recorder: CaptureSink {
     private let controlQueue = DispatchQueue(label: "recorder.control")
     // Every source delivers on this one queue, so a recording sees its frames in arrival order.
     private let dataQueue = DispatchQueue(label: "recorder.data")
-    // One source per depth source of the cameras this phone has; made on the main queue, as their previews are views.
-    private var sources: [DepthSource: CaptureSource] = [:]
+    // One source per camera this phone has; made on the main queue, as their previews are views.
+    private var sources: [DepthCamera: CaptureSource] = [:]
     // Owned by controlQueue.
     private var running: CaptureSource?
 
@@ -89,41 +89,34 @@ final class Recorder: CaptureSink {
     var onInterruption: ((String) -> Void)?
 
     init(cameras: [DepthCamera]) {
-        for depthSource in DepthSource.allCases where cameras.contains(depthSource.camera) {
-            switch depthSource {
-            case .avfoundationTrueDepth:
-                guard let device = AVFoundationSource.frontDevice else { preconditionFailure("the front TrueDepth camera is not available") }
-                sources[depthSource] = AVFoundationSource(device: device, depthSource: depthSource, sink: self, queue: dataQueue)
-            case .avfoundationLiDAR:
-                guard let device = AVFoundationSource.rearDevice else { preconditionFailure("the rear LiDAR depth camera is not available") }
-                sources[depthSource] = AVFoundationSource(device: device, depthSource: depthSource, sink: self, queue: dataQueue)
-            case .arkitSceneDepth:
-                sources[depthSource] = ARKitSource(sink: self, queue: dataQueue)
+        for camera in cameras {
+            switch camera {
+            case .front: sources[camera] = AVFoundationSource(sink: self, queue: dataQueue)
+            case .rear: sources[camera] = ARKitSource(sink: self, queue: dataQueue)
             }
         }
     }
 
-    // The view showing the depth source's live color stream.
-    func preview(for depthSource: DepthSource) -> UIView {
-        source(depthSource).preview
+    // The view showing the camera's live color stream.
+    func preview(for camera: DepthCamera) -> UIView {
+        source(camera).preview
     }
 
-    private func source(_ depthSource: DepthSource) -> CaptureSource {
-        guard let source = sources[depthSource] else { preconditionFailure("\(depthSource.rawValue) is not available on this phone") }
+    private func source(_ camera: DepthCamera) -> CaptureSource {
+        guard let source = sources[camera] else { preconditionFailure("the \(camera.rawValue) camera is not available on this phone") }
         return source
     }
 
-    // Stops the running source and starts the depth source's, depth filtered or not; completion gets a description of the stream format.
-    func start(depthSource: DepthSource, depthFiltering: Bool, completion: @escaping (Result<String, Error>) -> Void) {
-        let camera = depthSource.camera
-        let source = source(depthSource)
+    // Stops the running source and starts the camera's; completion gets a description of the stream format.
+    func start(camera: DepthCamera, completion: @escaping (Result<String, Error>) -> Void) {
+        let source = source(camera)
         controlQueue.async {
             if let running = self.running, running !== source { running.stop() }
             self.running = source
             // No recording starts until the new source's format is known.
             self.dataQueue.sync { self.format = nil }
             self.orientation.track(device: source.device)
-            source.start(depthFiltering: depthFiltering) { result in
+            source.start { result in
                 self.dataQueue.async {
                     if case .success(let format) = result {
                         self.camera = camera
@@ -158,14 +151,13 @@ final class Recorder: CaptureSink {
             guard let recording = self.active else { return }
             self.active = nil
             self.publishStats()
-            recording.stop()
             DispatchQueue.main.async { completion(recording) }
         }
     }
 
-    func captured(color: CMSampleBuffer, intrinsics: matrix_float3x3?) {
+    func captured(color: CVPixelBuffer, at time: CMTime, intrinsics: matrix_float3x3?, pose: Pose?) {
         guard let active else { return }
-        if active.appendColor(color, intrinsics: intrinsics, orientation: orientation.snapshot()) {
+        if active.appendColor(color, at: time, intrinsics: intrinsics, pose: pose, orientation: orientation.snapshot()) {
             stats.colorFrames += 1
             if stats.colorFrames % 5 == 0 { publishStats() }
         } else {

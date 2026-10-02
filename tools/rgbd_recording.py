@@ -1,8 +1,12 @@
-"""Reads an RGBD Scanner recording (.tar): metadata, the color and depth tables, the depth maps, their confidence maps when the depth source has them, the color frames, and a front recording's 8-bit H.264 depth tracks. `read` opens any format_version: 1 through FramesRecording, 2 to 5 through Recording.
+"""Reads an RGBD Scanner recording (.tar, format_version 7 only): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
 
-Format history: 1 holds one frames.csv row per color/depth synchronizer pair instead of color.csv and depth.csv; 2 has color.csv and depth.csv without intrinsics in color.csv; 3 adds per-stream intrinsics; 4 adds metadata.json's depth_source and, for "arkit_scene_depth", confidence.bin; 5 adds the 8-bit depth tracks of "avfoundation_truedepth" recordings and the rear "avfoundation_lidar" depth source.
+The archive is a POSIX ustar tar whose members sit under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front). metadata.json's camera is "front" (the TrueDepth camera through AVFoundation, depth_source "avfoundation_truedepth") or "rear" (the LiDAR camera through ARKit world tracking, depth_source "arkit_scene_depth"); depth filtering is always off.
 
-Pixels are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal; a color frame that was dropped, or lost when the app was closed mid-recording, keeps its timestamp as a dropped row (index -1). Each table row carries its frame's intrinsics fx,fy,cx,cy in its own stream's pixels. metadata.json's depth_source says where the depth came from: "avfoundation_truedepth" (front), "avfoundation_lidar" (rear, the LiDAR depth camera through AVFoundation) or "arkit_scene_depth" (rear), whose recordings alone also hold confidence.bin (UInt8 ARConfidenceLevel per depth pixel: 0 low, 1 medium, 2 high). Each delivered depth row has the delivered map's row stride, bytes_per_row, which depth.bin drops. "avfoundation_truedepth" recordings also hold the depth maps as an earlier app encoded them, 8-bit H.264 tracks described by metadata.json's depth8_h264, in the earlier app's portrait mirrored layout (track pixel (r, c) is depth map pixel (c, r)); depth8_metres turns a track's codes back into metres in the sensor's orientation.
+color.bin holds every delivered color frame uncompressed, frame n (color.csv's row with index n) at bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2, no header: the camera's 420f buffer, 8-bit full-range YCbCr 4:2:0, its luma plane (color_height rows of color_width bytes, one Y per pixel) then its CbCr plane (color_height/2 rows of color_width bytes, one Cb, Cr byte pair per 2x2 pixels), rows tightly packed; `color_bgr` converts a frame to BGR through metadata.json's color_ycbcr_matrix. depth.bin holds every delivered depth map as Float32 metres ("fdep"), map n at bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), rows tightly packed, NaN or 0 meaning no reading. The rear's confidence.bin holds one UInt8 ARConfidenceLevel map per depth map, in depth.bin's order and layout: 0 low, 1 medium, 2 high.
+
+color.csv and depth.csv hold one row per frame delivered or dropped: index (-1 on a dropped row), timestamp (host-clock seconds, one clock for both tables), dropped (a dropped row's reason; its later cells are empty), the frame's intrinsics fx, fy, cx, cy in its own stream's pixels (empty on a delivered row only when the frame came without them), upright_rotation_deg and CoreMotion gravity. depth.csv adds bytes_per_row, the delivered map's row stride that depth.bin drops, and the front's AVDepthData filtered, accuracy and quality. The rear's color.csv adds ARKit's tracking_state and world_from_camera_<r><c>, rows 0 to 2 of ARFrame.camera.transform (camera to world, metres), which `world_from_camera` returns as a 4x4 matrix. The rear's depth intrinsics are its color intrinsics carried to the depth map with ARKit's pixel-center origin, f*s and (c+0.5)*s-0.5, s = depth size / color size; the front's are each depth map's own calibration scaled from its reference dimensions with Apple's corner origin, f*s and c*s. The front's calibration.jsonl holds one line per delivered depth map, in depth.csv's order: {"index", "timestamp", "calibration"}, the map's AVCameraCalibrationData described, or null when it came without one.
+
+Pixels and intrinsics are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal (`pairs`).
 """
 
 import csv
@@ -10,92 +14,69 @@ import io
 import json
 import tarfile
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
-DEPTH_DTYPES = {"fdep": "<f4", "hdep": "<f2"}
-FILES = {"color.mov", "color.csv", "depth.bin", "depth.csv", "metadata.json"}
-FRAMES_FILES = {"color.mov", "depth.bin", "frames.csv", "metadata.json"}
-CONFIDENCE_FILE = "confidence.bin"
-DEPTH_SOURCES = ("avfoundation_truedepth", "avfoundation_lidar", "arkit_scene_depth")
+FILES = {"metadata.json", "color.bin", "color.csv", "depth.bin", "depth.csv"}
+CAMERA_FILES = {"front": {"calibration.jsonl"}, "rear": {"confidence.bin"}}
+INTRINSICS = ["fx", "fy", "cx", "cy"]
+ORIENTATION = ["upright_rotation_deg", "gravity_x", "gravity_y", "gravity_z", "gravity_ts"]
+POSE = [f"world_from_camera_{r}{c}" for r in range(3) for c in range(4)]
+COLOR_HEADERS = {
+    "front": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION],
+    "rear": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION, "tracking_state", *POSE],
+}
+DEPTH_HEADERS = {
+    "front": ["index", "timestamp", "dropped", "filtered", "accuracy", "quality", *INTRINSICS, *ORIENTATION, "bytes_per_row"],
+    "rear": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION, "bytes_per_row"],
+}
 HIGH_CONFIDENCE = 2
-INTRINSICS = ("fx", "fy", "cx", "cy")
 SAME_INSTANT_S = 0.0005
+# Kr and Kb of each YCbCr matrix metadata.json's color_ycbcr_matrix can name (kCVImageBufferYCbCrMatrix_*).
+YCBCR_MATRICES = {"ITU_R_601_4": (0.299, 0.114), "ITU_R_709_2": (0.2126, 0.0722)}
 
 
 class Recording:
-    def __init__(self, tar_path: Path, work_dir: Path) -> None:
-        with tarfile.open(tar_path) as tar:
+    """A format_version 7 recording: its metadata and tables read, its .bin members memory-mapped in place inside the tar."""
+
+    def __init__(self, tar_path: Path) -> None:
+        # Mode "r:" opens an uncompressed tar only, the one whose members can be memory-mapped in place.
+        with tarfile.open(tar_path, "r:") as tar:
             members = {Path(m.name).name: m for m in tar.getmembers()}
             assert "metadata.json" in members, sorted(members)
             self.meta: Dict = json.load(tar.extractfile(members["metadata.json"]))
-            version = self.meta["format_version"]
-            assert version in (2, 3, 4, 5), version
-            # Formats 2 and 3 predate depth_source, confidence maps and 8-bit depth tracks.
-            assert ("depth_source" in self.meta) == (version >= 4), (version, sorted(self.meta))
-            depth_source = self.meta["depth_source"] if version >= 4 else None
-            assert depth_source is None or depth_source in DEPTH_SOURCES, depth_source
-            # The rear LiDAR depth camera through AVFoundation came with format 5.
-            assert depth_source != "avfoundation_lidar" or version == 5, (version, depth_source)
-            # The depth source's metadata describes its confidence maps exactly when it delivers them.
-            self.has_confidence = "confidence_pixel_format" in self.meta
-            assert self.has_confidence == (depth_source == "arkit_scene_depth"), (depth_source, self.has_confidence)
-            # The front camera's format 5 recordings, and only they, hold the 8-bit depth tracks.
-            assert ("depth8_h264" in self.meta) == (version == 5 and depth_source == "avfoundation_truedepth"), (version, depth_source, "depth8_h264" in self.meta)
-            depth8_files = {t["file"] for t in self.meta["depth8_h264"]["tracks"]} if "depth8_h264" in self.meta else set()
-            assert set(members) == FILES | ({CONFIDENCE_FILE} if self.has_confidence else set()) | depth8_files, sorted(members)
-            self.color_rows: List[Dict[str, str]] = list(csv.DictReader(io.TextIOWrapper(tar.extractfile(members["color.csv"]))))
-            self.depth_rows: List[Dict[str, str]] = list(csv.DictReader(io.TextIOWrapper(tar.extractfile(members["depth.csv"]))))
-            raw = tar.extractfile(members["depth.bin"]).read()
-            raw_confidence = tar.extractfile(members[CONFIDENCE_FILE]).read() if self.has_confidence else None
-            self.mov = work_dir / "color.mov"
-            self.mov.write_bytes(tar.extractfile(members["color.mov"]).read())
-            self.depth8_movs: Dict[str, Path] = {}
-            for name in sorted(depth8_files):
-                self.depth8_movs[name] = work_dir / name
-                self.depth8_movs[name].write_bytes(tar.extractfile(members[name]).read())
-        shape = (-1, self.meta["depth_height"], self.meta["depth_width"])
-        self.depth = np.frombuffer(raw, dtype=DEPTH_DTYPES[self.meta["depth_pixel_format"]]).reshape(shape).astype(np.float32)
-        self.confidence: Optional[np.ndarray] = None
-        if raw_confidence is not None:
-            assert self.meta["confidence_pixel_format"] == "L008" and self.meta["confidence_bytes_per_pixel"] == 1, self.meta["confidence_pixel_format"]
-            self.confidence = np.frombuffer(raw_confidence, dtype=np.uint8).reshape(shape)
+            assert self.meta["format_version"] == 7, self.meta["format_version"]
+            camera = self.meta["camera"]
+            assert camera in CAMERA_FILES, camera
+            names = sorted(m.name for m in tar.getmembers())
+            assert names == sorted(f"{self.meta['id']}/{name}" for name in FILES | CAMERA_FILES[camera]), names
+            self.color_rows = read_table(tar, members["color.csv"], COLOR_HEADERS[camera])
+            self.depth_rows = read_table(tar, members["depth.csv"], DEPTH_HEADERS[camera])
+            self.calibrations: Optional[List[Dict]] = None
+            if camera == "front":
+                self.calibrations = [json.loads(line) for line in tar.extractfile(members["calibration.jsonl"]).read().decode().splitlines()]
+        meta = self.meta
+        width, height = meta["color_width"], meta["color_height"]
+        assert meta["color_pixel_format"] == "420f" and width % 2 == 0 and height % 2 == 0 and meta["color_bytes_per_frame"] == width * height * 3 // 2, (meta["color_pixel_format"], width, height, meta["color_bytes_per_frame"])
+        self.color = map_frames(tar_path, members["color.bin"], np.dtype(np.uint8), (height * 3 // 2, width))
+        depth_shape = (meta["depth_height"], meta["depth_width"])
+        assert meta["depth_pixel_format"] == "fdep" and meta["depth_bytes_per_pixel"] == 4 and meta["depth_bytes_per_frame"] == depth_shape[0] * depth_shape[1] * 4, (meta["depth_pixel_format"], meta["depth_bytes_per_pixel"], meta["depth_bytes_per_frame"])
+        self.depth = map_frames(tar_path, members["depth.bin"], np.dtype("<f4"), depth_shape)
+        self.confidence: Optional[np.memmap] = None
+        if camera == "rear":
+            assert meta["confidence_pixel_format"] == "L008" and meta["confidence_bytes_per_pixel"] == 1, (meta["confidence_pixel_format"], meta["confidence_bytes_per_pixel"])
+            self.confidence = map_frames(tar_path, members["confidence.bin"], np.dtype(np.uint8), depth_shape)
         self.colors = [r for r in self.color_rows if r["index"] != "-1"]
         self.depths = [r for r in self.depth_rows if r["index"] != "-1"]
 
-    def depth8_track(self, file: str) -> Tuple[np.ndarray, np.ndarray]:
-        """One 8-bit depth track: its codes, frames x encoded height x encoded width uint8 in the track's portrait mirrored layout, and each frame's presentation time in seconds."""
-        assert file in self.depth8_movs, (file, sorted(self.depth8_movs))
-        cap = cv2.VideoCapture(str(self.depth8_movs[file]))
-        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
-        codes, times = [], []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            # The codes are gray, so the decoder's three channels are equal.
-            assert np.array_equal(frame[..., 0], frame[..., 1]) and np.array_equal(frame[..., 0], frame[..., 2]), file
-            codes.append(frame[..., 0])
-            times.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
-        return np.stack(codes), np.array(times)
-
-    def depth8_metres(self, codes: np.ndarray) -> np.ndarray:
-        """A track's codes as Float32 metres, code / 255 * range_m with 0 meaning no reading, laid out back in the sensor's orientation like depth.bin's maps."""
-        def _validate_inputs() -> None:
-            assert codes.dtype == np.uint8 and codes.ndim == 3, (codes.dtype, codes.shape)
-
-        _validate_inputs()
-
-        spec = self.meta["depth8_h264"]
-        # Track pixel (r, c) is map pixel (c, r): the map turned 90 degrees clockwise, then mirrored left to right.
-        assert spec["layout"] == "portrait_mirrored", spec["layout"]
-        metres = codes.astype(np.float32) / np.float32(255) * np.float32(spec["range_m"])
-        return np.ascontiguousarray(np.transpose(metres, (0, 2, 1)))
+    def color_bgr(self, index: int) -> np.ndarray:
+        """Color frame `index` as 8-bit BGR, color_height x color_width x 3 in sensor orientation, converted through metadata.json's color_ycbcr_matrix."""
+        return ycbcr_to_bgr(self.color[index], self.meta["color_ycbcr_matrix"])
 
     def color_frames(self) -> Iterator[np.ndarray]:
-        return video_frames(self.mov)
+        """Yields every color frame in order, as `color_bgr` gives it."""
+        return (self.color_bgr(i) for i in range(self.color.shape[0]))
 
     def pairs(self) -> List[Tuple[Dict[str, str], Dict[str, str]]]:
         """Each depth row with the color.csv row, delivered or dropped, captured at the same instant, matched by timestamp."""
@@ -107,51 +88,72 @@ class Recording:
                 out.append((c, d))
         return out
 
+    def world_from_camera(self, row: Dict[str, str]) -> np.ndarray:
+        """A delivered rear color row's ARFrame.camera.transform as a 4x4 float64 matrix: ARKit's camera frame to its world frame, metres."""
+        def _validate_inputs() -> None:
+            assert self.meta["camera"] == "rear", self.meta["camera"]
+            assert row["index"] != "-1", row
 
-class FramesRecording:
-    """A format_version 1 recording: color.mov, depth.bin, frames.csv (one row per color/depth synchronizer pair, each stream's index in color_index and depth_index) and metadata.json."""
+        _validate_inputs()
 
-    def __init__(self, tar_path: Path, work_dir: Path) -> None:
-        with tarfile.open(tar_path) as tar:
-            members = {Path(m.name).name: m for m in tar.getmembers()}
-            assert set(members) == FRAMES_FILES, sorted(members)
-            self.meta: Dict = json.load(tar.extractfile(members["metadata.json"]))
-            assert self.meta["format_version"] == 1, self.meta["format_version"]
-            self.rows: List[Dict[str, str]] = list(csv.DictReader(io.TextIOWrapper(tar.extractfile(members["frames.csv"]))))
-            raw = tar.extractfile(members["depth.bin"]).read()
-            self.mov = work_dir / "color.mov"
-            self.mov.write_bytes(tar.extractfile(members["color.mov"]).read())
-        self.depth = np.frombuffer(raw, dtype=DEPTH_DTYPES[self.meta["depth_pixel_format"]]).reshape(-1, self.meta["depth_height"], self.meta["depth_width"])
-        self.confidence: Optional[np.ndarray] = None
-        self.depth8_movs: Dict[str, Path] = {}
-        # A pair row names a delivered frame of each stream by its index, each delivered frame exactly once, in order.
-        self.colors = [r for r in self.rows if r["color_index"] not in ("", "-1")]
-        self.depths = [r for r in self.rows if r["depth_index"] not in ("", "-1")]
-        assert [int(r["color_index"]) for r in self.colors] == list(range(len(self.colors))), "color_index is not 0..n-1"
-        assert [int(r["depth_index"]) for r in self.depths] == list(range(len(self.depths))), "depth_index is not 0..n-1"
-
-    def color_frames(self) -> Iterator[np.ndarray]:
-        return video_frames(self.mov)
+        top = np.array([float(row[k]) for k in POSE], dtype=np.float64).reshape(3, 4)
+        return np.vstack([top, [0, 0, 0, 1]])
 
 
-def read(tar_path: Path, work_dir: Path) -> Union[Recording, FramesRecording]:
-    """Opens a recording of any format_version with the reader of its format."""
-    with tarfile.open(tar_path) as tar:
-        members = {Path(m.name).name: m for m in tar.getmembers()}
-        assert "metadata.json" in members, sorted(members)
-        version = json.load(tar.extractfile(members["metadata.json"]))["format_version"]
-    return FramesRecording(tar_path, work_dir) if version == 1 else Recording(tar_path, work_dir)
+def read_table(tar: tarfile.TarFile, member: tarfile.TarInfo, header: List[str]) -> List[Dict[str, str]]:
+    """A color.csv or depth.csv member's rows, its header the camera's and every row as long as the header."""
+    reader = csv.DictReader(io.TextIOWrapper(tar.extractfile(member)))
+    assert reader.fieldnames == header, (member.name, reader.fieldnames)
+    rows = list(reader)
+    # DictReader keys a longer row's extra cells by None and gives a shorter row's missing cells the value None.
+    assert all(len(r) == len(header) and None not in r.values() for r in rows), member.name
+    return rows
 
 
-def video_frames(mov: Path) -> Iterator[np.ndarray]:
-    """Yields a movie's frames in order, BGR, in sensor orientation (the track's display rotation is not applied)."""
-    cap = cv2.VideoCapture(str(mov))
-    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            return
-        yield frame
+def map_frames(tar_path: Path, member: tarfile.TarInfo, dtype: np.dtype, frame_shape: Tuple[int, int]) -> np.memmap:
+    """A .bin member's frames memory-mapped read-only where its bytes sit in the uncompressed tar: frames x frame_shape of dtype."""
+    def _validate_inputs() -> None:
+        assert member.isreg(), member.name
+        # The member holds whole frames only.
+        assert member.size % (dtype.itemsize * frame_shape[0] * frame_shape[1]) == 0, (member.name, member.size, dtype, frame_shape)
+
+    _validate_inputs()
+
+    frames = member.size // (dtype.itemsize * frame_shape[0] * frame_shape[1])
+    return np.memmap(tar_path, dtype=dtype, mode="r", offset=member.offset_data, shape=(frames, *frame_shape))
+
+
+def ycbcr_planes(frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """A color.bin frame's luma plane, height x width uint8, and CbCr plane, height / 2 x width / 2 x 2 uint8 (Cb, Cr), each Cb, Cr pair covering 2 x 2 luma pixels."""
+    def _validate_inputs() -> None:
+        assert frame.dtype == np.uint8 and frame.ndim == 2 and frame.shape[0] % 3 == 0 and frame.shape[1] % 2 == 0, (frame.dtype, frame.shape)
+
+    _validate_inputs()
+
+    height = frame.shape[0] * 2 // 3
+    return frame[:height], frame[height:].reshape(height // 2, frame.shape[1] // 2, 2)
+
+
+def ycbcr_to_bgr(frame: np.ndarray, matrix: str) -> np.ndarray:
+    """A color.bin frame as 8-bit BGR: full-range R = Y + 2(1-Kr)(Cr-128), B = Y + 2(1-Kb)(Cb-128), G = (Y - Kr R - Kb B) / (1 - Kr - Kb) with the named matrix's Kr and Kb, each Cb, Cr pair applied to its 2 x 2 luma pixels, rounded to the nearest level and clipped to 0..255."""
+    def _validate_inputs() -> None:
+        assert matrix in YCBCR_MATRICES, (matrix, sorted(YCBCR_MATRICES))
+
+    _validate_inputs()
+
+    luma, cbcr = ycbcr_planes(frame)
+    kr, kb = YCBCR_MATRICES[matrix]
+    height, width = luma.shape
+    assert luma.dtype == np.uint8 and cbcr.dtype == np.uint8, (luma.dtype, cbcr.dtype)
+    # Luma as (block row, row in block, block column, column in block), so each 2 x 2 block's Cb, Cr broadcast over its four pixels.
+    y = luma.astype(np.float64).reshape(height // 2, 2, width // 2, 2)
+    cb, cr = (cbcr[:, None, :, None, i].astype(np.float64) - 128 for i in (0, 1))
+    r = y + 2 * (1 - kr) * cr
+    b = y + 2 * (1 - kb) * cb
+    g = (y - kr * r - kb * b) / (1 - kr - kb)
+    bgr = np.clip(np.rint(np.stack([b, g, r], axis=-1)), 0, 255)
+    assert bgr.dtype == np.float64, bgr.dtype
+    return bgr.astype(np.uint8).reshape(height, width, 3)
 
 
 def upright(image: np.ndarray, rotation_deg: str) -> np.ndarray:

@@ -1,57 +1,60 @@
-import AVFoundation
 import CoreMedia
 import Foundation
 import UIKit
+import simd
 
 // One recording, captured into a work directory Documents/work/<uuid>/ and then packed, once it has a name, into Documents/<id>.tar with its sidecar Documents/<id>.json.
 //
+// metadata.json's camera says where the frames come from: "front" is the TrueDepth camera through AVFoundation (depth_source "avfoundation_truedepth"), color and depth from separate outputs at one frame rate; "rear" is the LiDAR camera through ARKit world tracking (depth_source "arkit_scene_depth"), the color image, its pose, the depth and its confidence from one ARFrame and so always at one timestamp. Depth is never filtered (depth_filtering_enabled false), and the lens autofocuses wherever it can (metadata.json's focus: autofocus or fixed).
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal.
-// All pixels, and the intrinsics, are in the sensor's native orientation, unrotated and unmirrored; each frame records how the phone was held.
-// Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels; they are empty on a dropped row, and on a color row whose frame came without them.
-// The depth comes from metadata.json's depth_source: "avfoundation_truedepth" (front: the TrueDepth camera through AVFoundation, color and depth from separate outputs), "avfoundation_lidar" (rear: the LiDAR depth camera through AVFoundation, color and depth from separate outputs) or "arkit_scene_depth" (rear: ARKit's LiDAR scene depth, its temporally smoothed variant when depth_filtering_enabled (metadata.json's arkit_frame_semantics), with color and depth from the same ARFrame and so always at the same timestamp).
+// All pixels, the intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; each frame records how the phone was held.
+// Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels, as metadata.json's intrinsics_convention says; they are empty on a dropped row, and on a delivered row whose frame came without them.
+// A dropped row is -1, the timestamp and why the frame was dropped (e.g. late, out_of_buffers, writer_busy, no_scene_depth), every other cell empty.
 //
-// The archive (format_version 5):
-//   color.mov       HEVC color video; its n-th frame is the row with index n in color.csv. Its display transform is the first frame's upright rotation, so players show it upright.
-//   color.csv       one row per color frame delivered or dropped, with the frame's intrinsics in color-frame pixels
-//   depth.bin       depth maps exactly as the source delivered them (filtered by Apple only when metadata.json's depth_filtering_enabled: AVFoundation's depth filter, or ARKit's smoothed scene depth), concatenated with no header: map n occupies bytes [n*size, (n+1)*size), size = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
-//   depth8_h264_w512.mov, depth8_h264_w480_stridewidth.mov, depth8_h264_w480.mov   avfoundation_truedepth only: the depth maps again, as three commits of an earlier app encoded them (see Depth8Track and metadata.json's depth8_h264), for ablations; the n-th sample is depth map n, at depth.csv's timestamp minus the first depth map's
-//   confidence.bin  arkit_scene_depth only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
-//   depth.csv       one row per depth map delivered or dropped, with its intrinsics in depth-map pixels, scaled from the color camera's intrinsics (the depth is registered to the color camera): avfoundation_truedepth and avfoundation_lidar from the calibration's intrinsic reference dimensions, arkit_scene_depth from the captured image's; filtered/accuracy/quality are AVDepthData's, and for ARKit "1" when smoothed else "0"/"absolute"/empty; bytes_per_row is the delivered map's row stride, which depth.bin drops
-//   metadata.json   id, name, duration, device, depth source, formats and frame rate, conventions, the first depth map's calibration at the intrinsic reference dimensions, counts, whether it was recovered after the app stopped, the color video's error if its writer failed, and, for avfoundation_truedepth, how the 8-bit depth tracks were made (depth8_h264) and their writers' error (depth8_h264_error)
+// The archive (format_version 7), its members under <id>/:
+//   color.bin          every delivered color frame exactly as the camera delivered it, uncompressed, with no header: the frame with color.csv index n occupies bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2; each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, color_height rows of color_width bytes (a Y byte per pixel), then its CbCr plane, color_height/2 rows of color_width bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through color_ycbcr_matrix
+//   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says
+//   depth.bin          depth maps exactly as delivered, concatenated with no header: map n occupies bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), depth_bytes_per_frame = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
+//   depth.csv          one row per depth map delivered or dropped: index,timestamp,dropped, then, for the front, filtered,accuracy,quality (AVDepthData's isDepthDataFiltered 1 or 0, depthDataAccuracy absolute or relative, depthDataQuality high or low), then fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,bytes_per_row (the delivered map's row stride, which depth.bin drops)
+//   confidence.bin     rear only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
+//   calibration.jsonl  front only: one line per delivered depth map, in depth.csv's order, {"index": n, "timestamp": t, "calibration": c}, n and t the map's depth.csv index and timestamp, c its full AVCameraCalibrationData, or null when it came without one
+//   metadata.json      id, name, duration, device, camera, depth source, formats and frame rate, focus, conventions, counts, and whether it was recovered after the app stopped
 //
-// The work directory holds everything packing needs, so a directory left by a closed app or a failed pack is packed at the next launch:
+// A frame's bytes are queued for writing before its row, so every .bin and calibration.jsonl hold at least the frames that have a row; a color frame whose copy would push the bytes waiting to be written above maxQueuedBytes is dropped as writer_busy.
+// The work directory holds everything packing needs, so a directory left by a closed app or a failed pack is packed at the next launch, each file cut to the frames that have a row:
 //   start.json        metadata known when recording starts: camera, start time, device, formats, conventions
-//   calibration.json  the first depth map's calibration, once one has arrived
-//   color.mov, color.csv, depth.bin, confidence.bin, depth8_h264_*.mov, depth.csv   written as the frames arrive; the movies are fragmented every second, so each plays up to its last fragment if its writer never finishes
+//   color.bin, color.csv, depth.bin, depth.csv, confidence.bin (rear), calibration.jsonl (front)   written as the frames arrive
 //   sidecar.json      the recording's id, name and duration, fixed when packing begins; a pack that finds it resumes
 //   archive.tar.part  the archive being built; each file is deleted once it is in
 final class Recording {
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private static var workRoot: URL { documents.appendingPathComponent("work", isDirectory: true) }
-    private static let archived = ["color.mov", "depth.bin", "color.csv", "depth.csv", "metadata.json"]
-    private static let confidenceFile = "confidence.bin"
+    // The bytes waiting for the file queue stay within this: about 29 front or 129 rear color frames.
+    private static let maxQueuedBytes = 512 << 20
 
-    static let intrinsicsColumns = "fx,fy,cx,cy"
-    static let orientationColumns = "upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts"
-    static let colorHeader = "index,timestamp,dropped," + intrinsicsColumns + "," + orientationColumns
-    static let depthHeader = "index,timestamp,dropped,filtered,accuracy,quality," + intrinsicsColumns + "," + orientationColumns + ",bytes_per_row"
+    private static let intrinsicsColumns = "fx,fy,cx,cy"
+    private static let orientationColumns = "upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts"
+    // ARKit's tracking state and rows 0-2 of ARCamera.transform, row-major.
+    private static let poseColumns = "tracking_state," + (0..<3).flatMap { row in (0..<4).map { column in "world_from_camera_\(row)\(column)" } }.joined(separator: ",")
 
     private let directory: URL
     private let format: StreamFormat
-    private let writer: AVAssetWriter
-    private let videoInput: AVAssetWriterInput
+    private let colorHandle: FileHandle
     private let colorTable: FileHandle
-    private let depthTable: FileHandle
     private let depthHandle: FileHandle
-    // Present when the source delivers confidence.
+    private let depthTable: FileHandle
+    // The rear's confidence.bin.
     private let confidenceHandle: FileHandle?
-    private let fileQueue = DispatchQueue(label: "recording.files")
-    // The front camera's 8-bit depth tracks, encoded on their own queue; empty for the rear camera.
-    private let depth8: [Depth8Track]
-    private let depth8Queue = DispatchQueue(label: "recording.depth8")
-    // Entered until stop() has finished the videos, so packing waits for them.
-    private let stopped = DispatchGroup()
-    private var colorVideoError: String?
+    // The front's calibration.jsonl.
+    private let calibrationHandle: FileHandle?
+    // The column counts of color.csv and depth.csv, which differ by camera; every row has exactly these.
+    private let colorColumns: Int
+    private let depthColumns: Int
+    // Each write's autoreleased memory is released as soon as it is written: a front recording writes about 0.55 GB a second.
+    private let fileQueue = DispatchQueue(label: "recording.files", autoreleaseFrequency: .workItem)
+    // The bytes of the frames queued on fileQueue and not yet written.
+    private let queuedLock = NSLock()
+    private var queuedBytes = 0
 
     // Owned by fileQueue: the first failed write, after which nothing more is written.
     private var fileError: Error?
@@ -59,76 +62,35 @@ final class Recording {
     // Owned by the capture data queue.
     private var colorCount = 0
     private var depthCount = 0
-    private var hasCalibration = false
-    // The first depth map's time, time zero of the 8-bit depth tracks.
-    private var depth8Start: CMTime?
 
     init(camera: DepthCamera, format: StreamFormat) throws {
+        precondition((format.confidencePixelFormat != nil) == (camera == .rear), "a \(camera.rawValue) recording of a stream \(format.confidencePixelFormat == nil ? "without" : "with") confidence")
         self.format = format
         directory = Self.workRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        precondition(camera == format.depthSource.camera, "a \(camera.rawValue) recording of \(format.depthSource.rawValue) depth")
         var systemInfo = utsname()
         uname(&systemInfo)
-        if camera == .front {
-            precondition(format.depthPixelFormat == kCVPixelFormatType_DepthFloat32 && format.depthWidth > format.depthHeight,
-                         "8-bit depth tracks need a landscape Float32 depth map, not \(format.depthWidth)×\(format.depthHeight) \(fourCC(format.depthPixelFormat))")
-            // Turned into portrait, the map is depthHeight wide; the earlier app's first buffer was the next power of two wide.
-            let width = format.depthHeight
-            let powerOfTwo = 1 << (Int.bitWidth - (width - 1).leadingZeroBitCount)
-            let track = { [directory] (file: String, reproduces: String, sourceRows: Depth8Track.Rows, bufferWidth: Int, bufferRows: Depth8Track.Rows) in
-                try Depth8Track(directory: directory, file: file, reproduces: reproduces, width: width, height: format.depthWidth, sourceRows: sourceRows, bufferWidth: bufferWidth, bufferRows: bufferRows)
-            }
-            depth8 = try [
-                track("depth8_h264_w\(powerOfTwo).mov", "9627f38: buffer the next power of two wide, rows a width apart in the map and the buffer", .width, powerOfTwo, .width),
-                track("depth8_h264_w\(width)_stridewidth.mov", "ddeadac: buffer as wide as the map, rows a width apart in the map and the buffer", .width, width, .width),
-                track("depth8_h264_w\(width).mov", "aa3e5ee: buffer as wide as the map, rows bytes-per-row apart in the map and the buffer", .bytesPerRow, width, .bytesPerRow),
-            ]
-        } else {
-            depth8 = []
-        }
-
         var start = format.describe()
         start["camera"] = camera.rawValue
+        start["depth_source"] = camera.depthSource
         start["start_time_utc"] = ISO8601DateFormatter().string(from: Date())
-        if !depth8.isEmpty {
-            start["depth8_h264"] = [
-                "tracks": depth8.map(\.described),
-                "range_m": Depth8Track.rangeMetres,
-                "layout": Depth8Track.layout,
-                "pixel_mapping": Depth8Track.pixelMapping,
-                "description": "each depth map as delivered, its rows read bytes_per_row apart (depth.bin's map) or, for source_rows width, depth_width floats apart from the start of the delivered buffer (the same map unless depth.csv's bytes_per_row exceeds depth_width * 4), laid out as the earlier app's .portrait, mirrored front depth connection delivered it (layout, pixel_mapping), quantized as code = UInt8(min(max(z / range_m, 0), 1) * 255) in Float32, truncated, with NaN and z <= 0 → 0, written into a zeroed OneComponent8 buffer buffer_width wide whose rows are buffer_bytes_per_row bytes apart, row j at byte j * buffer_row_stride_bytes, and encoded by the phone's H.264 encoder at encoded_width × encoded_height with its default settings; the n-th sample is depth map n at depth.csv's timestamp minus the first depth map's; decode as code / 255 * range_m metres, 0 meaning no reading",
-            ]
-        }
         start["device_model"] = withUnsafeBytes(of: &systemInfo.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         start["system_version"] = UIDevice.current.systemVersion
         start["timestamp_clock"] = "host time (CMClockGetHostTimeClock), seconds; shared by color.csv, depth.csv and gravity_ts"
         start["orientation_convention"] = "pixels and intrinsics are in the sensor's native orientation, unrotated and unmirrored; rotating a frame clockwise by its upright_rotation_deg makes it upright (horizon-level); gravity_x/y/z is CoreMotion gravity in g in the phone's device frame (x right, y toward the top of the phone held in portrait, z out of the screen)"
         try JSONSerialization.data(withJSONObject: start, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("start.json"))
 
-        writer = try AVAssetWriter(outputURL: directory.appendingPathComponent("color.mov"), fileType: .mov)
-        writer.movieFragmentInterval = CMTime(value: 1, timescale: 1)
-        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: format.colorWidth,
-            AVVideoHeightKey: format.colorHeight,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 60_000_000,
-                AVVideoExpectedSourceFrameRateKey: Int(format.frameRate.rounded()),
-                AVVideoAllowFrameReorderingKey: false,
-            ],
-        ])
-        videoInput.expectsMediaDataInRealTime = true
-        guard writer.canAdd(videoInput) else { throw RecorderError("cannot add video writer input") }
-        writer.add(videoInput)
-
-        colorTable = try Self.create(directory.appendingPathComponent("color.csv"), Data((Self.colorHeader + "\n").utf8))
-        depthTable = try Self.create(directory.appendingPathComponent("depth.csv"), Data((Self.depthHeader + "\n").utf8))
+        let colorHeader = "index,timestamp,dropped," + Self.intrinsicsColumns + "," + Self.orientationColumns + (camera == .rear ? "," + Self.poseColumns : "")
+        let depthHeader = "index,timestamp,dropped," + (camera == .front ? "filtered,accuracy,quality," : "") + Self.intrinsicsColumns + "," + Self.orientationColumns + ",bytes_per_row"
+        colorColumns = colorHeader.split(separator: ",").count
+        depthColumns = depthHeader.split(separator: ",").count
+        colorHandle = try Self.create(directory.appendingPathComponent("color.bin"), Data())
+        colorTable = try Self.create(directory.appendingPathComponent("color.csv"), Data((colorHeader + "\n").utf8))
         depthHandle = try Self.create(directory.appendingPathComponent("depth.bin"), Data())
-        confidenceHandle = format.confidencePixelFormat == nil ? nil : try Self.create(directory.appendingPathComponent(Self.confidenceFile), Data())
-        stopped.enter()
-        depth8.forEach { _ in stopped.enter() }
+        depthTable = try Self.create(directory.appendingPathComponent("depth.csv"), Data((depthHeader + "\n").utf8))
+        confidenceHandle = camera == .rear ? try Self.create(directory.appendingPathComponent("confidence.bin"), Data()) : nil
+        calibrationHandle = camera == .front ? try Self.create(directory.appendingPathComponent("calibration.jsonl"), Data()) : nil
     }
 
     private static func create(_ url: URL, _ contents: Data) throws -> FileHandle {
@@ -138,70 +100,75 @@ final class Recording {
         return handle
     }
 
-    // The frame calls below, and stop(), run on the capture data queue.
+    // The frame calls below run on the capture data queue.
 
-    // Returns whether the frame went into the video; a frame the writer does not take is recorded as dropped.
-    func appendColor(_ buffer: CMSampleBuffer, intrinsics: matrix_float3x3?, orientation: Orientation) -> Bool {
-        let time = CMSampleBufferGetPresentationTimeStamp(buffer)
-        if writer.status == .unknown {
-            // Display only: the stored pixels stay in sensor orientation.
-            videoInput.transform = CGAffineTransform(rotationAngle: CGFloat(orientation.uprightRotationDegrees) * .pi / 180)
-            writer.startWriting()
-            writer.startSession(atSourceTime: time)
-        }
-        guard videoInput.isReadyForMoreMediaData, videoInput.append(buffer) else {
-            recordDroppedColor(at: time, reason: writer.status == .failed ? "writer_failed" : "writer_busy")
+    // Returns whether the frame is written; a frame whose copy would push the bytes waiting to be written above maxQueuedBytes is recorded as dropped. Only the rear's frames come with a pose.
+    func appendColor(_ image: CVPixelBuffer, at time: CMTime, intrinsics: matrix_float3x3?, pose: Pose?, orientation: Orientation) -> Bool {
+        // Only this queue adds to queuedBytes, so the bound still holds once the frame is queued.
+        guard queuedLock.withLock({ queuedBytes }) + format.colorBytesPerFrame <= Self.maxQueuedBytes else {
+            recordDroppedColor(at: time, reason: "writer_busy")
             return false
         }
-        append([String(colorCount), seconds(time), ""] + Self.columns(intrinsics) + [Self.columns(orientation)], to: colorTable)
+        writeColor(image)
+        append([String(colorCount), seconds(time), ""] + Self.cells(intrinsics) + Self.cells(orientation) + Self.cells(pose), to: colorTable, columns: colorColumns)
         colorCount += 1
         return true
     }
 
     func recordDroppedColor(at time: CMTime, reason: String) {
-        append(["-1", seconds(time), reason] + Array(repeating: "", count: 4) + [Self.columns(nil)], to: colorTable)
+        append(["-1", seconds(time), reason] + Array(repeating: "", count: colorColumns - 3), to: colorTable, columns: colorColumns)
     }
 
     func appendDepth(_ depth: DepthSample, orientation: Orientation) {
-        let (bytes, bytesPerRow) = writeMap(depth.map, width: format.depthWidth, height: format.depthHeight, pixelFormat: format.depthPixelFormat, bytesPerPixel: format.depthBytesPerPixel, to: depthHandle)
-        if !depth8.isEmpty {
-            let start = depth8Start ?? depth.time
-            depth8Start = start
-            let time = CMTimeSubtract(depth.time, start)
-            // Read depth_width floats apart from the buffer's start, the rows are the packed map's unless the buffer pads them.
-            let padded = bytesPerRow != format.depthWidth * 4
-            let misread = padded ? Self.contiguous(depth.map, count: bytes.count) : bytes
-            depth8Queue.async { [depth8, format] in
-                let codes = Depth8Track.codes(bytes, mapWidth: format.depthWidth, mapHeight: format.depthHeight)
-                let misreadCodes = padded ? Depth8Track.codes(misread, mapWidth: format.depthWidth, mapHeight: format.depthHeight) : codes
-                depth8.forEach { $0.append($0.sourceRows == .width ? misreadCodes : codes, at: time) }
-            }
-        }
+        let bytesPerRow = writeMap(depth.map, width: format.depthWidth, height: format.depthHeight, pixelFormat: format.depthPixelFormat, bytesPerPixel: format.depthBytesPerPixel, to: depthHandle)
         if let confidenceHandle, let confidencePixelFormat = format.confidencePixelFormat {
             guard let confidence = depth.confidence else { preconditionFailure("depth map at \(seconds(depth.time)) s came without its confidence map") }
             writeMap(confidence, width: format.depthWidth, height: format.depthHeight, pixelFormat: confidencePixelFormat, bytesPerPixel: 1, to: confidenceHandle)
         } else {
             precondition(depth.confidence == nil, "confidence map from a source whose format has none")
         }
-        if !hasCalibration, let calibration = depth.calibration {
-            hasCalibration = true
-            let described = calibration()
-            perform { [directory] in
-                try JSONSerialization.data(withJSONObject: described, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("calibration.json"))
-            }
+        if let calibrationHandle {
+            writeCalibration(depth.calibration, index: depthCount, time: depth.time, to: calibrationHandle)
+        } else {
+            precondition(depth.calibration == nil, "calibration from the rear camera, which has none")
         }
-        append([String(depthCount), seconds(depth.time), "", depth.filtered, depth.accuracy, depth.quality]
-               + Self.columns(depth.intrinsics) + [Self.columns(orientation), String(bytesPerRow)], to: depthTable)
+        append([String(depthCount), seconds(depth.time), ""] + depth.sourceCells + Self.cells(depth.intrinsics) + Self.cells(orientation) + [String(bytesPerRow)], to: depthTable, columns: depthColumns)
         depthCount += 1
     }
 
     func recordDroppedDepth(at time: CMTime, reason: String) {
-        append(["-1", seconds(time), reason] + Array(repeating: "", count: 7) + [Self.columns(nil), ""], to: depthTable)
+        append(["-1", seconds(time), reason] + Array(repeating: "", count: depthColumns - 3), to: depthTable, columns: depthColumns)
     }
 
-    // Copies the map's rows without their padding, then writes them off the capture queue; returns the copy and the map's bytes per row.
+    // Copies a 420f frame's planes without their row padding, the luma rows, then the CbCr rows, then writes them off the capture queue.
+    private func writeColor(_ image: CVPixelBuffer) {
+        let width = format.colorWidth, height = format.colorHeight
+        precondition(CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "color frame is \(fourCC(CVPixelBufferGetPixelFormatType(image))), not 420f")
+        precondition(CVPixelBufferGetWidthOfPlane(image, 0) == width && CVPixelBufferGetHeightOfPlane(image, 0) == height
+                     && CVPixelBufferGetWidthOfPlane(image, 1) == width / 2 && CVPixelBufferGetHeightOfPlane(image, 1) == height / 2,
+                     "a \(CVPixelBufferGetWidth(image))×\(CVPixelBufferGetHeight(image)) 420f frame differs from the stream format's \(width)×\(height)")
+        // Plane 0 has a Y byte per pixel, plane 1 a Cb, Cr byte pair per 2 × 2 pixels, so a row of either is width bytes.
+        let planeRows = [height, height / 2]
+        var bytes = Data(count: format.colorBytesPerFrame)
+        CVPixelBufferLockBaseAddress(image, .readOnly)
+        bytes.withUnsafeMutableBytes { dst in
+            var offset = 0
+            for (plane, rows) in planeRows.enumerated() {
+                let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(image, plane)
+                let base = CVPixelBufferGetBaseAddressOfPlane(image, plane)!
+                for y in 0..<rows {
+                    memcpy(dst.baseAddress!.advanced(by: offset), base.advanced(by: y * bytesPerRow), width)
+                    offset += width
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(image, .readOnly)
+        write(bytes, to: colorHandle)
+    }
+
+    // Copies the map's rows without their padding, then writes them off the capture queue; returns the map's bytes per row.
     @discardableResult
-    private func writeMap(_ map: CVPixelBuffer, width: Int, height: Int, pixelFormat: OSType, bytesPerPixel: Int, to handle: FileHandle) -> (Data, Int) {
+    private func writeMap(_ map: CVPixelBuffer, width: Int, height: Int, pixelFormat: OSType, bytesPerPixel: Int, to handle: FileHandle) -> Int {
         precondition(CVPixelBufferGetWidth(map) == width && CVPixelBufferGetHeight(map) == height && CVPixelBufferGetPixelFormatType(map) == pixelFormat,
                      "\(CVPixelBufferGetWidth(map))×\(CVPixelBufferGetHeight(map)) \(fourCC(CVPixelBufferGetPixelFormatType(map))) map differs from the stream format's \(width)×\(height) \(fourCC(pixelFormat))")
         let rowBytes = width * bytesPerPixel
@@ -215,21 +182,31 @@ final class Recording {
             }
         }
         CVPixelBufferUnlockBaseAddress(map, .readOnly)
-        perform { try handle.write(contentsOf: bytes) }
-        return (bytes, bytesPerRow)
+        write(bytes, to: handle)
+        return bytesPerRow
     }
 
-    // The first count bytes of a buffer, row padding and all.
-    private static func contiguous(_ map: CVPixelBuffer, count: Int) -> Data {
-        CVPixelBufferLockBaseAddress(map, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
-        precondition(CVPixelBufferGetDataSize(map) >= count, "a \(CVPixelBufferGetDataSize(map))-byte buffer has no \(count) bytes")
-        return Data(bytes: CVPixelBufferGetBaseAddress(map)!, count: count)
+    // Writes a depth map's calibration.jsonl line; its calibration is described and turned into JSON on the file queue, off the capture queue.
+    private func writeCalibration(_ calibration: (() -> [String: Any])?, index: Int, time: CMTime, to handle: FileHandle) {
+        let head = "{\"index\": \(index), \"timestamp\": \(seconds(time)), \"calibration\": "
+        perform {
+            let json = try calibration.map { try JSONSerialization.data(withJSONObject: $0(), options: [.sortedKeys]) } ?? Data("null".utf8)
+            try handle.write(contentsOf: Data(head.utf8) + json + Data("}\n".utf8))
+        }
     }
 
-    private func append(_ row: [String], to table: FileHandle) {
+    private func append(_ row: [String], to table: FileHandle, columns: Int) {
+        precondition(row.count == columns, "a row of \(row.count) cells in a table of \(columns) columns: \(row)")
         let line = Data((row.joined(separator: ",") + "\n").utf8)
         perform { try table.write(contentsOf: line) }
+    }
+
+    // Writes a frame's bytes through perform, counted in queuedBytes until the write has run.
+    private func write(_ bytes: Data, to handle: FileHandle) {
+        let count = bytes.count
+        queuedLock.withLock { queuedBytes += count }
+        perform { try handle.write(contentsOf: bytes) }
+        fileQueue.async { [self] in queuedLock.withLock { queuedBytes -= count } }
     }
 
     // Runs a file write on the file queue, in the order the writes were asked for.
@@ -240,35 +217,13 @@ final class Recording {
         }
     }
 
-    // Ends the recording at this moment; the videos finish in the background, the 8-bit depth tracks once their queued maps are in.
-    func stop() {
-        depth8Queue.async { [depth8, stopped] in
-            depth8.forEach { $0.finish { stopped.leave() } }
-        }
-        switch writer.status {
-        case .writing:
-            videoInput.markAsFinished()
-            writer.finishWriting { [self] in
-                if writer.status == .failed { colorVideoError = (writer.error ?? RecorderError("video writer failed")).localizedDescription }
-                stopped.leave()
-            }
-        case .failed:
-            colorVideoError = (writer.error ?? RecorderError("video writer failed")).localizedDescription
-            stopped.leave()
-        default:
-            // No color frame arrived, so the writer never started.
-            stopped.leave()
-        }
-    }
-
-    // Once the video is finished, packs the recording; userName is nil when the user left it unnamed.
+    // Once every queued write is in, packs the recording; userName is nil when the user left it unnamed.
     func pack(userName: String?, completion: @escaping (Result<RecordingInfo?, Error>) -> Void) {
-        stopped.notify(queue: fileQueue) { [self] in
+        fileQueue.async { [self] in
             completion(Result {
-                for handle in [colorTable, depthTable, depthHandle, confidenceHandle].compactMap({ $0 }) { try handle.close() }
+                for handle in [colorHandle, colorTable, depthHandle, depthTable, confidenceHandle, calibrationHandle].compactMap({ $0 }) { try handle.close() }
                 if let fileError { throw fileError }
-                let depth8Errors = depth8.compactMap { track in track.error.map { "\(track.file): \($0)" } }
-                return try Self.pack(directory, userName: userName, colorVideoError: colorVideoError, depth8Error: depth8Errors.isEmpty ? nil : depth8Errors.joined(separator: "; "), recovered: false)
+                return try Self.pack(directory, userName: userName, recovered: false)
             })
         }
     }
@@ -280,18 +235,18 @@ final class Recording {
     }
 
     // Packs a work directory into Documents/<id>.tar with its sidecar Documents/<id>.json and removes the directory, resuming a pack that was cut short. Returns nil, removing the directory, when a stream has no frames; a failed pack leaves the directory to be packed at the next launch, and its error names the directory.
-    static func pack(_ directory: URL, userName: String?, colorVideoError: String?, depth8Error: String?, recovered: Bool) throws -> RecordingInfo? {
+    static func pack(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
         do {
-            return try packWorkDirectory(directory, userName: userName, colorVideoError: colorVideoError, depth8Error: depth8Error, recovered: recovered)
+            return try packWorkDirectory(directory, userName: userName, recovered: recovered)
         } catch {
             throw RecorderError("work/\(directory.lastPathComponent): \(error.localizedDescription)")
         }
     }
 
-    private static func packWorkDirectory(_ directory: URL, userName: String?, colorVideoError: String?, depth8Error: String?, recovered: Bool) throws -> RecordingInfo? {
+    private static func packWorkDirectory(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
         let pending = directory.appendingPathComponent("sidecar.json")
         if !FileManager.default.fileExists(atPath: pending.path) {
-            guard let info = try writeMetadata(directory, userName: userName, colorVideoError: colorVideoError, depth8Error: depth8Error, recovered: recovered) else {
+            guard let info = try writeMetadata(directory, userName: userName, recovered: recovered) else {
                 try FileManager.default.removeItem(at: directory)
                 return nil
             }
@@ -300,8 +255,7 @@ final class Recording {
         let info = try RecordingInfo.load(pending)
         if !FileManager.default.fileExists(atPath: info.tar.path) {
             let part = directory.appendingPathComponent("archive.tar.part")
-            let start = try Self.start(directory)
-            let files = archived + (start.confidenceBytesPerPixel == nil ? [] : [confidenceFile]) + (start.depth8H264?.tracks.map(\.file) ?? [])
+            let files = ["color.bin", "depth.bin", "color.csv", "depth.csv", "metadata.json"] + (info.camera == .rear ? ["confidence.bin"] : ["calibration.jsonl"])
             try Tar.pack(files.map { directory.appendingPathComponent($0) }, root: info.id, into: part)
             try info.write(to: info.sidecar)
             try FileManager.default.moveItem(at: part, to: info.tar)
@@ -313,21 +267,11 @@ final class Recording {
     // The fields of start.json that packing relies on.
     private struct Start: Decodable {
         let camera: DepthCamera
-        let depthSource: DepthSource
         let startTimeUtc: Date
+        let colorBytesPerFrame: Int
         let depthWidth: Int
         let depthHeight: Int
-        let depthBytesPerPixel: Int
-        // Present when the source delivers confidence.
-        let confidenceBytesPerPixel: Int?
-        let depthFilteringEnabled: Bool
-        // Present for the front camera, which writes 8-bit depth tracks.
-        let depth8H264: Depth8?
-
-        struct Depth8: Decodable {
-            struct Track: Decodable { let file: String }
-            let tracks: [Track]
-        }
+        let depthBytesPerFrame: Int
     }
 
     private static func start(_ directory: URL) throws -> Start {
@@ -337,95 +281,65 @@ final class Recording {
         return try decoder.decode(Start.self, from: Data(contentsOf: directory.appendingPathComponent("start.json")))
     }
 
-    // Writes metadata.json from start.json, calibration.json and the tables, and returns the recording's sidecar; nil when a stream has no frames.
-    private static func writeMetadata(_ directory: URL, userName: String?, colorVideoError: String?, depth8Error: String?, recovered: Bool) throws -> RecordingInfo? {
+    // Writes metadata.json from start.json and the tables, cutting each file to the frames that have a row, and returns the recording's sidecar; nil when a stream has no frames.
+    private static func writeMetadata(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
         let file = { (name: String) in directory.appendingPathComponent(name) }
         let start = try start(directory)
         guard var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: file("start.json"))) as? [String: Any] else { throw RecorderError("start.json is not an object") }
 
-        var color = try Table(contentsOf: file("color.csv"))
+        let color = try Table(contentsOf: file("color.csv"))
         let depth = try Table(contentsOf: file("depth.csv"))
-        // A writer that did not finish, because the app was closed or the writer failed, leaves color.mov holding only the frames up to its last fragment.
-        if recovered || colorVideoError != nil {
-            let movieFrames = try videoFrameCount(file("color.mov"))
-            guard movieFrames <= color.frames else { throw RecorderError("color.mov holds \(movieFrames) frames but color.csv only \(color.frames)") }
-            color = color.dropping(from: movieFrames, reason: recovered ? "lost_in_crash" : "lost_in_video_failure")
-            try color.text.write(to: file("color.csv"), atomically: true, encoding: .utf8)
-        }
         guard color.frames > 0, depth.frames > 0 else { return nil }
 
-        // A depth map written just before the app was closed can lack its row.
-        let bytesPerFrame = start.depthWidth * start.depthHeight * start.depthBytesPerPixel
-        try truncate(file("depth.bin"), toMaps: depth.frames, of: bytesPerFrame)
-        if let confidenceBytesPerPixel = start.confidenceBytesPerPixel {
-            try truncate(file(confidenceFile), toMaps: depth.frames, of: start.depthWidth * start.depthHeight * confidenceBytesPerPixel)
+        // A frame's bytes are written before its row, so a recording cut off by a closed app can hold frames without one.
+        try truncate(file("color.bin"), toFrames: color.frames, of: start.colorBytesPerFrame)
+        try truncate(file("depth.bin"), toFrames: depth.frames, of: start.depthBytesPerFrame)
+        switch start.camera {
+        case .front: try truncate(file("calibration.jsonl"), toLines: depth.frames)
+        // One UInt8 per depth pixel.
+        case .rear: try truncate(file("confidence.bin"), toFrames: depth.frames, of: start.depthWidth * start.depthHeight)
         }
 
-        // An unnamed recording is named by its start date and time, its camera and its depth configuration.
-        precondition(start.camera == start.depthSource.camera, "a \(start.camera.rawValue) recording of \(start.depthSource.rawValue) depth")
-        let config = depthConfig(start.depthSource, filtered: start.depthFilteringEnabled)
-        let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, config: config.id, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(config.name)",
+        // An unnamed recording is named by its start date and time and its camera.
+        let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")",
                                  namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
-                                 camera: start.camera, uploaded: false, colorVideoError: colorVideoError)
-        metadata["format_version"] = 5
+                                 camera: start.camera, uploaded: false)
+        metadata["format_version"] = 7
         metadata["id"] = info.id
         metadata["name"] = info.name
         metadata["named_by_user"] = info.namedByUser
         metadata["duration_s"] = info.durationSeconds
         metadata["recovered"] = recovered
-        metadata["color_video_error"] = colorVideoError ?? NSNull()
-        metadata["depth8_h264_error"] = depth8Error ?? NSNull()
         metadata["color_frames"] = color.frames
         metadata["depth_frames"] = depth.frames
-        metadata["depth_bytes_per_frame"] = bytesPerFrame
-        metadata["depth_calibration_first_frame"] = FileManager.default.fileExists(atPath: file("calibration.json").path)
-            ? try JSONSerialization.jsonObject(with: Data(contentsOf: file("calibration.json"))) : NSNull()
         try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]).write(to: file("metadata.json"))
         return info
     }
 
-    // Cuts a file of maps to its first count maps, the ones with a depth.csv row.
-    private static func truncate(_ url: URL, toMaps count: Int, of bytesPerMap: Int) throws {
+    // Cuts a file of frames to its first count frames, the ones with a table row.
+    private static func truncate(_ url: URL, toFrames count: Int, of bytesPerFrame: Int) throws {
         let handle = try FileHandle(forWritingTo: url)
-        guard try handle.seekToEnd() >= UInt64(count * bytesPerMap) else { throw RecorderError("\(url.lastPathComponent) holds fewer maps than depth.csv") }
-        try handle.truncate(atOffset: UInt64(count * bytesPerMap))
+        guard try handle.seekToEnd() >= UInt64(count * bytesPerFrame) else { throw RecorderError("\(url.lastPathComponent) holds fewer frames than its table") }
+        try handle.truncate(atOffset: UInt64(count * bytesPerFrame))
         try handle.close()
     }
 
-    // The number of frames in a movie, counted from its samples without decoding them.
-    private static func videoFrameCount(_ movie: URL) throws -> Int {
-        let asset = AVURLAsset(url: movie)
-        let loaded = DispatchSemaphore(value: 0)
-        var tracks: Result<[AVAssetTrack], Error> = .failure(RecorderError("\(movie.lastPathComponent) did not load"))
-        asset.loadTracks(withMediaType: .video) { found, error in
-            tracks = found.map { .success($0) } ?? .failure(error ?? RecorderError("\(movie.lastPathComponent) has no tracks"))
-            loaded.signal()
+    // Cuts a file of lines to its first count lines, the ones with a table row.
+    private static func truncate(_ url: URL, toLines count: Int) throws {
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        var end = data.startIndex
+        for _ in 0..<count {
+            guard let newline = data[end...].firstIndex(of: UInt8(ascii: "\n")) else { throw RecorderError("\(url.lastPathComponent) holds fewer lines than its table") }
+            end = newline + 1
         }
-        loaded.wait()
-        guard let track = try tracks.get().first else { throw RecorderError("\(movie.lastPathComponent) has no video track") }
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        reader.add(output)
-        guard reader.startReading() else { throw reader.error ?? RecorderError("cannot read \(movie.lastPathComponent)") }
-        var frames = 0
-        while let sample = output.copyNextSampleBuffer() { frames += CMSampleBufferGetNumSamples(sample) }
-        guard reader.status == .completed else { throw reader.error ?? RecorderError("reading \(movie.lastPathComponent) stopped early") }
-        return frames
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(end))
+        try handle.close()
     }
 
-    // The depth configuration, as the id spells it and as the default name says it: the rear camera's depth source, avfoundation or arkit (both read the LiDAR sensor), then filteroff or filteron.
-    private static func depthConfig(_ depthSource: DepthSource, filtered: Bool) -> (id: String, name: String) {
-        let filter = filtered ? (id: "filteron", name: "filter on") : (id: "filteroff", name: "filter off")
-        switch depthSource {
-        case .avfoundationTrueDepth: return (filter.id, "Front \(filter.name)")
-        case .avfoundationLiDAR: return ("avfoundation_\(filter.id)", "Rear AVFoundation \(filter.name)")
-        case .arkitSceneDepth: return ("arkit_\(filter.id)", "Rear ARKit \(filter.name)")
-        }
-    }
-
-    // rgbd_<start>_<camera>_<config>, then the user's name, if given, reduced to [A-Za-z0-9_-] and at most 40 characters.
-    private static func id(_ startTime: Date, _ camera: DepthCamera, config: String, _ userName: String?) -> String {
-        let base = "rgbd_\(formatted(startTime, "yyyyMMdd_HHmmss"))_\(camera.rawValue)_\(config)"
+    // rgbd_<start>_<camera>, then the user's name, if given, reduced to [A-Za-z0-9_-] and at most 40 characters.
+    private static func id(_ startTime: Date, _ camera: DepthCamera, _ userName: String?) -> String {
+        let base = "rgbd_\(formatted(startTime, "yyyyMMdd_HHmmss"))_\(camera.rawValue)"
         guard let userName else { return base }
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
         let suffix = String(String.UnicodeScalarView(userName.unicodeScalars.map { allowed.contains($0) ? $0 : "_" }).prefix(40))
@@ -440,16 +354,23 @@ final class Recording {
     }
 
     // fx, fy, cx, cy of an intrinsic matrix; empty when the frame came without one.
-    private static func columns(_ k: matrix_float3x3?) -> [String] {
+    private static func cells(_ k: matrix_float3x3?) -> [String] {
         guard let k else { return ["", "", "", ""] }
         return [k.columns.0.x, k.columns.1.y, k.columns.2.x, k.columns.2.y].map { String($0) }
     }
 
-    // A dropped frame has no orientation.
-    private static func columns(_ o: Orientation?) -> String {
-        guard let o else { return ",,,," }
-        guard let g = o.gravity, let t = o.gravityTime else { return "\(o.uprightRotationDegrees),,,," }
-        return [String(o.uprightRotationDegrees), String(format: "%.5f", g.x), String(format: "%.5f", g.y), String(format: "%.5f", g.z), String(format: "%.9f", t)].joined(separator: ",")
+    // upright_rotation_deg, gravity_x, gravity_y, gravity_z, gravity_ts; the gravity cells are empty before the first motion sample.
+    private static func cells(_ o: Orientation) -> [String] {
+        guard let g = o.gravity, let t = o.gravityTime else { return [String(o.uprightRotationDegrees), "", "", "", ""] }
+        return [String(o.uprightRotationDegrees), String(format: "%.5f", g.x), String(format: "%.5f", g.y), String(format: "%.5f", g.z), String(format: "%.9f", t)]
+    }
+
+    // tracking_state, then world_from_camera_00 ... world_from_camera_23; none for the front, which has no pose.
+    private static func cells(_ pose: Pose?) -> [String] {
+        guard let pose else { return [] }
+        // Row-major, while a simd matrix is indexed by column first.
+        let t = pose.worldFromCamera
+        return [pose.trackingState] + (0..<3).flatMap { row in (0..<4).map { column in String(t[column][row]) } }
     }
 }
 

@@ -1,13 +1,11 @@
 import AVFoundation
 import UIKit
 
-// The front TrueDepth camera or the rear LiDAR depth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered unless the start asks for Apple's filter.
+// The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered, and the lens autofocuses when it can move.
 final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
     static var frontDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) }
-    static var rearDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) }
 
     let device: AVCaptureDevice
-    private let depthSource: DepthSource
     let preview: UIView
     private let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -15,11 +13,13 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     private weak var sink: CaptureSink?
     private let queue: DispatchQueue
 
+    // Owned by queue: the start's ready and the formats it configured, until the first color frame gives the stream format.
+    private var pending: (ready: (Result<StreamFormat, Error>) -> Void, format: CaptureFormat)?
+
     // Both outputs deliver on queue, so the sink sees the frames in arrival order.
-    init(device: AVCaptureDevice, depthSource: DepthSource, sink: CaptureSink, queue: DispatchQueue) {
-        precondition(depthSource != .arkitSceneDepth, "ARKit's scene depth is not an AVFoundation source")
+    init(sink: CaptureSink, queue: DispatchQueue) {
+        guard let device = Self.frontDevice else { preconditionFailure("the front TrueDepth camera is not available") }
         self.device = device
-        self.depthSource = depthSource
         self.sink = sink
         self.queue = queue
         let view = PreviewLayerView()
@@ -38,21 +38,24 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         }
     }
 
-    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
-        ready(Result {
-            // Intrinsic matrix delivery can be enabled only while the session is stopped.
-            if session.isRunning { session.stopRunning() }
-            let format = try configure(depthFiltering: depthFiltering)
+    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+        // Intrinsic matrix delivery can be enabled only while the session is stopped.
+        if session.isRunning { session.stopRunning() }
+        do {
+            let format = try configure()
+            queue.sync { pending = (ready, format) }
             session.startRunning()
-            return format.stream(depthFiltering: depthFiltering, depthSource: depthSource)
-        })
+        } catch {
+            ready(.failure(error))
+        }
     }
 
     func stop() {
         session.stopRunning()
+        queue.sync { pending = nil }
     }
 
-    private func configure(depthFiltering: Bool) throws -> CaptureFormat {
+    private func configure() throws -> CaptureFormat {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
@@ -70,8 +73,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         guard session.canAddOutput(videoOutput) else { throw RecorderError("cannot add video output") }
         session.addOutput(videoOutput)
 
-        // Off gives raw sensor depth; Apple's filter smooths the stream over time and interpolates missing values.
-        depthOutput.isFilteringEnabled = depthFiltering
+        // Raw sensor depth: Apple's filter would smooth the stream over time and interpolate missing values.
+        depthOutput.isFilteringEnabled = false
         depthOutput.alwaysDiscardsLateDepthData = false
         depthOutput.setDelegate(self, callbackQueue: queue)
         guard session.canAddOutput(depthOutput) else { throw RecorderError("cannot add depth output") }
@@ -85,6 +88,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         device.activeVideoMinFrameDuration = format.frameDuration
         device.activeVideoMaxFrameDuration = format.frameDuration
         device.activeDepthDataMinFrameDuration = format.frameDuration
+        // A lens that cannot move is fixed-focus hardware.
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
         device.unlockForConfiguration()
 
         // Frames are kept in the sensor's own orientation and unmirrored, the orientation Apple's calibration describes; how the phone was held is recorded with each frame instead.
@@ -101,8 +106,13 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { preconditionFailure("a video sample without an image") }
+        if let pending {
+            self.pending = nil
+            pending.ready(.success(pending.format.stream(firstFrame: image, focus: device.focusMode == .continuousAutoFocus ? "autofocus" : "fixed")))
+        }
         let matrix = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data
-        sink?.captured(color: sampleBuffer, intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } })
+        sink?.captured(color: image, at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } }, pose: nil)
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -112,7 +122,7 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
         let map = depthData.depthDataMap
         let cal = depthData.cameraCalibrationData
-        // The depth is registered to the color camera; the calibration's intrinsics are at its reference dimensions.
+        // The depth is registered to the color camera; the calibration's intrinsics are at its reference dimensions, measured from the upper left of the frame.
         let intrinsics = cal.map { cal in
             scaled(cal.intrinsicMatrix,
                    scaleX: Float(CVPixelBufferGetWidth(map)) / Float(cal.intrinsicMatrixReferenceDimensions.width),
@@ -124,10 +134,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             metres: depthData.depthDataType == kCVPixelFormatType_DepthFloat32 ? map : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap,
             confidence: nil,
             intrinsics: intrinsics,
-            calibration: cal.map { cal in { Self.describe(cal) } },
-            filtered: depthData.isDepthDataFiltered ? "1" : "0",
-            accuracy: depthData.depthDataAccuracy == .absolute ? "absolute" : "relative",
-            quality: depthData.depthDataQuality == .high ? "high" : "low"))
+            sourceCells: [depthData.isDepthDataFiltered ? "1" : "0", depthData.depthDataAccuracy == .absolute ? "absolute" : "relative", depthData.depthDataQuality == .high ? "high" : "low"],
+            calibration: cal.map { cal in { Self.describe(cal) } }))
     }
 
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection, reason: AVCaptureOutput.DataDroppedReason) {
@@ -194,17 +202,18 @@ private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     let frameDuration: CMTime
 
-    func stream(depthFiltering: Bool, depthSource: DepthSource) -> StreamFormat {
-        let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
+    // The stream format, the color size and YCbCr matrix read from the first delivered color frame; focus is metadata.json's: autofocus or fixed.
+    func stream(firstFrame image: CVPixelBuffer, focus: String) -> StreamFormat {
         let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
         return StreamFormat(
-            colorWidth: Int(colorDims.width), colorHeight: Int(colorDims.height), colorPixelFormat: CMFormatDescriptionGetMediaSubType(color.formatDescription),
+            colorWidth: CVPixelBufferGetWidth(image), colorHeight: CVPixelBufferGetHeight(image), colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
             frameRate: 1 / CMTimeGetSeconds(frameDuration),
-            depthFilteringEnabled: depthFiltering,
-            depthSource: depthSource,
             details: [
+                "focus": focus,
+                "intrinsics_convention": "color.csv's fx,fy,cx,cy are each color frame's kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, in color pixels; depth.csv's are each depth map's own AVDepthData.cameraCalibrationData.intrinsicMatrix carried from intrinsic_reference_width x intrinsic_reference_height to the depth map: with sx = depth_width / intrinsic_reference_width and sy = depth_height / intrinsic_reference_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = cy * sy; Apple measures both principal points from \"the upper left of the frame\", the frame's corner, so plain scaling is exact; neither stream is distortion-corrected: calibration.jsonl carries each depth map's lens distortion lookup tables and center, which describe the color camera the depth is registered to",
+                "calibration_description": "calibration.jsonl: one line per delivered depth map, in depth.csv's order, {\"index\": n, \"timestamp\": t, \"calibration\": c} with n and t the map's depth.csv index and timestamp, and c the map's AVDepthData.cameraCalibrationData, null when the map came without one: intrinsic_matrix_row_major (intrinsicMatrix, at intrinsic_reference_width x intrinsic_reference_height, its intrinsicMatrixReferenceDimensions), extrinsic_matrix_row_major_3x4 (extrinsicMatrix), pixel_size_mm (pixelSize), lens_distortion_center (lensDistortionCenter), lens_distortion_lookup_table and inverse_lens_distortion_lookup_table (lensDistortionLookupTable and inverseLensDistortionLookupTable as Float32 arrays)",
                 "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
                     let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
                     return "\(d.width)x\(d.height) \(fourCC(CMFormatDescriptionGetMediaSubType(f.formatDescription)))"

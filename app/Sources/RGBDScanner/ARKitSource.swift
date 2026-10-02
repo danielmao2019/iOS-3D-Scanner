@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// The rear LiDAR camera through an ARSession running world tracking with scene depth: each ARFrame carries the color image, the LiDAR depth registered to it, unsmoothed (sceneDepth) or, with the depth filter on, smoothed over time (smoothedSceneDepth) and the depth's confidence, all at the frame's timestamp.
+// The rear LiDAR camera through an ARSession running world tracking with scene depth and autofocus: each ARFrame carries the color image, the camera's pose, the LiDAR depth registered to the image, unsmoothed (sceneDepth), and the depth's confidence, all at the frame's timestamp.
 final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     let device: AVCaptureDevice
     var preview: UIView { display }
@@ -14,12 +14,10 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     // Owned by queue: the start's ready, until the first frame with scene depth gives the stream format.
     private var pendingReady: ((Result<StreamFormat, Error>) -> Void)?
-    // Owned by queue: whether the running session delivers smoothedSceneDepth instead of sceneDepth.
-    private var smoothed = false
 
     // The session delivers its frames on queue.
     init(sink: CaptureSink, queue: DispatchQueue) {
-        // The world-tracking video format with the largest captured image, then the highest frame rate, among those with the scene depth map's 4:3 aspect ratio (256×192), since the depth intrinsics are scaled from the color image.
+        // The world-tracking video format with the largest captured image, then the highest frame rate, among those with the scene depth map's 4:3 aspect ratio (256×192), since the depth intrinsics are carried over from the color image.
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats.filter { $0.imageResolution.width * 3 == $0.imageResolution.height * 4 }
         guard let videoFormat = formats.max(by: { a, b in
             (a.imageResolution.width * a.imageResolution.height, a.framesPerSecond) < (b.imageResolution.width * b.imageResolution.height, b.framesPerSecond)
@@ -36,15 +34,13 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         session.delegateQueue = queue
     }
 
-    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
         let configuration = ARWorldTrackingConfiguration()
         configuration.videoFormat = videoFormat
-        // .smoothedSceneDepth is ARKit's depth smoothed over time, the counterpart of AVFoundation's depth filter.
-        configuration.frameSemantics = depthFiltering ? [.smoothedSceneDepth] : [.sceneDepth]
-        queue.sync {
-            pendingReady = ready
-            smoothed = depthFiltering
-        }
+        // Unsmoothed depth: .smoothedSceneDepth would average it over time.
+        configuration.frameSemantics = [.sceneDepth]
+        configuration.isAutoFocusEnabled = true
+        queue.sync { pendingReady = ready }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -56,43 +52,30 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let time = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000_000)
         let image = frame.capturedImage
-        let sceneDepth = smoothed ? frame.smoothedSceneDepth : frame.sceneDepth
         if let ready = pendingReady {
             // The first frames of a session can come before scene depth.
-            guard let depth = sceneDepth else { return }
+            guard let depth = frame.sceneDepth else { return }
             pendingReady = nil
             ready(streamFormat(image: image, depth: depth))
         }
         display.show(image, at: time)
         let camera = frame.camera
-        sink?.captured(color: Self.sampleBuffer(image, at: time), intrinsics: camera.intrinsics)
-        guard let depth = sceneDepth else {
+        sink?.captured(color: image, at: time, intrinsics: camera.intrinsics, pose: Pose(trackingState: Self.describe(camera.trackingState), worldFromCamera: camera.transform))
+        guard let depth = frame.sceneDepth else {
             sink?.droppedDepth(at: time, reason: "no_scene_depth")
             return
         }
         let map = depth.depthMap
-        let k = camera.intrinsics, resolution = camera.imageResolution
+        let resolution = camera.imageResolution
         sink?.captured(depth: DepthSample(
             time: time,
             map: map,
             metres: map,
             confidence: depth.confidenceMap,
-            // ARKit's intrinsics are in capturedImage pixels; the depth map covers the same view at a lower resolution.
-            intrinsics: scaled(k, scaleX: Float(CVPixelBufferGetWidth(map)) / Float(resolution.width), scaleY: Float(CVPixelBufferGetHeight(map)) / Float(resolution.height)),
-            calibration: {
-                [
-                    "intrinsic_matrix_row_major": [
-                        [k.columns.0.x, k.columns.1.x, k.columns.2.x],
-                        [k.columns.0.y, k.columns.1.y, k.columns.2.y],
-                        [k.columns.0.z, k.columns.1.z, k.columns.2.z],
-                    ],
-                    "intrinsic_reference_width": Int(resolution.width),
-                    "intrinsic_reference_height": Int(resolution.height),
-                ]
-            },
-            filtered: smoothed ? "1" : "0",
-            accuracy: "absolute",
-            quality: ""))
+            // ARKit's intrinsics are in capturedImage pixels, measured from the center of the upper-left pixel; the depth map covers the same view at a lower resolution.
+            intrinsics: resampled(camera.intrinsics, scaleX: Float(CVPixelBufferGetWidth(map)) / Float(resolution.width), scaleY: Float(CVPixelBufferGetHeight(map)) / Float(resolution.height)),
+            sourceCells: [],
+            calibration: nil))
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
@@ -103,7 +86,23 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         sink?.interrupted("the camera failed: \(error.localizedDescription)")
     }
 
-    // The stream format from the first frame with scene depth; the depth intrinsics are scaled from the color image, so the two must have one aspect ratio.
+    // The color.csv cell of a tracking state: normal, not_available or limited_<reason>.
+    private static func describe(_ state: ARCamera.TrackingState) -> String {
+        switch state {
+        case .normal: return "normal"
+        case .notAvailable: return "not_available"
+        case .limited(let reason):
+            switch reason {
+            case .initializing: return "limited_initializing"
+            case .excessiveMotion: return "limited_excessive_motion"
+            case .insufficientFeatures: return "limited_insufficient_features"
+            case .relocalizing: return "limited_relocalizing"
+            @unknown default: preconditionFailure("tracking is limited for a reason this app does not know: \(reason)")
+            }
+        }
+    }
+
+    // The stream format from the first frame with scene depth; the depth intrinsics are carried over from the color image, so the two must have one aspect ratio.
     private func streamFormat(image: CVPixelBuffer, depth: ARDepthData) -> Result<StreamFormat, Error> {
         let colorWidth = CVPixelBufferGetWidth(image), colorHeight = CVPixelBufferGetHeight(image)
         let map = depth.depthMap
@@ -115,14 +114,15 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         precondition(CVPixelBufferGetWidth(confidence) == depthWidth && CVPixelBufferGetHeight(confidence) == depthHeight, "confidence map differs in size from the depth map")
         precondition(CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat32, "scene depth is \(fourCC(CVPixelBufferGetPixelFormatType(map))), not Float32 metres")
         return .success(StreamFormat(
-            colorWidth: colorWidth, colorHeight: colorHeight, colorPixelFormat: CVPixelBufferGetPixelFormatType(image),
+            colorWidth: colorWidth, colorHeight: colorHeight, colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: depthWidth, depthHeight: depthHeight, depthPixelFormat: CVPixelBufferGetPixelFormatType(map),
             confidencePixelFormat: CVPixelBufferGetPixelFormatType(confidence),
             frameRate: Double(videoFormat.framesPerSecond),
-            depthFilteringEnabled: smoothed,
-            depthSource: .arkitSceneDepth,
             details: [
-                "arkit_frame_semantics": [smoothed ? "smoothedSceneDepth" : "sceneDepth"],
+                "focus": "autofocus",
+                "intrinsics_convention": "color.csv's fx,fy,cx,cy are each frame's ARCamera.intrinsics, in color pixels, the principal point measured, as ARCamera.h says, from the center of the upper-left pixel; depth.csv's carry them to the depth map, which covers the same view at a lower resolution: with sx = depth_width / color_width and sy = depth_height / color_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = (cx + 0.5) * sx - 0.5, cy_d = (cy + 0.5) * sy - 0.5",
+                "pose_convention": "color.csv's world_from_camera_<row><column> are rows 0-2 of ARCamera.transform, row-major (the constant bottom row 0,0,0,1 omitted): the transform from ARKit's camera frame to its world frame, in metres; the camera frame, as Apple defines it, has its origin at the camera, +x toward increasing column of the sensor-oriented color image, +y toward decreasing row, +z out of the lens toward the viewer, the camera looking along -z; the world frame is gravity-aligned with +y up, its origin and heading where tracking started, and each session start resets tracking; the poses are ARKit's estimates, and tracking_state says under which tracking state each was made",
+                "arkit_frame_semantics": ["sceneDepth"],
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),
             ]))
@@ -130,13 +130,6 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     private static func describe(_ format: ARConfiguration.VideoFormat) -> String {
         "\(Int(format.imageResolution.width))x\(Int(format.imageResolution.height)) \(format.framesPerSecond) fps \(format.captureDeviceType.rawValue)"
-    }
-
-    // The captured image as a sample buffer at the frame's timestamp, for the video writer.
-    private static func sampleBuffer(_ image: CVPixelBuffer, at time: CMTime) -> CMSampleBuffer {
-        // Both fail only on an image buffer CoreMedia cannot describe, which ARKit's captured images are not.
-        try! CMSampleBuffer(imageBuffer: image, formatDescription: CMVideoFormatDescription(imageBuffer: image),
-                            sampleTiming: CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid))
     }
 
     // Shows ARKit's captured images, turned upright for the portrait-only screen.
@@ -169,7 +162,9 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             let renderer = displayLayer.sampleBufferRenderer
             // The renderer fails when the app goes to the background and needs a flush to show images again.
             if renderer.status == .failed { renderer.flush() }
-            let sample = ARKitSource.sampleBuffer(image, at: time)
+            // Both fail only on an image buffer CoreMedia cannot describe, which ARKit's captured images are not.
+            let sample = try! CMSampleBuffer(imageBuffer: image, formatDescription: CMVideoFormatDescription(imageBuffer: image),
+                                             sampleTiming: CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid))
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true)! as NSArray
             (attachments[0] as! NSMutableDictionary)[kCMSampleAttachmentKey_DisplayImmediately] = true
             renderer.enqueue(sample)
