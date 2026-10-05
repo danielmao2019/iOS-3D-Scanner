@@ -1,65 +1,40 @@
 import Foundation
 
-// Writes a POSIX ustar archive, streamed in chunks; a member of 8 GiB or more has its size in the GNU base-256 encoding, which tar and Python's tarfile read.
+// A POSIX ustar archive of files, built as it is streamed and never stored: each file as root/<file name>, a header, its bytes and zero padding to a whole block, then two zero blocks; a member of 8 GiB or more has its size in the GNU base-256 encoding, which tar and Python's tarfile read.
 enum Tar {
     private static let blockSize = 512
 
-    // Appends the files as root/<file name> to a partial archive after the members it already holds whole, deleting each file once it is in, then ends the archive; a pack cut short is resumed by calling this again.
-    static func pack(_ files: [URL], root: String, into archive: URL) throws {
-        if !FileManager.default.fileExists(atPath: archive.path) {
-            guard FileManager.default.createFile(atPath: archive.path, contents: nil) else { throw RecorderError("cannot create \(archive.lastPathComponent)") }
-        }
-        let out = try FileHandle(forUpdating: archive)
-        do {
-            let stored = try completeMembers(out)
-            for file in files {
-                let path = root + "/" + file.lastPathComponent
-                if !stored.contains(path) { try append(file, as: path, to: out) }
-                // A file already stored may still be on disk when the previous pack stopped between storing and deleting it.
-                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
-            }
-            try out.write(contentsOf: Data(count: 2 * blockSize))
-        } catch {
-            try? out.close()
-            throw error
-        }
-        try out.close()
+    // The archive's size in bytes, from the files' sizes.
+    static func size(of files: [URL]) throws -> Int {
+        try files.reduce(2 * blockSize) { total, file in try total + blockSize + padded(attributes(of: file).size) }
     }
 
-    // The paths of the members stored whole; whatever follows the last of them is cut off and the handle is left at the end.
-    private static func completeMembers(_ handle: FileHandle) throws -> Set<String> {
-        let length = try handle.seekToEnd()
-        var paths = Set<String>()
-        var offset: UInt64 = 0
-        while offset + UInt64(blockSize) <= length {
-            try handle.seek(toOffset: offset)
-            guard let header = try handle.read(upToCount: blockSize), header.count == blockSize, header.contains(where: { $0 != 0 }),
-                  let size = size(ofHeader: [UInt8](header)) else { break }
-            let end = offset + UInt64(blockSize + padded(size))
-            guard end <= length else { break }
-            paths.insert(String(decoding: header.prefix(100).prefix { $0 != 0 }, as: UTF8.self))
-            offset = end
+    // Hands the archive's bytes to send in order, in chunks of at most 8 MiB; each member's mtime is its file's modification date, so every call streams the same bytes while the files stay as they are. Fails if a file's size changes while it is read.
+    static func stream(_ files: [URL], root: String, to send: (Data) throws -> Void) throws {
+        for file in files {
+            let (size, mtime) = try attributes(of: file)
+            try send(header(path: root + "/" + file.lastPathComponent, size: size, mtime: mtime))
+            let input = try FileHandle(forReadingFrom: file)
+            var read = 0
+            // Each chunk is released before the next is read: a file of several GB would otherwise stay in memory until iOS stops the app.
+            while try autoreleasepool(invoking: { () throws -> Bool in
+                guard let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
+                read += chunk.count
+                try send(chunk)
+                return true
+            }) {}
+            try input.close()
+            guard read == size else { throw RecorderError("\(file.lastPathComponent) changed while it was sent") }
+            try send(Data(count: padded(size) - size))
         }
-        try handle.truncate(atOffset: offset)
-        try handle.seek(toOffset: offset)
-        return paths
+        try send(Data(count: 2 * blockSize))
     }
 
-    private static func append(_ file: URL, as path: String, to out: FileHandle) throws {
-        guard let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize else { throw RecorderError("\(file.lastPathComponent) has no size") }
-        try out.write(contentsOf: header(path: path, size: size, mtime: Int(Date().timeIntervalSince1970)))
-        let input = try FileHandle(forReadingFrom: file)
-        var written = 0
-        // Each chunk is released before the next is read: a file of several GB would otherwise stay in memory until iOS stops the app.
-        while try autoreleasepool(invoking: { () throws -> Bool in
-            guard let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
-            try out.write(contentsOf: chunk)
-            written += chunk.count
-            return true
-        }) {}
-        try input.close()
-        guard written == size else { throw RecorderError("\(file.lastPathComponent) changed while packing") }
-        try out.write(contentsOf: Data(count: padded(size) - size))
+    // A file's size and modification date in whole seconds since 1970.
+    private static func attributes(of file: URL) throws -> (size: Int, mtime: Int) {
+        let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        guard let size = values.fileSize, let modified = values.contentModificationDate else { throw RecorderError("\(file.lastPathComponent) has no size or modification date") }
+        return (size, Int(modified.timeIntervalSince1970))
     }
 
     static func header(path: String, size: Int, mtime: Int) -> Data {
@@ -87,12 +62,6 @@ enum Tar {
         block[154] = 0
         block[155] = 0x20
         return Data(block)
-    }
-
-    private static func size(ofHeader header: [UInt8]) -> Int? {
-        let field = header[124..<136]
-        if header[124] & 0x80 != 0 { return field.dropFirst().reduce(0) { $0 << 8 | Int($1) } }
-        return Int(String(decoding: field.prefix { $0 != 0 && $0 != 0x20 }, as: UTF8.self), radix: 8)
     }
 
     private static func octal(_ value: Int, width: Int) -> String {

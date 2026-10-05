@@ -11,7 +11,7 @@ struct ContentView: View {
                     ForEach(model.availableCameras) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                .disabled(model.isRecording || model.isFinishing)
+                .disabled(model.isRecording)
                 .onChange(of: model.camera) { _, _ in model.startPreview() }
             } else if let only = model.availableCameras.first {
                 Text(only.label).font(.headline)
@@ -59,12 +59,12 @@ struct ContentView: View {
                 .font(.caption2.monospacedDigit())
 
             Button(action: model.recordTapped) {
-                Text(model.isRecording ? "Stop" : (model.isFinishing ? "Packaging…" : "Record"))
+                Text(model.isRecording ? "Stop" : "Record")
                     .font(.title2.bold()).frame(maxWidth: .infinity).padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
             .tint(model.isRecording ? .red : .accentColor)
-            .disabled(model.isStarting || model.isFinishing || model.formatSummary.isEmpty)
+            .disabled(model.isStarting || model.formatSummary.isEmpty)
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 

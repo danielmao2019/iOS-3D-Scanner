@@ -1,10 +1,25 @@
 import CryptoKit
 import Foundation
 
-// Uploads a recording's .tar to the receiver (server/receive.py) with an HTTP PUT; the receiver checks the SHA-256 and keeps the file.
-final class Uploader: NSObject, URLSessionTaskDelegate {
+// Uploads a finished recording to the receiver (server/receive.py) with one HTTP PUT whose body is the recording's archive, built from its directory as it is sent (Tar), followed by the archive's SHA-256 as 64 lowercase hex characters, hashed from the bytes sent; the receiver checks the hash and keeps the archive.
+final class Uploader: NSObject, URLSessionDataDelegate {
     private var session: URLSession!
-    private var progress: [Int: (Double) -> Void] = [:]
+    // Owned by the main queue, the session's delegate queue: the uploads in flight by task identifier.
+    private var uploads: [Int: Upload] = [:]
+
+    private struct Upload {
+        let files: [URL]
+        let root: String
+        let onProgress: (Double) -> Void
+        let completion: (Result<String, Error>) -> Void
+        // The server's reply as it arrives.
+        var reply = Data()
+        // Why the archive could not be sent, when the upload was cancelled for it.
+        var failure: Error?
+    }
+
+    // A write into a body stream found it closed or failed: the task ended or asked for a new body stream.
+    private struct BodyStreamClosed: Error {}
 
     override init() {
         super.init()
@@ -14,58 +29,86 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }
 
-    static func sha256(of file: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: file)
-        defer { handle.closeFile() }
-        var hasher = SHA256()
-        // Each chunk is released before the next is read: a file of several GB would otherwise stay in memory until iOS stops the app.
-        while autoreleasepool(invoking: { () -> Bool in
-            let chunk = handle.readData(ofLength: 8 << 20)
-            hasher.update(data: chunk)
-            return !chunk.isEmpty
-        }) {}
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    // Called on the main queue, which onProgress and completion are called on.
+    func upload(_ info: RecordingInfo, server: String, onProgress: @escaping (Double) -> Void, completion: @escaping (Result<String, Error>) -> Void) {
+        let base = server.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(base)/upload/\(info.id).tar") else { return completion(.failure(RecorderError("bad server URL"))) }
+        let files = info.members
+        let size: Int
+        do { size = try Tar.size(of: files) } catch { return completion(.failure(error)) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(Secrets.uploadToken, forHTTPHeaderField: "X-Upload-Token")
+        request.setValue("application/x-tar", forHTTPHeaderField: "Content-Type")
+        // The archive and its 64 hex characters, set explicitly so the streamed body is sent with its length instead of in chunks.
+        request.setValue(String(size + 64), forHTTPHeaderField: "Content-Length")
+        let task = session.uploadTask(withStreamedRequest: request)
+        uploads[task.taskIdentifier] = Upload(files: files, root: info.id, onProgress: onProgress, completion: completion)
+        task.resume()
     }
 
-    func upload(file: URL, server: String, onProgress: @escaping (Double) -> Void, completion: @escaping (Result<String, Error>) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let digest: String
-            do { digest = try Uploader.sha256(of: file) } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
-                return
+    // Asked for when the task starts and whenever it must send its body anew: a new producer writes the body from its first byte into a new pair of bound streams.
+    func urlSession(_ session: URLSession, task: URLSessionTask, needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
+        guard let upload = uploads[task.taskIdentifier] else { preconditionFailure("a body stream asked for by a task this uploader did not start") }
+        var input: InputStream?
+        var output: OutputStream?
+        Stream.getBoundStreams(withBufferSize: 1 << 20, inputStream: &input, outputStream: &output)
+        guard let input, let output else { preconditionFailure("no bound stream pair") }
+        Thread { self.produce(upload, into: output, for: task) }.start()
+        completionHandler(input)
+    }
+
+    // Runs on a thread of its own: writes the archive, then its SHA-256 in hex, into the unscheduled output, each write blocking while the stream is full; stops once the stream is closed or fails, and cancels the task when the archive cannot be read.
+    private func produce(_ upload: Upload, into output: OutputStream, for task: URLSessionTask) {
+        output.open()
+        var hasher = SHA256()
+        do {
+            try Tar.stream(upload.files, root: upload.root) { chunk in
+                hasher.update(data: chunk)
+                try Self.write(chunk, to: output)
             }
+            try Self.write(Data(hasher.finalize().map { String(format: "%02x", $0) }.joined().utf8), to: output)
+        } catch is BodyStreamClosed {
+            // Nothing reads this stream anymore; a new body stream, if the task asked for one, has a producer of its own.
+        } catch {
             DispatchQueue.main.async {
-                let base = server.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                guard let url = URL(string: "\(base)/upload/\(file.lastPathComponent)") else {
-                    completion(.failure(RecorderError("bad server URL")))
-                    return
-                }
-                var request = URLRequest(url: url)
-                request.httpMethod = "PUT"
-                request.setValue(Secrets.uploadToken, forHTTPHeaderField: "X-Upload-Token")
-                request.setValue(digest, forHTTPHeaderField: "X-Content-SHA256")
-                request.setValue("application/x-tar", forHTTPHeaderField: "Content-Type")
-                let task = self.session.uploadTask(with: request, fromFile: file) { data, response, error in
-                    if let error = error as NSError? {
-                        let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map { " [\($0.domain) \($0.code)]" } ?? ""
-                        return completion(.failure(RecorderError("\(error.localizedDescription) (\(error.domain) \(error.code))\(underlying)")))
-                    }
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                    if status == 200 {
-                        completion(.success(body))
-                    } else {
-                        completion(.failure(RecorderError("server replied \(status): \(body)")))
-                    }
-                }
-                self.progress[task.taskIdentifier] = onProgress
-                task.resume()
+                self.uploads[task.taskIdentifier]?.failure = error
+                task.cancel()
+            }
+        }
+        output.close()
+    }
+
+    // Writes all of data, blocking while the stream is full.
+    private static func write(_ data: Data, to output: OutputStream) throws {
+        try data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < bytes.count {
+                let written = output.write(bytes.bindMemory(to: UInt8.self).baseAddress! + offset, maxLength: bytes.count - offset)
+                guard written > 0 else { throw BodyStreamClosed() }
+                offset += written
             }
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard totalBytesExpectedToSend > 0 else { return }
-        progress[task.taskIdentifier]?(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        uploads[task.taskIdentifier]?.onProgress(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        uploads[dataTask.taskIdentifier]?.reply.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let upload = uploads.removeValue(forKey: task.taskIdentifier) else { preconditionFailure("a task this uploader did not start completed") }
+        if let failure = upload.failure { return upload.completion(.failure(failure)) }
+        if let error = error as NSError? {
+            let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map { " [\($0.domain) \($0.code)]" } ?? ""
+            return upload.completion(.failure(RecorderError("\(error.localizedDescription) (\(error.domain) \(error.code))\(underlying)")))
+        }
+        let status = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+        let body = String(decoding: upload.reply, as: UTF8.self)
+        upload.completion(status == 200 ? .success(body) : .failure(RecorderError("server replied \(status): \(body)")))
     }
 }

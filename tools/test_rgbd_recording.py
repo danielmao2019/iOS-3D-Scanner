@@ -1,4 +1,4 @@
-"""Tests the format_version "4.0" tools on tiny synthetic front and rear recordings laid out exactly as the app archives them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
+"""Tests the tools on tiny synthetic format_version "4.1" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, laid out alike, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -166,7 +166,7 @@ def recording_id(camera: str) -> str:
 
 def metadata(camera: str, matrix: str) -> Dict:
     meta = {
-        "format_version": "4.0",
+        "format_version": "4.1",
         "id": recording_id(camera),
         "name": f"2026-10-02 12:00:00 {camera.capitalize()}",
         "named_by_user": False,
@@ -364,6 +364,19 @@ def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
     assert np.array_equal(bgr[0:2, 2:4], np.full((2, 2, 3), second)), bgr[0:2, 2:4].tolist()
     frames = list(rec.color_frames())
     assert len(frames) == FRAMES and all(np.array_equal(f, rec.color_bgr(i)) for i, f in enumerate(frames))
+
+
+@pytest.mark.parametrize("camera", ["front", "rear"])
+def test_reader_reads_4_0(tmp_path: Path, camera: str) -> None:
+    files = members(camera, "ITU_R_709_2")
+    files["metadata.json"] = json.dumps(metadata(camera, "ITU_R_709_2") | {"format_version": "4.0"}).encode()
+
+    rec = Recording(write_tar(tmp_path / "recording.tar", recording_id(camera), files))
+
+    # App 4.0 packed the same layout that app 4.1 streams.
+    assert rec.meta["format_version"] == "4.0"
+    assert len(rec.color_rows) == len(rec.depth_rows) == len(TIMES)
+    assert np.array_equal(rec.color, color_frames()) and np.array_equal(rec.depth, depth_maps(), equal_nan=True)
 
 
 @pytest.mark.parametrize("change", ["format_version", "extra_member", "missing_member"])

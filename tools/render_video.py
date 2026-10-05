@@ -1,4 +1,4 @@
-"""Renders every color frame of an RGBD Scanner recording (.tar, format_version "4.0"), converted from color.bin to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel.
+"""Renders every color frame of an RGBD Scanner recording (.tar, format_version "4.0" or "4.1"), converted from color.bin to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel.
 
 Usage: python tools/render_video.py <recording.tar> <out.mp4> --ffmpeg <ffmpeg with libx264>
 """

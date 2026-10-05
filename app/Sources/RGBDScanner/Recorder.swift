@@ -145,7 +145,7 @@ final class Recorder: CaptureSink {
         }
     }
 
-    // Stops the active recording and hands it over to be named and packed.
+    // Stops the active recording and hands it over to be named and finished.
     func stopRecording(completion: @escaping (Recording) -> Void) {
         dataQueue.async {
             guard let recording = self.active else { return }
