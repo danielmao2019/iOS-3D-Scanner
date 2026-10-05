@@ -11,7 +11,7 @@ import simd
 // Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels, as metadata.json's intrinsics_convention says; they are empty on a dropped row, and on a delivered row whose frame came without them.
 // A dropped row is -1, the timestamp and why the frame was dropped (e.g. late, out_of_buffers, writer_busy, no_scene_depth), every other cell empty.
 //
-// The archive (format_version 7), its members under <id>/:
+// The archive (format_version "4.0", <major>.<minor>, the major the app version (v4) and the minor counting archive changes within it), its members under <id>/:
 //   color.bin          every delivered color frame exactly as the camera delivered it, uncompressed, with no header: the frame with color.csv index n occupies bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2; each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, color_height rows of color_width bytes (a Y byte per pixel), then its CbCr plane, color_height/2 rows of color_width bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through color_ycbcr_matrix
 //   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says
 //   depth.bin          depth maps exactly as delivered, concatenated with no header: map n occupies bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), depth_bytes_per_frame = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
@@ -304,7 +304,7 @@ final class Recording {
         let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")",
                                  namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
                                  camera: start.camera, uploaded: false)
-        metadata["format_version"] = 7
+        metadata["format_version"] = "4.0"
         metadata["id"] = info.id
         metadata["name"] = info.name
         metadata["named_by_user"] = info.namedByUser

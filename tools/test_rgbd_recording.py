@@ -1,4 +1,4 @@
-"""Tests the format_version 7 tools on tiny synthetic front and rear recordings laid out exactly as the app archives them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
+"""Tests the format_version "4.0" tools on tiny synthetic front and rear recordings laid out exactly as the app archives them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -166,7 +166,7 @@ def recording_id(camera: str) -> str:
 
 def metadata(camera: str, matrix: str) -> Dict:
     meta = {
-        "format_version": 7,
+        "format_version": "4.0",
         "id": recording_id(camera),
         "name": f"2026-10-02 12:00:00 {camera.capitalize()}",
         "named_by_user": False,
@@ -370,7 +370,7 @@ def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
 def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
     files = members("rear", "ITU_R_709_2")
     if change == "format_version":
-        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2") | {"format_version": 5}).encode()
+        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2") | {"format_version": "3.0"}).encode()
     elif change == "extra_member":
         files["calibration.jsonl"] = calibration_jsonl()
     else:

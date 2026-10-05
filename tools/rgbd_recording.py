@@ -1,4 +1,4 @@
-"""Reads an RGBD Scanner recording (.tar, format_version 7 only): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
+"""Reads an RGBD Scanner recording (.tar, format_version "4.0" only, <major>.<minor>, the major the app version (v4) and the minor counting archive changes within it): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
 
 The archive is a POSIX ustar tar whose members sit under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front). metadata.json's camera is "front" (the TrueDepth camera through AVFoundation, depth_source "avfoundation_truedepth") or "rear" (the LiDAR camera through ARKit world tracking, depth_source "arkit_scene_depth"); depth filtering is always off.
 
@@ -38,7 +38,7 @@ YCBCR_MATRICES = {"ITU_R_601_4": (0.299, 0.114), "ITU_R_709_2": (0.2126, 0.0722)
 
 
 class Recording:
-    """A format_version 7 recording: its metadata and tables read, its .bin members memory-mapped in place inside the tar."""
+    """A format_version "4.0" recording: its metadata and tables read, its .bin members memory-mapped in place inside the tar."""
 
     def __init__(self, tar_path: Path) -> None:
         # Mode "r:" opens an uncompressed tar only, the one whose members can be memory-mapped in place.
@@ -46,7 +46,7 @@ class Recording:
             members = {Path(m.name).name: m for m in tar.getmembers()}
             assert "metadata.json" in members, sorted(members)
             self.meta: Dict = json.load(tar.extractfile(members["metadata.json"]))
-            assert self.meta["format_version"] == 7, self.meta["format_version"]
+            assert self.meta["format_version"] == "4.0", self.meta["format_version"]
             camera = self.meta["camera"]
             assert camera in CAMERA_FILES, camera
             names = sorted(m.name for m in tar.getmembers())
