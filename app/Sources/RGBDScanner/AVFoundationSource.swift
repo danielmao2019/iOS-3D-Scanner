@@ -221,22 +221,28 @@ private struct CaptureFormat {
             ])
     }
 
-    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, at the highest frame rate both formats support.
+    // Bytes per second of uncompressed frames a recording may ask the storage to write: the iPhone 13 Pro Max's storage kept up with about 0.37 GB/s of frame writes once the first few GB were in (measured 2026-10-05 with app 4.1), and the budget leaves about 20% for an upload reading the same storage.
+    private static let storageWriteBudget = 300_000_000
+
+    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, among the pairs with a whole frame rate both formats support whose frames stay within storageWriteBudget, at the highest such rate.
     static func best(for device: AVCaptureDevice) -> CaptureFormat? {
-        let depthTypeRank: [OSType: Int] = [
-            kCVPixelFormatType_DepthFloat32: 3,
-            kCVPixelFormatType_DepthFloat16: 2,
-            kCVPixelFormatType_DisparityFloat32: 1,
-            kCVPixelFormatType_DisparityFloat16: 0,
+        // Each depth type's precision rank and bytes per pixel.
+        let depthTypes: [OSType: (rank: Int, bytesPerPixel: Int)] = [
+            kCVPixelFormatType_DepthFloat32: (3, 4),
+            kCVPixelFormatType_DepthFloat16: (2, 2),
+            kCVPixelFormatType_DisparityFloat32: (1, 4),
+            kCVPixelFormatType_DisparityFloat16: (0, 2),
         ]
         var best: (CaptureFormat, [Int])?
         for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
             let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
             for depth in color.supportedDepthDataFormats {
-                guard let rank = depthTypeRank[CMFormatDescriptionGetMediaSubType(depth.formatDescription)],
-                      let frameDuration = shortestCommonFrameDuration(color, depth) else { continue }
+                guard let depthType = depthTypes[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
                 let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                let key = [Int(depthDims.width) * Int(depthDims.height), rank, Int(colorDims.width) * Int(colorDims.height)]
+                // A 420f color frame has a Y byte per pixel, then a Cb, Cr byte pair per 2 × 2 pixels.
+                let bytesPerFrame = Int(colorDims.width) * Int(colorDims.height) * 3 / 2 + Int(depthDims.width) * Int(depthDims.height) * depthType.bytesPerPixel
+                guard let frameDuration = frameDurationWithinBudget(color, depth, bytesPerFrame: bytesPerFrame) else { continue }
+                let key = [Int(depthDims.width) * Int(depthDims.height), depthType.rank, Int(colorDims.width) * Int(colorDims.height)]
                 if best == nil || best!.1.lexicographicallyPrecedes(key) {
                     best = (CaptureFormat(color: color, depth: depth, frameDuration: frameDuration), key)
                 }
@@ -245,13 +251,13 @@ private struct CaptureFormat {
         return best?.0
     }
 
-    // The shortest frame duration inside a supported range of both formats.
-    private static func shortestCommonFrameDuration(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format) -> CMTime? {
+    // The frame duration, 1 / fps, of the highest whole frame rate fps inside a supported range of both formats at which bytesPerFrame a frame stays within storageWriteBudget; nil when not even 1 fps does.
+    private static func frameDurationWithinBudget(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format, bytesPerFrame: Int) -> CMTime? {
         func supports(_ format: AVCaptureDevice.Format, _ duration: CMTime) -> Bool {
             format.videoSupportedFrameRateRanges.contains { $0.minFrameDuration <= duration && duration <= $0.maxFrameDuration }
         }
-        return (color.videoSupportedFrameRateRanges + depth.videoSupportedFrameRateRanges).map(\.minFrameDuration)
-            .filter { supports(color, $0) && supports(depth, $0) }
-            .min()
+        return stride(from: storageWriteBudget / bytesPerFrame, through: 1, by: -1).lazy
+            .map { CMTime(value: 1, timescale: Int32($0)) }
+            .first { supports(color, $0) && supports(depth, $0) }
     }
 }

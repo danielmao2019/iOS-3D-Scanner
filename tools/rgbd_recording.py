@@ -1,4 +1,4 @@
-"""Reads an RGBD Scanner recording (.tar, format_version "4.0" or "4.1", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor counting the app's changes within it; the two are laid out alike, 4.1 written by app 4.1, which stores a recording as a directory and streams it as this tar): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
+"""Reads an RGBD Scanner recording (.tar, format_version "4.<minor>", the version of the app that wrote it, the layout fixed within major 4 and the minor naming the app build; apps 4.1 and later store a recording as a directory and stream it as this tar): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
 
 The archive is a POSIX ustar tar whose members sit under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front). metadata.json's camera is "front" (the TrueDepth camera through AVFoundation, depth_source "avfoundation_truedepth") or "rear" (the LiDAR camera through ARKit world tracking, depth_source "arkit_scene_depth"); depth filtering is always off.
 
@@ -12,6 +12,7 @@ Pixels and intrinsics are in the sensor's native orientation; `upright` turns a 
 import csv
 import io
 import json
+import re
 import tarfile
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -38,7 +39,7 @@ YCBCR_MATRICES = {"ITU_R_601_4": (0.299, 0.114), "ITU_R_709_2": (0.2126, 0.0722)
 
 
 class Recording:
-    """A format_version "4.0" or "4.1" recording: its metadata and tables read, its .bin members memory-mapped in place inside the tar."""
+    """A format_version "4.<minor>" recording: its metadata and tables read, its .bin members memory-mapped in place inside the tar."""
 
     def __init__(self, tar_path: Path) -> None:
         # Mode "r:" opens an uncompressed tar only, the one whose members can be memory-mapped in place.
@@ -46,7 +47,8 @@ class Recording:
             members = {Path(m.name).name: m for m in tar.getmembers()}
             assert "metadata.json" in members, sorted(members)
             self.meta: Dict = json.load(tar.extractfile(members["metadata.json"]))
-            assert self.meta["format_version"] in ("4.0", "4.1"), self.meta["format_version"]
+            # The layout is fixed within major 4; the minor names the app build that wrote it.
+            assert re.fullmatch(r"4\.[0-9]+", self.meta["format_version"]), self.meta["format_version"]
             camera = self.meta["camera"]
             assert camera in CAMERA_FILES, camera
             names = sorted(m.name for m in tar.getmembers())

@@ -1,4 +1,4 @@
-"""Decodes RGBD Scanner recordings (.tar, format_version "4.0" or "4.1") into per-frame files in a directory next to each tar, named like the tar without .tar.
+"""Decodes RGBD Scanner recordings (.tar, format_version "4.<minor>") into per-frame files in a directory next to each tar, named like the tar without .tar.
 
 Each output directory holds color/<index:06d>.png (every color.bin frame converted from full-range YCbCr 4:2:0 to BGR through metadata.json's color_ycbcr_matrix, 8-bit lossless PNG, sensor orientation), depth/<index:06d>.npy (Float32 metres, sensor orientation, depth.bin's map as stored, NaN and 0 kept), confidence/<index:06d>.npy (uint8 ARConfidenceLevel, rear recordings), the recording's tables, metadata.json and, for a front recording, calibration.jsonl copied verbatim, and decoded.json, a machine summary. A directory is decoded under <name>.partial and renamed when complete, so an existing output directory is complete and is skipped unless --force.
 
