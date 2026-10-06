@@ -11,9 +11,9 @@ import simd
 // Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels, as metadata.json's intrinsics_convention says; they are empty on a dropped row, and on a delivered row whose frame came without them.
 // A dropped row is -1, the timestamp and why the frame was dropped (e.g. late, out_of_buffers, writer_busy, no_scene_depth), every other cell empty.
 //
-// The archive (format_version "4.2", the version of the app that wrote it, <major>.<minor>, the major the app version (v4), within which the layout is fixed, and the minor naming the app build), its members under <id>/:
+// The archive (format_version "4.3", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build; laid out as in 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which 4.3 added), its members under <id>/:
 //   color.bin          every delivered color frame exactly as the camera delivered it, uncompressed, with no header: the frame with color.csv index n occupies bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2; each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, color_height rows of color_width bytes (a Y byte per pixel), then its CbCr plane, color_height/2 rows of color_width bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through color_ycbcr_matrix
-//   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says
+//   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,exposure_duration_s,lens_position,received_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says; exposure_duration_s is the frame's own exposure time in seconds, lens_position the capture device's lensPosition (0 to 1) and received_ts the host-clock seconds at which the app received the frame, the last two read when the frame reached the app and so later than its exposure by the capture pipeline's latency, as metadata.json's exposure_lens_arrival_convention says
 //   depth.bin          depth maps exactly as delivered, concatenated with no header: map n occupies bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), depth_bytes_per_frame = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
 //   depth.csv          one row per depth map delivered or dropped: index,timestamp,dropped, then, for the front, filtered,accuracy,quality (AVDepthData's isDepthDataFiltered 1 or 0, depthDataAccuracy absolute or relative, depthDataQuality high or low), then fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,bytes_per_row (the delivered map's row stride, which depth.bin drops)
 //   confidence.bin     rear only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
@@ -34,6 +34,8 @@ final class Recording {
 
     private static let intrinsicsColumns = "fx,fy,cx,cy"
     private static let orientationColumns = "upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts"
+    // A color frame's own exposure time, its capture device's lens position and when the app received it.
+    private static let exposureLensArrivalColumns = "exposure_duration_s,lens_position,received_ts"
     // ARKit's tracking state and rows 0-2 of ARCamera.transform, row-major.
     private static let poseColumns = "tracking_state," + (0..<3).flatMap { row in (0..<4).map { column in "world_from_camera_\(row)\(column)" } }.joined(separator: ",")
 
@@ -82,7 +84,7 @@ final class Recording {
         start["orientation_convention"] = "pixels and intrinsics are in the sensor's native orientation, unrotated and unmirrored; rotating a frame clockwise by its upright_rotation_deg makes it upright (horizon-level); gravity_x/y/z is CoreMotion gravity in g in the phone's device frame (x right, y toward the top of the phone held in portrait, z out of the screen)"
         try JSONSerialization.data(withJSONObject: start, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("start.json"))
 
-        let colorHeader = "index,timestamp,dropped," + Self.intrinsicsColumns + "," + Self.orientationColumns + (camera == .rear ? "," + Self.poseColumns : "")
+        let colorHeader = "index,timestamp,dropped," + Self.intrinsicsColumns + "," + Self.orientationColumns + "," + Self.exposureLensArrivalColumns + (camera == .rear ? "," + Self.poseColumns : "")
         let depthHeader = "index,timestamp,dropped," + (camera == .front ? "filtered,accuracy,quality," : "") + Self.intrinsicsColumns + "," + Self.orientationColumns + ",bytes_per_row"
         colorColumns = colorHeader.split(separator: ",").count
         depthColumns = depthHeader.split(separator: ",").count
@@ -112,14 +114,15 @@ final class Recording {
     // The frame calls below run on the capture data queue.
 
     // Returns whether the frame is written; a frame whose copy would push the bytes waiting to be written above maxQueuedBytes is recorded as dropped. Only the rear's frames come with a pose.
-    func appendColor(_ image: CVPixelBuffer, at time: CMTime, intrinsics: matrix_float3x3?, pose: Pose?, orientation: Orientation) -> Bool {
+    func appendColor(_ color: ColorSample, orientation: Orientation) -> Bool {
         // Only this queue adds to queuedBytes, so the bound still holds once the frame is queued.
         guard bufferLock.withLock({ queuedBytes }) + format.colorBytesPerFrame <= Self.maxQueuedBytes else {
-            recordDroppedColor(at: time, reason: "writer_busy")
+            recordDroppedColor(at: color.time, reason: "writer_busy")
             return false
         }
-        writeColor(image)
-        append([String(colorCount), seconds(time), ""] + Self.cells(intrinsics) + Self.cells(orientation) + Self.cells(pose), to: colorTable, columns: colorColumns)
+        writeColor(color.image)
+        let exposureLensArrival = [String(format: "%.9f", color.exposureDuration), String(color.lensPosition), seconds(color.received)]
+        append([String(colorCount), seconds(color.time), ""] + Self.cells(color.intrinsics) + Self.cells(orientation) + exposureLensArrival + Self.cells(color.pose), to: colorTable, columns: colorColumns)
         colorCount += 1
         return true
     }
@@ -323,7 +326,7 @@ final class Recording {
         let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")",
                                  namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
                                  camera: start.camera, uploaded: false)
-        metadata["format_version"] = "4.2"
+        metadata["format_version"] = "4.3"
         metadata["id"] = info.id
         metadata["name"] = info.name
         metadata["named_by_user"] = info.namedByUser

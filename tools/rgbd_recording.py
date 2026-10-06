@@ -1,10 +1,10 @@
-"""Reads an RGBD Scanner recording (.tar, format_version "4.<minor>", the version of the app that wrote it, the layout fixed within major 4 and the minor naming the app build; apps 4.1 and later store a recording as a directory and stream it as this tar): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
+"""Reads an RGBD Scanner recording (.tar, format_version "4.<minor>", the version of the app that wrote it, the minor naming the app build; every minor is laid out as 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which minor 3 added; apps 4.1 and later store a recording as a directory and stream it as this tar): its metadata, the color and depth tables, the color frames, the depth maps, the rear camera's confidence maps and poses, and the front camera's per-map calibration. color.bin, depth.bin and confidence.bin are memory-mapped in place inside the uncompressed tar, at each member's data offset, never extracted: a front recording is about 0.55 GB per second.
 
 The archive is a POSIX ustar tar whose members sit under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front). metadata.json's camera is "front" (the TrueDepth camera through AVFoundation, depth_source "avfoundation_truedepth") or "rear" (the LiDAR camera through ARKit world tracking, depth_source "arkit_scene_depth"); depth filtering is always off.
 
 color.bin holds every delivered color frame uncompressed, frame n (color.csv's row with index n) at bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2, no header: the camera's 420f buffer, 8-bit full-range YCbCr 4:2:0, its luma plane (color_height rows of color_width bytes, one Y per pixel) then its CbCr plane (color_height/2 rows of color_width bytes, one Cb, Cr byte pair per 2x2 pixels), rows tightly packed; `color_bgr` converts a frame to BGR through metadata.json's color_ycbcr_matrix. depth.bin holds every delivered depth map as Float32 metres ("fdep"), map n at bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), rows tightly packed, NaN or 0 meaning no reading. The rear's confidence.bin holds one UInt8 ARConfidenceLevel map per depth map, in depth.bin's order and layout: 0 low, 1 medium, 2 high.
 
-color.csv and depth.csv hold one row per frame delivered or dropped: index (-1 on a dropped row), timestamp (host-clock seconds, one clock for both tables), dropped (a dropped row's reason; its later cells are empty), the frame's intrinsics fx, fy, cx, cy in its own stream's pixels (empty on a delivered row only when the frame came without them), upright_rotation_deg and CoreMotion gravity. depth.csv adds bytes_per_row, the delivered map's row stride that depth.bin drops, and the front's AVDepthData filtered, accuracy and quality. The rear's color.csv adds ARKit's tracking_state and world_from_camera_<r><c>, rows 0 to 2 of ARFrame.camera.transform (camera to world, metres), which `world_from_camera` returns as a 4x4 matrix. The rear's depth intrinsics are its color intrinsics, whose principal point ARKit measures from the center of the upper-left pixel, carried to the depth map as its grid lies on the color image, measured on six rear scans from where depth edges land on color edges: f*s on both axes, cx*sx along x, where the first depth column's center sits on the first color column's center, and (cy+0.5)*sy-0.5 along y, where the depth rows span the color rows edge to edge, s = depth size / color size; the front's are each depth map's own calibration scaled from its reference dimensions with Apple's corner origin, f*s and c*s. The front's calibration.jsonl holds one line per delivered depth map, in depth.csv's order: {"index", "timestamp", "calibration"}, the map's AVCameraCalibrationData described, or null when it came without one.
+color.csv and depth.csv hold one row per frame delivered or dropped: index (-1 on a dropped row), timestamp (host-clock seconds, one clock for both tables), dropped (a dropped row's reason; its later cells are empty), the frame's intrinsics fx, fy, cx, cy in its own stream's pixels (empty on a delivered row only when the frame came without them), upright_rotation_deg and CoreMotion gravity. From minor 3, color.csv adds, after gravity_ts, exposure_duration_s (the frame's own exposure time, seconds), lens_position (the capture device's lensPosition, 0 to 1) and received_ts (host-clock seconds at which the app received the frame), the last two read when the frame reached the app and so later than its exposure by the capture pipeline's latency. depth.csv adds bytes_per_row, the delivered map's row stride that depth.bin drops, and the front's AVDepthData filtered, accuracy and quality. The rear's color.csv adds ARKit's tracking_state and world_from_camera_<r><c>, rows 0 to 2 of ARFrame.camera.transform (camera to world, metres), which `world_from_camera` returns as a 4x4 matrix. The rear's depth intrinsics are its color intrinsics, whose principal point ARKit measures from the center of the upper-left pixel, carried to the depth map as its grid lies on the color image, measured on six rear scans from where depth edges land on color edges: f*s on both axes, cx*sx along x, where the first depth column's center sits on the first color column's center, and (cy+0.5)*sy-0.5 along y, where the depth rows span the color rows edge to edge, s = depth size / color size; the front's are each depth map's own calibration scaled from its reference dimensions with Apple's corner origin, f*s and c*s. The front's calibration.jsonl holds one line per delivered depth map, in depth.csv's order: {"index", "timestamp", "calibration"}, the map's AVCameraCalibrationData described, or null when it came without one.
 
 Pixels and intrinsics are in the sensor's native orientation; `upright` turns a frame the way the phone was held. A color frame and a depth frame were captured together when their timestamps are equal (`pairs`).
 """
@@ -24,10 +24,8 @@ CAMERA_FILES = {"front": {"calibration.jsonl"}, "rear": {"confidence.bin"}}
 INTRINSICS = ["fx", "fy", "cx", "cy"]
 ORIENTATION = ["upright_rotation_deg", "gravity_x", "gravity_y", "gravity_z", "gravity_ts"]
 POSE = [f"world_from_camera_{r}{c}" for r in range(3) for c in range(4)]
-COLOR_HEADERS = {
-    "front": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION],
-    "rear": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION, "tracking_state", *POSE],
-}
+# color.csv's columns from format minor 3 on, after gravity_ts.
+EXPOSURE_LENS_ARRIVAL = ["exposure_duration_s", "lens_position", "received_ts"]
 DEPTH_HEADERS = {
     "front": ["index", "timestamp", "dropped", "filtered", "accuracy", "quality", *INTRINSICS, *ORIENTATION, "bytes_per_row"],
     "rear": ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION, "bytes_per_row"],
@@ -47,13 +45,15 @@ class Recording:
             members = {Path(m.name).name: m for m in tar.getmembers()}
             assert "metadata.json" in members, sorted(members)
             self.meta: Dict = json.load(tar.extractfile(members["metadata.json"]))
-            # The layout is fixed within major 4; the minor names the app build that wrote it.
-            assert re.fullmatch(r"4\.[0-9]+", self.meta["format_version"]), self.meta["format_version"]
+            # Major 4, the minor naming the app build that wrote it.
+            version = re.fullmatch(r"4\.([0-9]+)", self.meta["format_version"])
+            assert version is not None, self.meta["format_version"]
+            self.format_minor = int(version.group(1))
             camera = self.meta["camera"]
             assert camera in CAMERA_FILES, camera
             names = sorted(m.name for m in tar.getmembers())
             assert names == sorted(f"{self.meta['id']}/{name}" for name in FILES | CAMERA_FILES[camera]), names
-            self.color_rows = read_table(tar, members["color.csv"], COLOR_HEADERS[camera])
+            self.color_rows = read_table(tar, members["color.csv"], color_header(camera, self.format_minor))
             self.depth_rows = read_table(tar, members["depth.csv"], DEPTH_HEADERS[camera])
             self.calibrations: Optional[List[Dict]] = None
             if camera == "front":
@@ -100,6 +100,19 @@ class Recording:
 
         top = np.array([float(row[k]) for k in POSE], dtype=np.float64).reshape(3, 4)
         return np.vstack([top, [0, 0, 0, 1]])
+
+
+def color_header(camera: str, minor: int) -> List[str]:
+    """color.csv's header for a camera in a format_version "4.<minor>" recording, with EXPOSURE_LENS_ARRIVAL after gravity_ts from minor 3 on."""
+    def _validate_inputs() -> None:
+        assert camera in CAMERA_FILES, camera
+        assert minor >= 0, minor
+
+    _validate_inputs()
+
+    exposure_lens_arrival = EXPOSURE_LENS_ARRIVAL if minor >= 3 else []
+    pose = ["tracking_state", *POSE] if camera == "rear" else []
+    return ["index", "timestamp", "dropped", *INTRINSICS, *ORIENTATION, *exposure_lens_arrival, *pose]
 
 
 def read_table(tar: tarfile.TarFile, member: tarfile.TarInfo, header: List[str]) -> List[Dict[str, str]]:

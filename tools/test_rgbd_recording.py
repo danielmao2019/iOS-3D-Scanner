@@ -1,4 +1,4 @@
-"""Tests the tools on tiny synthetic format_version "4.2" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, laid out alike, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
+"""Tests the tools on tiny synthetic format_version "4.3" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, whose color.csv lacks the three columns 4.3 added, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -15,7 +15,7 @@ import pytest
 
 from decode_recording import decode
 from inspect_recording import inspect, spatial_alignment
-from rgbd_recording import COLOR_HEADERS, DEPTH_HEADERS, YCBCR_MATRICES, Recording
+from rgbd_recording import DEPTH_HEADERS, YCBCR_MATRICES, Recording, color_header
 
 COLOR_WIDTH, COLOR_HEIGHT = 8, 6
 DEPTH_WIDTH, DEPTH_HEIGHT = 4, 3
@@ -26,6 +26,8 @@ TIMES = [f"{100 + i / 30:.9f}" for i in range(5)]
 COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
+# The synthetic recordings are app 4.3's, format_version "4.3".
+MINOR = 3
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 # The spatial alignment recording: a rear recording big enough to have structure, ALIGNED_PAIRS same-instant pairs, its depth a quarter of its color each way, each pair showing RECTANGLES random rectangles at NEAR_M before a background at FAR_M.
@@ -107,6 +109,11 @@ def orientation(instant: int) -> List[str]:
     return ["90", "0.01000", "-0.99000", "0.05000", f"{float(TIMES[instant]) - 0.001:.9f}"]
 
 
+def exposure_lens_arrival(time: str) -> List[str]:
+    """exposure_duration_s, lens_position and received_ts of a color frame with timestamp `time`: a 1/120 s exposure, the lens at 0.8, received 30 ms after its timestamp."""
+    return [f"{1 / 120:.9f}", "0.8", f"{float(time) + 0.03:.9f}"]
+
+
 def delivered(dropped: Dict[int, str]) -> Dict[int, int]:
     """Each delivered row's instant with its index."""
     instants = [i for i in range(len(TIMES)) if i not in dropped]
@@ -124,13 +131,14 @@ def table(header: List[str], dropped: Dict[int, str], cells: Dict[int, List[str]
     return ("\n".join(lines) + "\n").encode()
 
 
-def color_csv(camera: str) -> bytes:
+def color_csv(camera: str, minor: int) -> bytes:
+    """A format_version "4.<minor>" color.csv, with exposure_duration_s, lens_position and received_ts from minor 3 on."""
     cells = {}
     for instant in delivered(COLOR_DROPPED):
-        cells[instant] = [f32(v) for v in color_intrinsics(instant)] + orientation(instant)
+        cells[instant] = [f32(v) for v in color_intrinsics(instant)] + orientation(instant) + (exposure_lens_arrival(TIMES[instant]) if minor >= 3 else [])
         if camera == "rear":
             cells[instant] += ["limited_initializing" if instant == 0 else "normal"] + [f32(v) for v in pose(instant).ravel()]
-    return table(COLOR_HEADERS[camera], COLOR_DROPPED, cells)
+    return table(color_header(camera, minor), COLOR_DROPPED, cells)
 
 
 def depth_csv(camera: str) -> bytes:
@@ -164,9 +172,9 @@ def recording_id(camera: str) -> str:
     return f"rgbd_20261002_120000_{camera}"
 
 
-def metadata(camera: str, matrix: str) -> Dict:
+def metadata(camera: str, matrix: str, minor: int) -> Dict:
     meta = {
-        "format_version": "4.2",
+        "format_version": f"4.{minor}",
         "id": recording_id(camera),
         "name": f"2026-10-02 12:00:00 {camera.capitalize()}",
         "named_by_user": False,
@@ -212,12 +220,12 @@ def metadata(camera: str, matrix: str) -> Dict:
     return meta
 
 
-def members(camera: str, matrix: str) -> Dict[str, bytes]:
-    """Each archive member's name under <id>/ with its bytes."""
+def members(camera: str, matrix: str, minor: int) -> Dict[str, bytes]:
+    """Each archive member's name under <id>/ with its bytes, in format_version "4.<minor>"."""
     files = {
-        "metadata.json": json.dumps(metadata(camera, matrix), indent=2, sort_keys=True).encode(),
+        "metadata.json": json.dumps(metadata(camera, matrix, minor), indent=2, sort_keys=True).encode(),
         "color.bin": color_frames().tobytes(),
-        "color.csv": color_csv(camera),
+        "color.csv": color_csv(camera, minor),
         "depth.bin": depth_maps().tobytes(),
         "depth.csv": depth_csv(camera),
     }
@@ -240,7 +248,7 @@ def write_tar(path: Path, rec_id: str, files: Dict[str, bytes]) -> Path:
 
 
 def synthetic_tar(folder: Path, camera: str, matrix: str) -> Path:
-    return write_tar(folder / f"{recording_id(camera)}.tar", recording_id(camera), members(camera, matrix))
+    return write_tar(folder / f"{recording_id(camera)}.tar", recording_id(camera), members(camera, matrix, MINOR))
 
 
 def aligned_color_intrinsics(instant: int) -> np.ndarray:
@@ -274,7 +282,7 @@ def rectangle_cover(instant: int, width: int, height: int, k: np.ndarray) -> np.
 
 def aligned_members(fattening: int) -> Dict[str, bytes]:
     """The spatial alignment recording's members under <id>/: ALIGNED_PAIRS instants at 30 fps, each with a delivered color frame, its luma bright where the rectangles are, and a delivered depth map, near where they are grown by `fattening` depth px, each rasterized through its own recorded intrinsics."""
-    color_lines, depth_lines = [",".join(COLOR_HEADERS["rear"])], [",".join(DEPTH_HEADERS["rear"])]
+    color_lines, depth_lines = [",".join(color_header("rear", MINOR))], [",".join(DEPTH_HEADERS["rear"])]
     frames, maps = [], []
     for instant in range(ALIGNED_PAIRS):
         time = f"{200 + instant / 30:.9f}"
@@ -282,7 +290,7 @@ def aligned_members(fattening: int) -> Dict[str, bytes]:
         color_k = aligned_color_intrinsics(instant)
         # Rasterized through these, the depth grid lies on the color image as ARKit's does: first column centers together along x, rows edge to edge along y.
         depth_k = arkit_depth_intrinsics(color_k, ALIGNED_SCALE)
-        color_lines.append(",".join([str(instant), time, "", *(f32(v) for v in color_k), *orient, "normal", *(f32(v) for v in pose(instant).ravel())]))
+        color_lines.append(",".join([str(instant), time, "", *(f32(v) for v in color_k), *orient, *exposure_lens_arrival(time), "normal", *(f32(v) for v in pose(instant).ravel())]))
         depth_lines.append(",".join([str(instant), time, "", *(f32(v) for v in depth_k), *orient, str(ALIGNED_DEPTH_WIDTH * 4)]))
         luma = np.rint(60 + 140 * rectangle_cover(instant, ALIGNED_COLOR_WIDTH, ALIGNED_COLOR_HEIGHT, color_k))
         assert luma.dtype == np.float64, luma.dtype
@@ -292,7 +300,7 @@ def aligned_members(fattening: int) -> Dict[str, bytes]:
         inverse = cv2.dilate(inverse, np.ones((2 * fattening + 1, 2 * fattening + 1), np.uint8))
         assert inverse.dtype == np.float64, inverse.dtype
         maps.append((1 / inverse).astype(np.float32))
-    meta = metadata("rear", "ITU_R_709_2") | {
+    meta = metadata("rear", "ITU_R_709_2", MINOR) | {
         "duration_s": (ALIGNED_PAIRS - 1) / 30,
         "color_width": ALIGNED_COLOR_WIDTH,
         "color_height": ALIGNED_COLOR_HEIGHT,
@@ -332,6 +340,7 @@ def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
 
     assert len(rec.color_rows) == len(rec.depth_rows) == len(TIMES)
     assert [r["index"] for r in rec.colors] == [r["index"] for r in rec.depths] == ["0", "1", "2", "3"]
+    assert rec.format_minor == MINOR and [r["received_ts"] for r in rec.colors] == [exposure_lens_arrival(TIMES[i])[2] for i in delivered(COLOR_DROPPED)]
     with tarfile.open(tar_path) as tar:
         offsets = {Path(m.name).name: m.offset_data for m in tar.getmembers()}
     # Each .bin member is mapped in place inside the tar, never extracted.
@@ -368,22 +377,19 @@ def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
 
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_reader_reads_4_0(tmp_path: Path, camera: str) -> None:
-    files = members(camera, "ITU_R_709_2")
-    files["metadata.json"] = json.dumps(metadata(camera, "ITU_R_709_2") | {"format_version": "4.0"}).encode()
+    rec = Recording(write_tar(tmp_path / "recording.tar", recording_id(camera), members(camera, "ITU_R_709_2", 0)))
 
-    rec = Recording(write_tar(tmp_path / "recording.tar", recording_id(camera), files))
-
-    # App 4.0 packed the layout every app 4 build writes.
-    assert rec.meta["format_version"] == "4.0"
+    # App 4.0 wrote color.csv without the three columns 4.3 added, and everything else as 4.3 does.
+    assert rec.meta["format_version"] == "4.0" and rec.format_minor == 0 and "received_ts" not in rec.color_rows[0]
     assert len(rec.color_rows) == len(rec.depth_rows) == len(TIMES)
     assert np.array_equal(rec.color, color_frames()) and np.array_equal(rec.depth, depth_maps(), equal_nan=True)
 
 
 @pytest.mark.parametrize("change", ["format_version", "extra_member", "missing_member"])
 def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
-    files = members("rear", "ITU_R_709_2")
+    files = members("rear", "ITU_R_709_2", MINOR)
     if change == "format_version":
-        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2") | {"format_version": "3.0"}).encode()
+        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2", MINOR) | {"format_version": "3.0"}).encode()
     elif change == "extra_member":
         files["calibration.jsonl"] = calibration_jsonl()
     else:
@@ -406,7 +412,7 @@ def test_decode(tmp_path: Path, camera: str) -> None:
     maps = ["depth"] + (["confidence"] if camera == "rear" else [])
     expected = {"decoded.json", *texts, *(f"color/{i:06d}.png" for i in range(FRAMES)), *(f"{m}/{i:06d}.npy" for m in maps for i in range(FRAMES))}
     assert {str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()} == expected
-    files = members(camera, "ITU_R_709_2")
+    files = members(camera, "ITU_R_709_2", MINOR)
     for name in texts:
         assert (out / name).read_bytes() == files[name], name
     for i in range(FRAMES):

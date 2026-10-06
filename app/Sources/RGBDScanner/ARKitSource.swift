@@ -22,9 +22,10 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         guard let videoFormat = formats.max(by: { a, b in
             (a.imageResolution.width * a.imageResolution.height, a.framesPerSecond) < (b.imageResolution.width * b.imageResolution.height, b.framesPerSecond)
         }) else { preconditionFailure("world tracking has no 4:3 video format") }
-        guard let device = AVCaptureDevice.default(videoFormat.captureDeviceType, for: .video, position: videoFormat.captureDevicePosition) else {
-            preconditionFailure("no capture device for ARKit's \(videoFormat.captureDeviceType.rawValue)")
-        }
+        // The camera ARKit captures through, whose lens position each color frame records.
+        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { preconditionFailure("world tracking names no primary camera") }
+        precondition(device.deviceType == videoFormat.captureDeviceType && device.position == videoFormat.captureDevicePosition,
+                     "ARKit's primary camera \(device.deviceType.rawValue) is not its video format's \(videoFormat.captureDeviceType.rawValue)")
         self.videoFormat = videoFormat
         self.device = device
         self.sink = sink
@@ -50,6 +51,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let received = CMClockGetTime(CMClockGetHostTimeClock())
         let time = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000_000)
         let image = frame.capturedImage
         if let ready = pendingReady {
@@ -60,7 +62,14 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         }
         display.show(image, at: time)
         let camera = frame.camera
-        sink?.captured(color: image, at: time, intrinsics: camera.intrinsics, pose: Pose(trackingState: Self.describe(camera.trackingState), worldFromCamera: camera.transform))
+        sink?.captured(color: ColorSample(
+            time: time,
+            image: image,
+            intrinsics: camera.intrinsics,
+            exposureDuration: camera.exposureDuration,
+            lensPosition: device.lensPosition,
+            received: received,
+            pose: Pose(trackingState: Self.describe(camera.trackingState), worldFromCamera: camera.transform)))
         guard let depth = frame.sceneDepth else {
             sink?.droppedDepth(at: time, reason: "no_scene_depth")
             return
@@ -122,6 +131,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
                 "focus": "autofocus",
                 "intrinsics_convention": "color.csv's fx,fy,cx,cy are each frame's ARCamera.intrinsics, in color pixels, the principal point measured, as ARCamera.h says, from the center of the upper-left pixel; depth.csv's carry them to the depth map, which covers the same view at a lower resolution, as its grid lies on the color image, which six rear scans (2026-09-30 to 2026-10-02) measured from where depth edges land on color edges, x and y differing: along x the depth grid's first column center sits on the color image's first column center, along y the depth rows span the color image's rows edge to edge, so with sx = depth_width / color_width and sy = depth_height / color_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = (cy + 0.5) * sy - 0.5",
                 "pose_convention": "color.csv's world_from_camera_<row><column> are rows 0-2 of ARCamera.transform, row-major (the constant bottom row 0,0,0,1 omitted): the transform from ARKit's camera frame to its world frame, in metres; the camera frame, as Apple defines it, has its origin at the camera, +x toward increasing column of the sensor-oriented color image, +y toward decreasing row, +z out of the lens toward the viewer, the camera looking along -z; the world frame is gravity-aligned with +y up, its origin and heading where tracking started, and each session start resets tracking; the poses are ARKit's estimates, and tracking_state says under which tracking state each was made",
+                "exposure_lens_arrival_convention": "color.csv's exposure_duration_s is each delivered frame's own exposure time in seconds, its ARFrame.camera.exposureDuration; lens_position is the lensPosition (0 to 1) of ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera, the camera ARKit captures through, and received_ts the host-clock seconds at which the app's ARSession delegate received the frame, both read when the frame reached the app and so later than its exposure by the capture pipeline's latency",
                 "arkit_frame_semantics": ["sceneDepth"],
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),

@@ -155,9 +155,9 @@ final class Recorder: CaptureSink {
         }
     }
 
-    func captured(color: CVPixelBuffer, at time: CMTime, intrinsics: matrix_float3x3?, pose: Pose?) {
+    func captured(color: ColorSample) {
         guard let active else { return }
-        if active.appendColor(color, at: time, intrinsics: intrinsics, pose: pose, orientation: orientation.snapshot()) {
+        if active.appendColor(color, orientation: orientation.snapshot()) {
             stats.colorFrames += 1
             if stats.colorFrames % 5 == 0 { publishStats() }
         } else {

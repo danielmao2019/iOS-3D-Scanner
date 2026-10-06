@@ -280,6 +280,11 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     print(f"depth frames outside the color stream's time span: {len(rec.depths) - len(depth_in_span)}")
     print(f"upright rotations used: {sorted({r['upright_rotation_deg'] for r in rec.colors})}; |gravity| mean {np.linalg.norm(gravity, axis=1).mean():.3f} g")
     print(f"fx: color {fx_range(rec.colors)}, depth {fx_range(rec.depths)}")
+    if rec.format_minor >= 3:
+        exposure = np.array([float(r["exposure_duration_s"]) for r in rec.colors])
+        lens = np.array([float(r["lens_position"]) for r in rec.colors])
+        latency = np.array([float(r["received_ts"]) - float(r["timestamp"]) for r in rec.colors])
+        print(f"color exposure_duration_s {exposure.min() * 1e3:.3f}..{exposure.max() * 1e3:.3f} ms, median {np.median(exposure) * 1e3:.3f} ms; lens_position {lens.min():.3f}..{lens.max():.3f}; delivery latency received_ts - timestamp median {np.median(latency) * 1e3:.1f} ms, max {latency.max() * 1e3:.1f} ms")
     print("depth valid % per frame: min {:.1f} p5 {:.1f} p25 {:.1f} median {:.1f} p75 {:.1f} p95 {:.1f} max {:.1f}".format(coverage.min(), *np.percentile(coverage, [5, 25, 50, 75, 95]), coverage.max()))
     print("depth range: " + depth_range(rec.depth[is_valid]))
     if rear:

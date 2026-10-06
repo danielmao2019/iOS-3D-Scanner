@@ -81,6 +81,23 @@ struct Pose {
     let worldFromCamera: simd_float4x4
 }
 
+// A color frame as a source delivers it, with what the recording writes about it.
+struct ColorSample {
+    let time: CMTime
+    // As delivered, 420f.
+    let image: CVPixelBuffer
+    // In color pixels; nil when the frame came without them.
+    let intrinsics: matrix_float3x3?
+    // The frame's own exposure time, in seconds.
+    let exposureDuration: Double
+    // The capture device's lensPosition, 0 to 1, read when the frame reached the app.
+    let lensPosition: Float
+    // When the source's delegate received the frame, on the frames' host clock, so later than its exposure by the capture pipeline's latency.
+    let received: CMTime
+    // ARKit's pose of the rear camera; nil for the front, which has none.
+    let pose: Pose?
+}
+
 // A depth map as a source delivers it, with what the recording writes about it.
 struct DepthSample {
     let time: CMTime
@@ -100,8 +117,7 @@ struct DepthSample {
 
 // Where a capture source delivers frames, on the queue it was given; a color frame comes before a depth frame with the same timestamp.
 protocol CaptureSink: AnyObject {
-    // A color frame as delivered, with its intrinsics in its pixels (nil when it came without them) and, for the rear, ARKit's pose.
-    func captured(color: CVPixelBuffer, at time: CMTime, intrinsics: matrix_float3x3?, pose: Pose?)
+    func captured(color: ColorSample)
     func droppedColor(at time: CMTime, reason: String)
     func captured(depth: DepthSample)
     func droppedDepth(at time: CMTime, reason: String)
@@ -113,7 +129,7 @@ protocol CaptureSink: AnyObject {
 protocol CaptureSource: AnyObject {
     // Shows the live color stream; made on the main queue.
     var preview: UIView { get }
-    // The capture device whose rotation gives each frame's upright rotation.
+    // The capture device whose rotation gives each frame's upright rotation and whose lens position each color frame records.
     var device: AVCaptureDevice { get }
     // Starts delivering frames; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
     func start(ready: @escaping (Result<StreamFormat, Error>) -> Void)

@@ -1,4 +1,5 @@
 import AVFoundation
+import ImageIO
 import UIKit
 
 // The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered, and the lens autofocuses when it can move.
@@ -106,13 +107,23 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let received = CMClockGetTime(CMClockGetHostTimeClock())
         guard let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { preconditionFailure("a video sample without an image") }
         if let pending {
             self.pending = nil
             pending.ready(.success(pending.format.stream(firstFrame: image, focus: device.focusMode == .continuousAutoFocus ? "autofocus" : "fixed")))
         }
         let matrix = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data
-        sink?.captured(color: image, at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } }, pose: nil)
+        guard let exif = CMGetAttachment(sampleBuffer, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? [String: Any],
+              let exposureDuration = exif[kCGImagePropertyExifExposureTime as String] as? Double else { preconditionFailure("a video sample without its Exif exposure time") }
+        sink?.captured(color: ColorSample(
+            time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+            image: image,
+            intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } },
+            exposureDuration: exposureDuration,
+            lensPosition: device.lensPosition,
+            received: received,
+            pose: nil))
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -213,6 +224,7 @@ private struct CaptureFormat {
             details: [
                 "focus": focus,
                 "intrinsics_convention": "color.csv's fx,fy,cx,cy are each color frame's kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, in color pixels; depth.csv's are each depth map's own AVDepthData.cameraCalibrationData.intrinsicMatrix carried from intrinsic_reference_width x intrinsic_reference_height to the depth map: with sx = depth_width / intrinsic_reference_width and sy = depth_height / intrinsic_reference_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = cy * sy; Apple measures both principal points from \"the upper left of the frame\", the frame's corner, so plain scaling is exact; neither stream is distortion-corrected: calibration.jsonl carries each depth map's lens distortion lookup tables and center, which describe the color camera the depth is registered to",
+                "exposure_lens_arrival_convention": "color.csv's exposure_duration_s is each delivered frame's own exposure time in seconds, its sample buffer's Exif ExposureTime; lens_position is the TrueDepth camera's AVCaptureDevice.lensPosition (0 to 1) and received_ts the host-clock seconds at which the app's video data output delegate received the frame, both read when the frame reached the app and so later than its exposure by the capture pipeline's latency",
                 "calibration_description": "calibration.jsonl: one line per delivered depth map, in depth.csv's order, {\"index\": n, \"timestamp\": t, \"calibration\": c} with n and t the map's depth.csv index and timestamp, and c the map's AVDepthData.cameraCalibrationData, null when the map came without one: intrinsic_matrix_row_major (intrinsicMatrix, at intrinsic_reference_width x intrinsic_reference_height, its intrinsicMatrixReferenceDimensions), extrinsic_matrix_row_major_3x4 (extrinsicMatrix), pixel_size_mm (pixelSize), lens_distortion_center (lensDistortionCenter), lens_distortion_lookup_table and inverse_lens_distortion_lookup_table (lensDistortionLookupTable and inverseLensDistortionLookupTable as Float32 arrays)",
                 "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
                     let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
