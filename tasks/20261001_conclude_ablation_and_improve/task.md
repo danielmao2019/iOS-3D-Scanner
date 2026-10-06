@@ -11,7 +11,7 @@ goal: conclude ablation and improve app
 ## 1. Guidelines
 
 1. lost data:
-   1. use avfoundation for front camera, because that's the only choice. use arkit for rear and not use avfoundation, based on ablation results.
+   1. use avfoundation for front camera and use arkit for rear camera, based on ablation results.
 2. bad data:
    1. color stream was lossy. this is wrong and must be fixed. why compress? you must never ever compress.
    2. camera focus: choose autofocus.
