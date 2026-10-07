@@ -3,10 +3,25 @@ import SwiftUI
 
 @main
 struct RGBDScannerApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
+    }
+}
+
+// Makes the uploader at every launch, including one iOS makes in the background to report its session's events, and hands it the call that tells iOS those events are handled.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Its background session reconnects, as it is made, to the tasks iOS carried on while the app was not running.
+        _ = Uploader.shared
+        return true
+    }
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
+        Uploader.shared.backgroundEventsHandled = completionHandler
     }
 }
 
@@ -34,7 +49,7 @@ enum UploadState: Equatable {
     }
 }
 
-// A finished recording's Documents/<id>/recording.json, beside the archive's members in that directory.
+// A finished recording's Documents/<id>/recording.json, beside the archive's members in that directory; the uploader rewrites it as the receiver acknowledges each member.
 struct RecordingInfo: Codable {
     let id: String
     let name: String
@@ -42,15 +57,26 @@ struct RecordingInfo: Codable {
     let startTime: Date
     let durationSeconds: Double
     let camera: DepthCamera
+    // The archive's members in the order the archive holds them.
+    var members: [Member]
+    // Whether the receiver has acknowledged the manifest, and so holds the whole archive.
     var uploaded: Bool
 
-    static let fileName = "recording.json"
-    var directory: URL { Recording.documents.appendingPathComponent(id, isDirectory: true) }
-    var file: URL { directory.appendingPathComponent(Self.fileName) }
-    // The archive's members, in the order the archive holds them.
-    var members: [URL] {
-        (["color.bin", "depth.bin", "color.csv", "depth.csv", "metadata.json"] + (camera == .rear ? ["confidence.bin"] : ["calibration.jsonl"])).map { directory.appendingPathComponent($0) }
+    // An archive member: its file name, its size in bytes, its SHA-256 as 64 lowercase hex characters, and whether the receiver has acknowledged it.
+    struct Member: Codable {
+        let name: String
+        let size: Int
+        let sha256: String
+        var uploaded: Bool
     }
+
+    static let fileName = "recording.json"
+    // A finished recording's directory, Documents/<id>/.
+    static func directory(_ id: String) -> URL { Recording.documents.appendingPathComponent(id, isDirectory: true) }
+    var directory: URL { Self.directory(id) }
+    var file: URL { directory.appendingPathComponent(Self.fileName) }
+    // The manifest the uploader writes for the receiver once every member is acknowledged; never part of the archive.
+    var manifest: URL { directory.appendingPathComponent("manifest.json") }
 
     func write(to url: URL) throws {
         let encoder = JSONEncoder()
@@ -66,12 +92,12 @@ struct RecordingInfo: Codable {
     }
 }
 
-// A gallery entry: a finished recording with the size of its archive and where its upload stands.
+// A gallery entry: a finished recording, the total size of its members, and where its upload stands.
 struct RecordingFile: Identifiable {
     var info: RecordingInfo
-    let size: Int64
     var upload: UploadState
     var id: String { info.id }
+    var size: Int64 { info.members.reduce(0) { $0 + Int64($1.size) } }
     // Not while its upload is in flight.
     var canDelete: Bool { upload.canStart || upload == .uploaded }
 }
@@ -104,7 +130,6 @@ final class AppModel: ObservableObject {
 
     let availableCameras: [DepthCamera]
     let recorder: Recorder
-    private let uploader = Uploader()
     // The name given when the recording started; nil when naming was deferred.
     private var userName: String?
     // A stopped recording waiting for its name, with why it stopped when it was not the Stop button.
@@ -122,7 +147,7 @@ final class AppModel: ObservableObject {
         }
         recorder.onInterruption = { [weak self] reason in self?.stopRecording(because: reason) }
         refreshFiles()
-        // A recording left un-uploaded, e.g. by closing the app mid-upload, goes up now.
+        // A recording not yet uploaded resumes: the members the receiver acknowledged, and those still on their way, are not sent again.
         files.filter { !$0.info.uploaded }.forEach { upload($0.id) }
         recoverLeftovers()
     }
@@ -132,7 +157,7 @@ final class AppModel: ObservableObject {
         let directories = Recording.leftovers()
         DispatchQueue.global(qos: .utility).async {
             for directory in directories {
-                let result = Result { try Recording.finish(directory, userName: nil, recovered: true) }
+                let result = Result { try Recording.recover(directory) }
                 DispatchQueue.main.async { self.finished(result, note: "Recovered an unfinished recording") }
             }
         }
@@ -231,14 +256,15 @@ final class AppModel: ObservableObject {
         message = [note, outcome].compactMap { $0 }.joined(separator: ". ")
     }
 
+    // Uploads the recording's members the receiver has not acknowledged, then its manifest; the upload carries on while the app is suspended.
     func upload(_ id: String) {
         guard let file = files.first(where: { $0.id == id }), file.upload.canStart else { return }
         setUpload(id, .inProgress("uploading 0%"))
-        uploader.upload(file.info, server: server, onProgress: { fraction in
+        Uploader.shared.upload(id, server: server, onProgress: { fraction in
             self.setUpload(id, .inProgress(String(format: "uploading %.0f%%", fraction * 100)))
         }, completion: { result in
             switch result {
-            case .success: self.markUploaded(id)
+            case .success: self.setUpload(id, .uploaded)
             case .failure(let error): self.setUpload(id, .failed(error.localizedDescription))
             }
         })
@@ -259,13 +285,6 @@ final class AppModel: ObservableObject {
         if let i = files.firstIndex(where: { $0.id == id }) { files[i].upload = state }
     }
 
-    private func markUploaded(_ id: String) {
-        setUpload(id, .uploaded)
-        guard let i = files.firstIndex(where: { $0.id == id }) else { return }
-        files[i].info.uploaded = true
-        do { try files[i].info.write(to: files[i].info.file) } catch { message = "Cannot record the upload of \(files[i].info.name): \(error.localizedDescription)" }
-    }
-
     // Lists the recordings, the directories in Documents that hold a recording.json, newest first, keeping the state of uploads in flight.
     func refreshFiles() {
         let inFlight = Dictionary(uniqueKeysWithValues: files.map { ($0.id, $0.upload) })
@@ -274,9 +293,7 @@ final class AppModel: ObservableObject {
         for file in urls.map({ $0.appendingPathComponent(RecordingInfo.fileName) }) where FileManager.default.fileExists(atPath: file.path) {
             do {
                 let info = try RecordingInfo.load(file)
-                // A member can be removed through the Files app, which shows Documents.
-                guard let size = try? Tar.size(of: info.members) else { continue }
-                listed.append(RecordingFile(info: info, size: Int64(size), upload: inFlight[info.id] ?? (info.uploaded ? .uploaded : .notUploaded)))
+                listed.append(RecordingFile(info: info, upload: inFlight[info.id] ?? (info.uploaded ? .uploaded : .notUploaded)))
             } catch {
                 message = "Unreadable \(file.deletingLastPathComponent().lastPathComponent)/\(RecordingInfo.fileName): \(error.localizedDescription)"
             }

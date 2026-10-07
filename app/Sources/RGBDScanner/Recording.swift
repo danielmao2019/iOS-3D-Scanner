@@ -1,9 +1,10 @@
 import CoreMedia
+import CryptoKit
 import Foundation
 import UIKit
 import simd
 
-// One recording, captured into a work directory Documents/work/<uuid>/ and, once it has a name, finished by renaming that directory to Documents/<id>/, which then holds exactly the archive's members and recording.json; uploading streams the archive built from the members as it is sent (Tar).
+// One recording, captured into a work directory Documents/work/<uuid>/ and, once it has a name, finished by renaming that directory to Documents/<id>/, which then holds exactly the archive's members and recording.json, and, once its upload reaches it, manifest.json. Each .bin member is hashed (SHA-256) from its bytes in memory as they are written, the other members when the recording finishes, and recording.json records every member's size and hash, so uploading (Uploader) sends the members one by one with their hashes and the receiver assembles the archive from them.
 //
 // metadata.json's camera says where the frames come from: "front" is the TrueDepth camera through AVFoundation (depth_source "avfoundation_truedepth"), color and depth from separate outputs at one frame rate; "rear" is the LiDAR camera through ARKit world tracking (depth_source "arkit_scene_depth"), the color image, its pose, the depth and its confidence from one ARFrame and so always at one timestamp. Depth is never filtered (depth_filtering_enabled false), and the lens autofocuses wherever it can (metadata.json's focus: autofocus or fixed).
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal.
@@ -11,7 +12,7 @@ import simd
 // Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels, as metadata.json's intrinsics_convention says; they are empty on a dropped row, and on a delivered row whose frame came without them.
 // A dropped row is -1, the timestamp and why the frame was dropped (e.g. late, out_of_buffers, writer_busy, no_scene_depth), every other cell empty.
 //
-// The archive (format_version "4.5", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build; laid out as in 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which 4.3 added, and the rear's metadata.json avfoundation_calibration, which 4.4 added), its members under <id>/:
+// The archive (format_version "4.6", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build; laid out as in 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which 4.3 added, and the rear's metadata.json avfoundation_calibration, which 4.4 added), its members under <id>/:
 //   color.bin          every delivered color frame exactly as the camera delivered it, uncompressed, with no header: the frame with color.csv index n occupies bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2; each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, color_height rows of color_width bytes (a Y byte per pixel), then its CbCr plane, color_height/2 rows of color_width bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through color_ycbcr_matrix
 //   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,exposure_duration_s,lens_position,received_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says; exposure_duration_s is the frame's own exposure time in seconds, lens_position the capture device's lensPosition (0 to 1) and received_ts the host-clock seconds at which the app received the frame, the last two read when the frame reached the app and so later than its exposure by the capture pipeline's latency, as metadata.json's exposure_lens_arrival_convention says
 //   depth.bin          depth maps exactly as delivered, concatenated with no header: map n occupies bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), depth_bytes_per_frame = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
@@ -25,11 +26,12 @@ import simd
 //   start.json        metadata known when recording starts: camera, start time, device, formats, conventions; removed once recording.json is written
 //   color.bin, color.csv, depth.bin, depth.csv, confidence.bin (rear), calibration.jsonl (front)   written as the frames arrive
 //   metadata.json     written when finishing begins, from start.json and the tables
-//   recording.json    the recording's RecordingInfo, written once metadata.json is; a finish that finds it only removes start.json and renames the directory
+//   recording.json    the recording's RecordingInfo with every member's size and SHA-256, written once metadata.json is; a finish that finds it only removes start.json and renames the directory
+// A recording recovered at the next launch kept no hash, so its members are hashed by reading them when it is finished, the only time a recording's files are read back.
 final class Recording {
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private static var workRoot: URL { documents.appendingPathComponent("work", isDirectory: true) }
-    // The bytes waiting for the file queue stay within this: about 29 front or 129 rear color frames.
+    // The bytes waiting to be written and hashed stay within this: about 29 front or 129 rear color frames.
     private static let maxQueuedBytes = 512 << 20
 
     private static let intrinsicsColumns = "fx,fy,cx,cy"
@@ -41,12 +43,12 @@ final class Recording {
 
     private let directory: URL
     private let format: StreamFormat
-    private let colorHandle: FileHandle
+    private let colorFile: FramesFile
     private let colorTable: FileHandle
-    private let depthHandle: FileHandle
+    private let depthFile: FramesFile
     private let depthTable: FileHandle
     // The rear's confidence.bin.
-    private let confidenceHandle: FileHandle?
+    private let confidenceFile: FramesFile?
     // The front's calibration.jsonl.
     private let calibrationHandle: FileHandle?
     // The column counts of color.csv and depth.csv, which differ by camera; every row has exactly these.
@@ -54,10 +56,14 @@ final class Recording {
     private let depthColumns: Int
     // Each write's autoreleased memory is released as soon as it is written: a front recording writes about 0.55 GB a second.
     private let fileQueue = DispatchQueue(label: "recording.files", autoreleaseFrequency: .workItem)
-    // Under bufferLock: the bytes of the frames queued on fileQueue and not yet written, and the color buffers free for the next frame, each colorBytesPerFrame long; a color buffer goes back on the free list once it is written, so the bound on queuedBytes bounds how many exist, and all are freed when the files are closed.
+    // Hashes each frame's bytes beside fileQueue's write of them.
+    private let hashQueue = DispatchQueue(label: "recording.hashes", autoreleaseFrequency: .workItem)
+    // Under bufferLock: the bytes of the frames queued and not yet both written and hashed, and the color buffers free for the next frame, each colorBytesPerFrame long; a color buffer goes back on the free list once it is written and hashed, so the bound on queuedBytes bounds how many exist, and all are freed when the files are closed.
     private let bufferLock = NSLock()
     private var queuedBytes = 0
     private var freeColorBuffers: [UnsafeMutableRawPointer] = []
+    // Entered for each frame's bytes when they are queued, left once they are written, hashed and released; finishing waits for it to empty.
+    private let framesInFlight = DispatchGroup()
 
     // Owned by fileQueue: the first failed write, after which nothing more is written.
     private var fileError: Error?
@@ -88,11 +94,11 @@ final class Recording {
         let depthHeader = "index,timestamp,dropped," + (camera == .front ? "filtered,accuracy,quality," : "") + Self.intrinsicsColumns + "," + Self.orientationColumns + ",bytes_per_row"
         colorColumns = colorHeader.split(separator: ",").count
         depthColumns = depthHeader.split(separator: ",").count
-        colorHandle = try Self.createFrames(directory.appendingPathComponent("color.bin"))
+        colorFile = try FramesFile(directory, "color.bin")
         colorTable = try Self.create(directory.appendingPathComponent("color.csv"), Data((colorHeader + "\n").utf8))
-        depthHandle = try Self.createFrames(directory.appendingPathComponent("depth.bin"))
+        depthFile = try FramesFile(directory, "depth.bin")
         depthTable = try Self.create(directory.appendingPathComponent("depth.csv"), Data((depthHeader + "\n").utf8))
-        confidenceHandle = camera == .rear ? try Self.createFrames(directory.appendingPathComponent("confidence.bin")) : nil
+        confidenceFile = camera == .rear ? try FramesFile(directory, "confidence.bin") : nil
         calibrationHandle = camera == .front ? try Self.create(directory.appendingPathComponent("calibration.jsonl"), Data()) : nil
     }
 
@@ -103,12 +109,20 @@ final class Recording {
         return handle
     }
 
-    // Creates a .bin file of frames, written past the page cache.
-    private static func createFrames(_ url: URL) throws -> FileHandle {
-        let handle = try create(url, Data())
-        // The frames are never read back while recording; caching 0.55 GB a second of them would only add a copy and memory pressure.
-        guard fcntl(handle.fileDescriptor, F_NOCACHE, 1) != -1 else { throw RecorderError("cannot turn off caching of \(url.lastPathComponent): \(String(cString: strerror(errno)))") }
-        return handle
+    // A .bin file of frames, written past the page cache on fileQueue, with the size and SHA-256 of the bytes queued to it, added on hashQueue beside the writes.
+    private final class FramesFile {
+        let name: String
+        let handle: FileHandle
+        // Owned by hashQueue.
+        var size = 0
+        var hasher = SHA256()
+
+        init(_ directory: URL, _ name: String) throws {
+            self.name = name
+            handle = try Recording.create(directory.appendingPathComponent(name), Data())
+            // The frames are never read back while recording; caching 0.55 GB a second of them would only add a copy and memory pressure.
+            guard fcntl(handle.fileDescriptor, F_NOCACHE, 1) != -1 else { throw RecorderError("cannot turn off caching of \(name): \(String(cString: strerror(errno)))") }
+        }
     }
 
     // The frame calls below run on the capture data queue.
@@ -132,10 +146,10 @@ final class Recording {
     }
 
     func appendDepth(_ depth: DepthSample, orientation: Orientation) {
-        let bytesPerRow = writeMap(depth.map, width: format.depthWidth, height: format.depthHeight, pixelFormat: format.depthPixelFormat, bytesPerPixel: format.depthBytesPerPixel, to: depthHandle)
-        if let confidenceHandle, let confidencePixelFormat = format.confidencePixelFormat {
+        let bytesPerRow = writeMap(depth.map, width: format.depthWidth, height: format.depthHeight, pixelFormat: format.depthPixelFormat, bytesPerPixel: format.depthBytesPerPixel, to: depthFile)
+        if let confidenceFile, let confidencePixelFormat = format.confidencePixelFormat {
             guard let confidence = depth.confidence else { preconditionFailure("depth map at \(seconds(depth.time)) s came without its confidence map") }
-            writeMap(confidence, width: format.depthWidth, height: format.depthHeight, pixelFormat: confidencePixelFormat, bytesPerPixel: 1, to: confidenceHandle)
+            writeMap(confidence, width: format.depthWidth, height: format.depthHeight, pixelFormat: confidencePixelFormat, bytesPerPixel: 1, to: confidenceFile)
         } else {
             precondition(depth.confidence == nil, "confidence map from a source whose format has none")
         }
@@ -152,7 +166,7 @@ final class Recording {
         append(["-1", seconds(time), reason] + Array(repeating: "", count: depthColumns - 3), to: depthTable, columns: depthColumns)
     }
 
-    // Copies a 420f frame's planes without their row padding, the luma rows, then the CbCr rows, into a free color buffer, then writes the buffer as it is off the capture queue.
+    // Copies a 420f frame's planes without their row padding, the luma rows, then the CbCr rows, into a free color buffer, then writes and hashes the buffer as it is off the capture queue.
     private func writeColor(_ image: CVPixelBuffer) {
         let width = format.colorWidth, height = format.colorHeight
         precondition(CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "color frame is \(fourCC(CVPixelBufferGetPixelFormatType(image))), not 420f")
@@ -173,7 +187,7 @@ final class Recording {
             }
         }
         CVPixelBufferUnlockBaseAddress(image, .readOnly)
-        write(Data(bytesNoCopy: buffer, count: format.colorBytesPerFrame, deallocator: .none), to: colorHandle, recycling: buffer)
+        write(Data(bytesNoCopy: buffer, count: format.colorBytesPerFrame, deallocator: .none), to: colorFile, recycling: buffer)
     }
 
     // A color buffer aligned to iOS's 16 KiB pages, for the uncached write.
@@ -184,9 +198,9 @@ final class Recording {
         return buffer!
     }
 
-    // Copies the map's rows without their padding, then writes them off the capture queue; returns the map's bytes per row.
+    // Copies the map's rows without their padding, then writes and hashes them off the capture queue; returns the map's bytes per row.
     @discardableResult
-    private func writeMap(_ map: CVPixelBuffer, width: Int, height: Int, pixelFormat: OSType, bytesPerPixel: Int, to handle: FileHandle) -> Int {
+    private func writeMap(_ map: CVPixelBuffer, width: Int, height: Int, pixelFormat: OSType, bytesPerPixel: Int, to file: FramesFile) -> Int {
         precondition(CVPixelBufferGetWidth(map) == width && CVPixelBufferGetHeight(map) == height && CVPixelBufferGetPixelFormatType(map) == pixelFormat,
                      "\(CVPixelBufferGetWidth(map))×\(CVPixelBufferGetHeight(map)) \(fourCC(CVPixelBufferGetPixelFormatType(map))) map differs from the stream format's \(width)×\(height) \(fourCC(pixelFormat))")
         let rowBytes = width * bytesPerPixel
@@ -200,7 +214,7 @@ final class Recording {
             }
         }
         CVPixelBufferUnlockBaseAddress(map, .readOnly)
-        write(bytes, to: handle)
+        write(bytes, to: file)
         return bytesPerRow
     }
 
@@ -219,38 +233,49 @@ final class Recording {
         perform { try table.write(contentsOf: line) }
     }
 
-    // Writes a frame's bytes through perform, counted in queuedBytes until the write has run; the color buffer holding them, if any, then goes back on the free list.
-    private func write(_ bytes: Data, to handle: FileHandle, recycling colorBuffer: UnsafeMutableRawPointer? = nil) {
+    // Writes a frame's bytes to their file through perform and adds them to the file's hash on hashQueue, beside the write; they count in queuedBytes and framesInFlight, and the color buffer holding them, if any, goes back on the free list, once both are done.
+    private func write(_ bytes: Data, to file: FramesFile, recycling colorBuffer: UnsafeMutableRawPointer? = nil) {
         let count = bytes.count
         bufferLock.withLock { queuedBytes += count }
-        perform { try handle.write(contentsOf: bytes) }
-        fileQueue.async { [self] in
+        framesInFlight.enter()
+        let done = DispatchGroup()
+        perform(group: done) { try file.handle.write(contentsOf: bytes) }
+        hashQueue.async(group: done) {
+            file.hasher.update(data: bytes)
+            file.size += count
+        }
+        done.notify(queue: fileQueue) { [self] in
             bufferLock.withLock {
                 queuedBytes -= count
                 if let colorBuffer { freeColorBuffers.append(colorBuffer) }
             }
+            framesInFlight.leave()
         }
     }
 
-    // Runs a file write on the file queue, in the order the writes were asked for.
-    private func perform(_ write: @escaping () throws -> Void) {
-        fileQueue.async { [self] in
+    // Runs a file write on the file queue, in the order the writes were asked for, as part of group when one is given.
+    private func perform(group: DispatchGroup? = nil, _ write: @escaping () throws -> Void) {
+        fileQueue.async(group: group) { [self] in
             guard fileError == nil else { return }
             do { try write() } catch { fileError = error }
         }
     }
 
-    // Once every queued write is in, frees the color buffers, closes the files and finishes the recording; userName is nil when the user left it unnamed.
+    // Once every frame's bytes are written, hashed and released, frees the color buffers, closes the files and finishes the recording with its .bin files' hashes; userName is nil when the user left it unnamed.
     func finish(userName: String?, completion: @escaping (Result<RecordingInfo?, Error>) -> Void) {
-        fileQueue.async { [self] in
+        // The tables' writes, queued while recording, are ahead of this on fileQueue, so they are in too.
+        framesInFlight.notify(queue: fileQueue) { [self] in
             completion(Result {
                 bufferLock.withLock {
                     freeColorBuffers.forEach { free($0) }
                     freeColorBuffers.removeAll()
                 }
-                for handle in [colorHandle, colorTable, depthHandle, depthTable, confidenceHandle, calibrationHandle].compactMap({ $0 }) { try handle.close() }
+                for handle in [colorFile.handle, colorTable, depthFile.handle, depthTable, confidenceFile?.handle, calibrationHandle].compactMap({ $0 }) { try handle.close() }
                 if let fileError { throw fileError }
-                return try Self.finish(directory, userName: userName, recovered: false)
+                let hashes: [String: (size: Int, sha256: String)] = hashQueue.sync {
+                    Dictionary(uniqueKeysWithValues: [colorFile, depthFile, confidenceFile].compactMap { $0 }.map { ($0.name, (size: $0.size, sha256: $0.hasher.finalize().hex)) })
+                }
+                return try Self.finish(directory, userName: userName, hashes: hashes)
             })
         }
     }
@@ -261,19 +286,24 @@ final class Recording {
         (try? FileManager.default.contentsOfDirectory(at: workRoot, includingPropertiesForKeys: nil)) ?? []
     }
 
-    // Finishes a work directory where it lies, copying none of its frames: writes metadata.json, cutting each file to the frames that have a row, and recording.json, removes start.json and renames the directory to Documents/<id>/, resuming a finish that was cut short. Returns nil, removing the directory, when a stream has no frames; a failed finish leaves the directory to be finished at the next launch, and its error names the directory.
-    static func finish(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
+    // Finishes, under its date and time, a work directory a closed app or a failed finish left; it kept no hash, so its members are hashed by reading them.
+    static func recover(_ directory: URL) throws -> RecordingInfo? {
+        try finish(directory, userName: nil, hashes: nil)
+    }
+
+    // Finishes a work directory where it lies, copying none of its frames: writes metadata.json, cutting each file to the frames that have a row, and recording.json with every member's size and SHA-256, removes start.json and renames the directory to Documents/<id>/, resuming a finish that was cut short. hashes holds the .bin files' sizes and SHA-256s taken as they were written, and is nil for a recording recovered after the app stopped. Returns nil, removing the directory, when a stream has no frames; a failed finish leaves the directory to be finished at the next launch, and its error names the directory.
+    private static func finish(_ directory: URL, userName: String?, hashes: [String: (size: Int, sha256: String)]?) throws -> RecordingInfo? {
         do {
-            return try finishWorkDirectory(directory, userName: userName, recovered: recovered)
+            return try finishWorkDirectory(directory, userName: userName, hashes: hashes)
         } catch {
             throw RecorderError("work/\(directory.lastPathComponent): \(error.localizedDescription)")
         }
     }
 
-    private static func finishWorkDirectory(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
+    private static func finishWorkDirectory(_ directory: URL, userName: String?, hashes: [String: (size: Int, sha256: String)]?) throws -> RecordingInfo? {
         let infoFile = directory.appendingPathComponent(RecordingInfo.fileName)
         if !FileManager.default.fileExists(atPath: infoFile.path) {
-            guard let info = try writeMetadata(directory, userName: userName, recovered: recovered) else {
+            guard let info = try writeMetadata(directory, userName: userName, hashes: hashes) else {
                 try FileManager.default.removeItem(at: directory)
                 return nil
             }
@@ -303,8 +333,8 @@ final class Recording {
         return try decoder.decode(Start.self, from: Data(contentsOf: directory.appendingPathComponent("start.json")))
     }
 
-    // Writes metadata.json from start.json and the tables, cutting each file to the frames that have a row, and returns the recording's RecordingInfo; nil when a stream has no frames.
-    private static func writeMetadata(_ directory: URL, userName: String?, recovered: Bool) throws -> RecordingInfo? {
+    // Writes metadata.json from start.json and the tables, cutting each file to the frames that have a row, and returns the recording's RecordingInfo with every member's size and SHA-256; nil when a stream has no frames. hashes is as finish takes it.
+    private static func writeMetadata(_ directory: URL, userName: String?, hashes: [String: (size: Int, sha256: String)]?) throws -> RecordingInfo? {
         let file = { (name: String) in directory.appendingPathComponent(name) }
         let start = try start(directory)
         guard var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: file("start.json"))) as? [String: Any] else { throw RecorderError("start.json is not an object") }
@@ -322,20 +352,50 @@ final class Recording {
         case .rear: try truncate(file("confidence.bin"), toFrames: depth.frames, of: start.depthWidth * start.depthHeight)
         }
 
+        let id = id(start.startTimeUtc, start.camera, userName)
         // An unnamed recording is named by its start date and time and its camera.
-        let info = RecordingInfo(id: id(start.startTimeUtc, start.camera, userName), name: userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")",
-                                 namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: max(color.last, depth.last) - min(color.first, depth.first),
-                                 camera: start.camera, uploaded: false)
-        metadata["format_version"] = "4.5"
-        metadata["id"] = info.id
-        metadata["name"] = info.name
-        metadata["named_by_user"] = info.namedByUser
-        metadata["duration_s"] = info.durationSeconds
-        metadata["recovered"] = recovered
+        let name = userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")"
+        let duration = max(color.last, depth.last) - min(color.first, depth.first)
+        metadata["format_version"] = "4.6"
+        metadata["id"] = id
+        metadata["name"] = name
+        metadata["named_by_user"] = userName != nil
+        metadata["duration_s"] = duration
+        metadata["recovered"] = hashes == nil
         metadata["color_frames"] = color.frames
         metadata["depth_frames"] = depth.frames
         try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]).write(to: file("metadata.json"))
-        return info
+
+        let members = try archiveMembers(start.camera).map { member -> RecordingInfo.Member in
+            if let hashed = hashes?[member] {
+                // Every frame of a recording the app stopped has its row, so cutting a .bin file to its rows leaves exactly the bytes hashed.
+                guard try file(member).resourceValues(forKeys: [.fileSizeKey]).fileSize == hashed.size else { throw RecorderError("\(member) is not the \(hashed.size) bytes hashed as it was written") }
+                return RecordingInfo.Member(name: member, size: hashed.size, sha256: hashed.sha256, uploaded: false)
+            }
+            let read = try hash(file(member))
+            return RecordingInfo.Member(name: member, size: read.size, sha256: read.sha256, uploaded: false)
+        }
+        return RecordingInfo(id: id, name: name, namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: duration, camera: start.camera, members: members, uploaded: false)
+    }
+
+    // The archive's members in the order the archive holds them.
+    private static func archiveMembers(_ camera: DepthCamera) -> [String] {
+        ["color.bin", "depth.bin", "color.csv", "depth.csv", "metadata.json"] + (camera == .rear ? ["confidence.bin"] : ["calibration.jsonl"])
+    }
+
+    // A file's size and SHA-256, read back in chunks; each chunk is released before the next is read, as a file of several GB would otherwise stay in memory until iOS stops the app.
+    private static func hash(_ url: URL) throws -> (size: Int, sha256: String) {
+        let handle = try FileHandle(forReadingFrom: url)
+        var hasher = SHA256()
+        var size = 0
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try handle.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
+            hasher.update(data: chunk)
+            size += chunk.count
+            return true
+        }) {}
+        try handle.close()
+        return (size, hasher.finalize().hex)
     }
 
     // Cuts a file of frames to its first count frames, the ones with a table row.
@@ -398,4 +458,9 @@ final class Recording {
 
 private func seconds(_ time: CMTime) -> String {
     String(format: "%.9f", CMTimeGetSeconds(time))
+}
+
+extension SHA256Digest {
+    // As 64 lowercase hex characters, the way recording.json, the manifest and the receiver write a SHA-256.
+    var hex: String { map { String(format: "%02x", $0) }.joined() }
 }
