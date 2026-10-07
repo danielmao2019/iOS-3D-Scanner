@@ -78,11 +78,20 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             depth.setDelegate(receiver, callbackQueue: DispatchQueue(label: "rear.calibration"))
             guard session.canAddOutput(depth) else { throw RecorderError("cannot add the LiDAR depth camera's depth output") }
             session.addOutput(depth)
-            // Any format with depth: the calibration is at the camera's own reference dimensions whichever format delivers it.
-            guard let format = lidar.formats.first(where: { !$0.supportedDepthDataFormats.isEmpty }) else { throw RecorderError("the LiDAR depth camera has no format with depth") }
+            // The format with the largest 4:3 420f video among those with depth, at its largest depth format: the calibration's reference must be the full 4:3 view ARKit's frames show, as a smaller format's calibration describes a different geometry.
+            func pixels(_ format: AVCaptureDevice.Format) -> Int {
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                return Int(dims.width) * Int(dims.height)
+            }
+            let fullView = lidar.formats.filter { format in
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                return CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && dims.width * 3 == dims.height * 4 && !format.supportedDepthDataFormats.isEmpty
+            }
+            guard let format = fullView.max(by: { pixels($0) < pixels($1) }),
+                  let depthFormat = format.supportedDepthDataFormats.max(by: { pixels($0) < pixels($1) }) else { throw RecorderError("the LiDAR depth camera has no 4:3 420f format with depth") }
             try lidar.lockForConfiguration()
             lidar.activeFormat = format
-            lidar.activeDepthDataFormat = format.supportedDepthDataFormats[0]
+            lidar.activeDepthDataFormat = depthFormat
             lidar.unlockForConfiguration()
         }
         session.startRunning()
@@ -195,7 +204,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
                 "pose_convention": "color.csv's world_from_camera_<row><column> are rows 0-2 of ARCamera.transform, row-major (the constant bottom row 0,0,0,1 omitted): the transform from ARKit's camera frame to its world frame, in metres; the camera frame, as Apple defines it, has its origin at the camera, +x toward increasing column of the sensor-oriented color image, +y toward decreasing row, +z out of the lens toward the viewer, the camera looking along -z; the world frame is gravity-aligned with +y up, its origin and heading where tracking started, and each session start resets tracking; the poses are ARKit's estimates, and tracking_state says under which tracking state each was made",
                 "exposure_lens_arrival_convention": "color.csv's exposure_duration_s is each delivered frame's own exposure time in seconds, its ARFrame.camera.exposureDuration; lens_position is the lensPosition (0 to 1) of ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera, the camera ARKit captures through, and received_ts the host-clock seconds at which the app's ARSession delegate received the frame, both read when the frame reached the app and so later than its exposure by the capture pipeline's latency",
                 "avfoundation_calibration": calibration,
-                "avfoundation_calibration_description": "avfoundation_calibration: Apple's calibration of the rear wide camera, the camera ARKit captures through, which ARKit does not expose, taken from the first depth map of a short AVCaptureSession on the LiDAR depth camera (builtInLiDARDepthCamera) that carried its AVDepthData.cameraCalibrationData: \(calibrationKeysDescription); its intrinsics are at its own reference dimensions, so scale them to color_width x color_height; lens_position is that camera's lensPosition (0 to 1) and captured_at its depth map's host-clock seconds; it is captured once each time the rear camera starts, before ARKit runs, so its lens position may differ from a recording's frames'; ARKit's color frames carry this calibration's lens distortion with the opposite sign, so lens_distortion_lookup_table used as the distorted-to-undistorted map, and inverse_lens_distortion_lookup_table the other way, straightens them (measured on 2026-10-06 rear takes, the bow of 682 near-vertical edges against the bow this table predicts: slope -1.04, 95% -1.08..-1.00)",
+                "avfoundation_calibration_description": "avfoundation_calibration: Apple's calibration of the rear wide camera, the camera ARKit captures through, which ARKit does not expose, taken from the first depth map of a short AVCaptureSession on the LiDAR depth camera (builtInLiDARDepthCamera), running its largest 4:3 format with depth, that carried its AVDepthData.cameraCalibrationData: \(calibrationKeysDescription); its intrinsics are at its own reference dimensions, the full 4:3 view ARKit's frames show, so scale them to color_width x color_height; lens_position is that camera's lensPosition (0 to 1) and captured_at its depth map's host-clock seconds; it is captured once each time the rear camera starts, before ARKit runs, so its lens position may differ from a recording's frames'; ARKit's color frames carry this calibration's lens distortion with the opposite sign, so lens_distortion_lookup_table used as the distorted-to-undistorted map, and inverse_lens_distortion_lookup_table the other way, straightens them (measured on 2026-10-06 rear takes, the bow of 682 near-vertical edges against the bow this table predicts: slope -1.04, 95% -1.08..-1.00), while a calibration taken from a smaller format describes a different geometry (on a 4.4 rear take, the 640x480 format's table gave slope -0.62, 95% -0.71..-0.52, where the full 4:3 format's gives -1.04)",
                 "arkit_frame_semantics": ["sceneDepth"],
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),

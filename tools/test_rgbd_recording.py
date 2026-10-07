@@ -1,4 +1,4 @@
-"""Tests the tools on tiny synthetic format_version "4.4" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, whose color.csv lacks the three columns 4.3 added, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
+"""Tests the tools on tiny synthetic format_version "4.5" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, whose color.csv lacks the three columns 4.3 added, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -26,8 +26,8 @@ TIMES = [f"{100 + i / 30:.9f}" for i in range(5)]
 COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
-# The synthetic recordings are app 4.4's, format_version "4.4".
-MINOR = 4
+# The synthetic recordings are app 4.5's, format_version "4.5".
+MINOR = 5
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 # The spatial alignment recording: a rear recording big enough to have structure, ALIGNED_PAIRS same-instant pairs, its depth a quarter of its color each way, each pair showing RECTANGLES random rectangles at NEAR_M before a background at FAR_M.
