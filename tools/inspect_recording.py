@@ -330,7 +330,8 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     if rear:
         checks["every color frame has a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = all(is_pose(rec, r) for r in rec.colors)
         checks["confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
-    if rear and rec.format_minor >= 4:
+    # Apps 4.4 to 4.6 recorded it.
+    if rear and 4 <= rec.format_minor <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
     checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():

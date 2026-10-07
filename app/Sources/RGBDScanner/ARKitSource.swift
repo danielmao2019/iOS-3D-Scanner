@@ -2,11 +2,8 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// The rear LiDAR camera through an ARSession running world tracking with scene depth and autofocus: each ARFrame carries the color image, the camera's pose, the LiDAR depth registered to the image, unsmoothed (sceneDepth), and the depth's confidence, all at the frame's timestamp. ARKit exposes no calibration of its camera, so each start first takes Apple's from a short AVCaptureSession on the LiDAR depth camera.
+// The rear LiDAR camera through an ARSession running world tracking with scene depth and autofocus: each ARFrame carries the color image, the camera's pose, the LiDAR depth registered to the image, unsmoothed (sceneDepth), and the depth's confidence, all at the frame's timestamp.
 final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
-    // How long a start waits for the LiDAR depth camera's calibration.
-    private static let calibrationTimeout: Double = 5
-
     let device: AVCaptureDevice
     var preview: UIView { display }
     private let display = SampleBufferView()
@@ -15,8 +12,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     private weak var sink: CaptureSink?
     private let queue: DispatchQueue
 
-    // Owned by queue: the start's ready and the calibration it captured, until the first frame with scene depth gives the stream format.
-    private var pending: (ready: (Result<StreamFormat, Error>) -> Void, calibration: [String: Any])?
+    // Owned by queue: the start's ready, until the first frame with scene depth gives the stream format.
+    private var pendingReady: ((Result<StreamFormat, Error>) -> Void)?
 
     // The session delivers its frames on queue.
     init(sink: CaptureSink, queue: DispatchQueue) {
@@ -38,98 +35,30 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         session.delegateQueue = queue
     }
 
-    // Captures Apple's calibration, then runs ARKit; blocks the calling queue for the capture, so it happens when the rear camera starts, never at Record.
     func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
-        // The calibration capture needs the camera, which a running ARSession holds.
-        session.pause()
-        let calibration: [String: Any]
-        do { calibration = try Self.captureCalibration() } catch { return ready(.failure(error)) }
         let configuration = ARWorldTrackingConfiguration()
         configuration.videoFormat = videoFormat
         // Unsmoothed depth: .smoothedSceneDepth would average it over time.
         configuration.frameSemantics = [.sceneDepth]
         configuration.isAutoFocusEnabled = true
-        queue.sync { pending = (ready, calibration) }
+        queue.sync { pendingReady = ready }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
 
     func stop() {
         session.pause()
-        queue.sync { pending = nil }
-    }
-
-    // Apple's calibration of the wide camera ARKit captures through, described by describeCalibration with lens_position, the LiDAR depth camera's lensPosition then, and captured_at, its depth map's host-clock seconds: a short AVCaptureSession on the LiDAR depth camera, which delivers the calibration with its depth maps, runs until the first depth map with one arrives, then stops; fails when none arrives within calibrationTimeout.
-    private static func captureCalibration() throws -> [String: Any] {
-        guard let lidar = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) else { throw RecorderError("no LiDAR depth camera to take the rear camera's calibration from") }
-        let session = AVCaptureSession()
-        let receiver = CalibrationReceiver(device: lidar)
-        do {
-            session.beginConfiguration()
-            defer { session.commitConfiguration() }
-            session.sessionPreset = .inputPriority
-            let input = try AVCaptureDeviceInput(device: lidar)
-            guard session.canAddInput(input) else { throw RecorderError("cannot add the LiDAR depth camera's input") }
-            session.addInput(input)
-            // Depth flows beside a video output, whose frames are discarded.
-            let video = AVCaptureVideoDataOutput()
-            guard session.canAddOutput(video) else { throw RecorderError("cannot add the LiDAR depth camera's video output") }
-            session.addOutput(video)
-            let depth = AVCaptureDepthDataOutput()
-            depth.setDelegate(receiver, callbackQueue: DispatchQueue(label: "rear.calibration"))
-            guard session.canAddOutput(depth) else { throw RecorderError("cannot add the LiDAR depth camera's depth output") }
-            session.addOutput(depth)
-            // The format with the largest 4:3 420f video among those with depth, at its largest depth format: the calibration's reference must be the full 4:3 view ARKit's frames show, as a smaller format's calibration describes a different geometry.
-            func pixels(_ format: AVCaptureDevice.Format) -> Int {
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                return Int(dims.width) * Int(dims.height)
-            }
-            let fullView = lidar.formats.filter { format in
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                return CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && dims.width * 3 == dims.height * 4 && !format.supportedDepthDataFormats.isEmpty
-            }
-            guard let format = fullView.max(by: { pixels($0) < pixels($1) }),
-                  let depthFormat = format.supportedDepthDataFormats.max(by: { pixels($0) < pixels($1) }) else { throw RecorderError("the LiDAR depth camera has no 4:3 420f format with depth") }
-            try lidar.lockForConfiguration()
-            lidar.activeFormat = format
-            lidar.activeDepthDataFormat = depthFormat
-            lidar.unlockForConfiguration()
-        }
-        session.startRunning()
-        defer { session.stopRunning() }
-        guard receiver.delivered.wait(timeout: .now() + calibrationTimeout) == .success, let calibration = receiver.calibration else {
-            throw RecorderError("the LiDAR depth camera gave no calibration within \(Int(calibrationTimeout)) s")
-        }
-        return calibration
-    }
-
-    // Takes the description of the first calibration the LiDAR depth camera's depth maps carry, on the calibration session's queue.
-    private final class CalibrationReceiver: NSObject, AVCaptureDepthDataOutputDelegate {
-        let delivered = DispatchSemaphore(value: 0)
-        // Set once, before delivered is signalled.
-        private(set) var calibration: [String: Any]?
-        private let device: AVCaptureDevice
-
-        init(device: AVCaptureDevice) {
-            self.device = device
-            super.init()
-        }
-
-        func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
-            guard calibration == nil, let cal = depthData.cameraCalibrationData else { return }
-            calibration = describeCalibration(cal).merging(["lens_position": device.lensPosition, "captured_at": CMTimeGetSeconds(timestamp)]) { _, _ in preconditionFailure("a calibration description with its own lens_position or captured_at") }
-            delivered.signal()
-        }
+        queue.sync { pendingReady = nil }
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let received = CMClockGetTime(CMClockGetHostTimeClock())
         let time = CMTime(seconds: frame.timestamp, preferredTimescale: 1_000_000_000)
         let image = frame.capturedImage
-        if let pending {
+        if let ready = pendingReady {
             // The first frames of a session can come before scene depth.
             guard let depth = frame.sceneDepth else { return }
-            self.pending = nil
-            pending.ready(streamFormat(image: image, depth: depth, calibration: pending.calibration))
+            pendingReady = nil
+            ready(streamFormat(image: image, depth: depth))
         }
         display.show(image, at: time)
         let camera = frame.camera
@@ -182,8 +111,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         }
     }
 
-    // The stream format from the first frame with scene depth and the calibration captured before ARKit ran; the depth intrinsics are carried over from the color image, so the two must have one aspect ratio.
-    private func streamFormat(image: CVPixelBuffer, depth: ARDepthData, calibration: [String: Any]) -> Result<StreamFormat, Error> {
+    // The stream format from the first frame with scene depth; the depth intrinsics are carried over from the color image, so the two must have one aspect ratio.
+    private func streamFormat(image: CVPixelBuffer, depth: ARDepthData) -> Result<StreamFormat, Error> {
         let colorWidth = CVPixelBufferGetWidth(image), colorHeight = CVPixelBufferGetHeight(image)
         let map = depth.depthMap
         let depthWidth = CVPixelBufferGetWidth(map), depthHeight = CVPixelBufferGetHeight(map)
@@ -203,8 +132,6 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
                 "intrinsics_convention": "color.csv's fx,fy,cx,cy are each frame's ARCamera.intrinsics, in color pixels, the principal point measured, as ARCamera.h says, from the center of the upper-left pixel; depth.csv's carry them to the depth map, which covers the same view at a lower resolution, as its grid lies on the color image, which six rear scans (2026-09-30 to 2026-10-02) measured from where depth edges land on color edges, x and y differing: along x the depth grid's first column center sits on the color image's first column center, along y the depth rows span the color image's rows edge to edge, so with sx = depth_width / color_width and sy = depth_height / color_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = (cy + 0.5) * sy - 0.5",
                 "pose_convention": "color.csv's world_from_camera_<row><column> are rows 0-2 of ARCamera.transform, row-major (the constant bottom row 0,0,0,1 omitted): the transform from ARKit's camera frame to its world frame, in metres; the camera frame, as Apple defines it, has its origin at the camera, +x toward increasing column of the sensor-oriented color image, +y toward decreasing row, +z out of the lens toward the viewer, the camera looking along -z; the world frame is gravity-aligned with +y up, its origin and heading where tracking started, and each session start resets tracking; the poses are ARKit's estimates, and tracking_state says under which tracking state each was made",
                 "exposure_lens_arrival_convention": "color.csv's exposure_duration_s is each delivered frame's own exposure time in seconds, its ARFrame.camera.exposureDuration; lens_position is the lensPosition (0 to 1) of ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera, the camera ARKit captures through, and received_ts the host-clock seconds at which the app's ARSession delegate received the frame, both read when the frame reached the app and so later than its exposure by the capture pipeline's latency",
-                "avfoundation_calibration": calibration,
-                "avfoundation_calibration_description": "avfoundation_calibration: Apple's calibration of the rear wide camera, the camera ARKit captures through, which ARKit does not expose, taken from the first depth map of a short AVCaptureSession on the LiDAR depth camera (builtInLiDARDepthCamera), running its largest 4:3 format with depth, that carried its AVDepthData.cameraCalibrationData: \(calibrationKeysDescription); its intrinsics are at its own reference dimensions, the full 4:3 view ARKit's frames show, so scale them to color_width x color_height; lens_position is that camera's lensPosition (0 to 1) and captured_at its depth map's host-clock seconds; it is captured once each time the rear camera starts, before ARKit runs, so its lens position may differ from a recording's frames'; ARKit's color frames carry this calibration's lens distortion with the opposite sign, so lens_distortion_lookup_table used as the distorted-to-undistorted map, and inverse_lens_distortion_lookup_table the other way, straightens them (measured on 2026-10-06 rear takes, the bow of 682 near-vertical edges against the bow this table predicts: slope -1.04, 95% -1.08..-1.00), while a calibration taken from a smaller format describes a different geometry (on a 4.4 rear take, the 640x480 format's table gave slope -0.62, 95% -0.71..-0.52, where the full 4:3 format's gives -1.04)",
                 "arkit_frame_semantics": ["sceneDepth"],
                 "arkit_video_format": Self.describe(videoFormat),
                 "arkit_video_formats": ARWorldTrackingConfiguration.supportedVideoFormats.map(Self.describe),

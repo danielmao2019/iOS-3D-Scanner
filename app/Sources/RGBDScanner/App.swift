@@ -150,6 +150,26 @@ final class AppModel: ObservableObject {
         // A recording not yet uploaded resumes: the members the receiver acknowledged, and those still on their way, are not sent again.
         files.filter { !$0.info.uploaded }.forEach { upload($0.id) }
         recoverLeftovers()
+        addMissingMembers()
+    }
+
+    // Lists the members of the recordings apps 4.1 to 4.5 finished, which the gallery shows once they have them; one not yet uploaded then uploads.
+    private func addMissingMembers() {
+        let directories = Recording.withoutMembers()
+        DispatchQueue.global(qos: .utility).async {
+            for directory in directories {
+                let result = Result { try Recording.addMembers(directory) }
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let info):
+                        self.refreshFiles()
+                        if !info.uploaded { self.upload(info.id) }
+                    case .failure(let error):
+                        self.message = "Unreadable \(directory.lastPathComponent): \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
     }
 
     // Finishes, under their date and time, the recordings a closed app or a failed finish left unfinished.
@@ -285,12 +305,12 @@ final class AppModel: ObservableObject {
         if let i = files.firstIndex(where: { $0.id == id }) { files[i].upload = state }
     }
 
-    // Lists the recordings, the directories in Documents that hold a recording.json, newest first, keeping the state of uploads in flight.
+    // Lists the recordings, the directories in Documents that hold a recording.json listing their members, newest first, keeping the state of uploads in flight; one from apps 4.1 to 4.5 joins once addMissingMembers has listed its members.
     func refreshFiles() {
         let inFlight = Dictionary(uniqueKeysWithValues: files.map { ($0.id, $0.upload) })
         let urls = (try? FileManager.default.contentsOfDirectory(at: Recording.documents, includingPropertiesForKeys: nil)) ?? []
         var listed: [RecordingFile] = []
-        for file in urls.map({ $0.appendingPathComponent(RecordingInfo.fileName) }) where FileManager.default.fileExists(atPath: file.path) {
+        for file in urls.map({ $0.appendingPathComponent(RecordingInfo.fileName) }) where FileManager.default.fileExists(atPath: file.path) && !Recording.listsNoMembers(file) {
             do {
                 let info = try RecordingInfo.load(file)
                 listed.append(RecordingFile(info: info, upload: inFlight[info.id] ?? (info.uploaded ? .uploaded : .notUploaded)))

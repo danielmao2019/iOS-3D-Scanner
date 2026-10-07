@@ -163,37 +163,6 @@ func arkitDepthIntrinsics(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) ->
     return s
 }
 
-// Apple's calibration of a camera described for metadata, its keys as calibrationKeysDescription says.
-func describeCalibration(_ cal: AVCameraCalibrationData) -> [String: Any] {
-    let k = cal.intrinsicMatrix
-    let e = cal.extrinsicMatrix
-    func floats(_ data: Data?) -> [Float] {
-        guard let data else { return [] }
-        return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-    }
-    return [
-        "intrinsic_matrix_row_major": [
-            [k.columns.0.x, k.columns.1.x, k.columns.2.x],
-            [k.columns.0.y, k.columns.1.y, k.columns.2.y],
-            [k.columns.0.z, k.columns.1.z, k.columns.2.z],
-        ],
-        "intrinsic_reference_width": cal.intrinsicMatrixReferenceDimensions.width,
-        "intrinsic_reference_height": cal.intrinsicMatrixReferenceDimensions.height,
-        "extrinsic_matrix_row_major_3x4": [
-            [e.columns.0.x, e.columns.1.x, e.columns.2.x, e.columns.3.x],
-            [e.columns.0.y, e.columns.1.y, e.columns.2.y, e.columns.3.y],
-            [e.columns.0.z, e.columns.1.z, e.columns.2.z, e.columns.3.z],
-        ],
-        "pixel_size_mm": cal.pixelSize,
-        "lens_distortion_center": [cal.lensDistortionCenter.x, cal.lensDistortionCenter.y],
-        "lens_distortion_lookup_table": floats(cal.lensDistortionLookupTable),
-        "inverse_lens_distortion_lookup_table": floats(cal.inverseLensDistortionLookupTable),
-    ]
-}
-
-// What describeCalibration's keys hold, for metadata.json's descriptions.
-let calibrationKeysDescription = "intrinsic_matrix_row_major (intrinsicMatrix, at intrinsic_reference_width x intrinsic_reference_height, its intrinsicMatrixReferenceDimensions), extrinsic_matrix_row_major_3x4 (extrinsicMatrix), pixel_size_mm (pixelSize), lens_distortion_center (lensDistortionCenter), lens_distortion_lookup_table and inverse_lens_distortion_lookup_table (lensDistortionLookupTable and inverseLensDistortionLookupTable as Float32 arrays)"
-
 struct RecorderError: LocalizedError {
     let message: String
     init(_ message: String) { self.message = message }

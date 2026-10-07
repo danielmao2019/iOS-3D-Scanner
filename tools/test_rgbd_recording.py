@@ -26,8 +26,8 @@ TIMES = [f"{100 + i / 30:.9f}" for i in range(5)]
 COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
-# The synthetic recordings are app 4.6's, format_version "4.6".
-MINOR = 6
+# The synthetic recordings are app 4.7's, format_version "4.7".
+MINOR = 7
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 # The spatial alignment recording: a rear recording big enough to have structure, ALIGNED_PAIRS same-instant pairs, its depth a quarter of its color each way, each pair showing RECTANGLES random rectangles at NEAR_M before a background at FAR_M.
@@ -231,7 +231,7 @@ def metadata(camera: str, matrix: str, minor: int) -> Dict:
             "arkit_video_format": "1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera",
             "arkit_video_formats": ["1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera"],
         })
-        if minor >= 4:
+        if 4 <= minor <= 6:
             meta.update({"avfoundation_calibration": rear_calibration(), "avfoundation_calibration_description": "synthetic"})
     else:
         meta.update({"calibration_description": "synthetic", "available_depth_formats": ["640x480 fdep"]})
@@ -448,6 +448,15 @@ def test_inspect(tmp_path: Path, camera: str) -> None:
 
     # The synthetic frames are too few and too small for the two edge alignments, which may fail; every other check holds on a recording laid out as the format says.
     assert {name for name, ok in checks.items() if not ok} <= {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK}, checks
+
+
+@pytest.mark.parametrize("minor", [6, MINOR])
+def test_inspect_rear_calibration(tmp_path: Path, minor: int) -> None:
+    checks = inspect(write_tar(tmp_path / "recording.tar", recording_id("rear"), members("rear", "ITU_R_601_4", minor)))
+
+    # Apps 4.4 to 4.6 recorded the rear's avfoundation_calibration, which is checked there and nowhere else.
+    calibration = [name for name in checks if "avfoundation_calibration" in name]
+    assert (len(calibration) == 1 and checks[calibration[0]]) if minor <= 6 else not calibration, checks
 
 
 def test_spatial_alignment(tmp_path: Path) -> None:

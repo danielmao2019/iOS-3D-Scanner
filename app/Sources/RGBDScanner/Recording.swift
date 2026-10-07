@@ -12,14 +12,14 @@ import simd
 // Intrinsics fx,fy,cx,cy are per frame and per stream, each in its own stream's pixels, as metadata.json's intrinsics_convention says; they are empty on a dropped row, and on a delivered row whose frame came without them.
 // A dropped row is -1, the timestamp and why the frame was dropped (e.g. late, out_of_buffers, writer_busy, no_scene_depth), every other cell empty.
 //
-// The archive (format_version "4.6", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build; laid out as in 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which 4.3 added, and the rear's metadata.json avfoundation_calibration, which 4.4 added), its members under <id>/:
+// The archive (format_version "4.7", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build; laid out as in 4.0 but for color.csv's exposure_duration_s, lens_position and received_ts, which 4.3 added), its members under <id>/:
 //   color.bin          every delivered color frame exactly as the camera delivered it, uncompressed, with no header: the frame with color.csv index n occupies bytes [n*color_bytes_per_frame, (n+1)*color_bytes_per_frame), color_bytes_per_frame = color_width*color_height*3/2; each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, color_height rows of color_width bytes (a Y byte per pixel), then its CbCr plane, color_height/2 rows of color_width bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through color_ycbcr_matrix
 //   color.csv          one row per color frame delivered or dropped: index,timestamp,dropped,fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,exposure_duration_s,lens_position,received_ts, then, for the rear, tracking_state (normal, not_available or limited_<reason>) and world_from_camera_00 ... world_from_camera_23, rows 0-2 of ARCamera.transform as metadata.json's pose_convention says; exposure_duration_s is the frame's own exposure time in seconds, lens_position the capture device's lensPosition (0 to 1) and received_ts the host-clock seconds at which the app received the frame, the last two read when the frame reached the app and so later than its exposure by the capture pipeline's latency, as metadata.json's exposure_lens_arrival_convention says
 //   depth.bin          depth maps exactly as delivered, concatenated with no header: map n occupies bytes [n*depth_bytes_per_frame, (n+1)*depth_bytes_per_frame), depth_bytes_per_frame = depth_width*depth_height*depth_bytes_per_pixel, rows tightly packed, little-endian, pixel type depth_pixel_format ("fdep" Float32 metres, "hdep" Float16 metres); NaN or 0 marks a pixel without a reading
 //   depth.csv          one row per depth map delivered or dropped: index,timestamp,dropped, then, for the front, filtered,accuracy,quality (AVDepthData's isDepthDataFiltered 1 or 0, depthDataAccuracy absolute or relative, depthDataQuality high or low), then fx,fy,cx,cy,upright_rotation_deg,gravity_x,gravity_y,gravity_z,gravity_ts,bytes_per_row (the delivered map's row stride, which depth.bin drops)
 //   confidence.bin     rear only: one map per depth map, in depth.bin's order and layout, UInt8 per pixel, ARConfidenceLevel 0 low, 1 medium, 2 high
 //   calibration.jsonl  front only: one line per delivered depth map, in depth.csv's order, {"index": n, "timestamp": t, "calibration": c}, n and t the map's depth.csv index and timestamp, c its full AVCameraCalibrationData, or null when it came without one
-//   metadata.json      id, name, duration, device, camera, depth source, formats and frame rate, focus, conventions, counts, whether it was recovered after the app stopped, and, for the rear, Apple's calibration of its camera as avfoundation_calibration_description says
+//   metadata.json      id, name, duration, device, camera, depth source, formats and frame rate, focus, conventions, counts, and whether it was recovered after the app stopped
 //
 // A frame's bytes are queued for writing before its row, so every .bin and calibration.jsonl hold at least the frames that have a row; a color frame whose copy would push the bytes waiting to be written above maxQueuedBytes is dropped as writer_busy.
 // The work directory holds everything finishing needs, so a directory left by a closed app or a failed finish is finished at the next launch, each file cut to the frames that have a row:
@@ -27,7 +27,7 @@ import simd
 //   color.bin, color.csv, depth.bin, depth.csv, confidence.bin (rear), calibration.jsonl (front)   written as the frames arrive
 //   metadata.json     written when finishing begins, from start.json and the tables
 //   recording.json    the recording's RecordingInfo with every member's size and SHA-256, written once metadata.json is; a finish that finds it only removes start.json and renames the directory
-// A recording recovered at the next launch kept no hash, so its members are hashed by reading them when it is finished, the only time a recording's files are read back.
+// A recording recovered at the next launch kept no hash, so its members are hashed by reading them when it is finished; so are those of a recording apps 4.1 to 4.5 finished, whose recording.json lists no members, when this app first finds it: the only times a recording's files are read back.
 final class Recording {
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private static var workRoot: URL { documents.appendingPathComponent("work", isDirectory: true) }
@@ -291,6 +291,43 @@ final class Recording {
         try finish(directory, userName: nil, hashes: nil)
     }
 
+    // The recordings apps 4.1 to 4.5 finished: their recording.json lists no members.
+    static func withoutMembers() -> [URL] {
+        let directories = (try? FileManager.default.contentsOfDirectory(at: documents, includingPropertiesForKeys: nil)) ?? []
+        return directories.filter { listsNoMembers($0.appendingPathComponent(RecordingInfo.fileName)) }
+    }
+
+    // Whether recording.json exists and lists no members, as apps 4.1 to 4.5 wrote it.
+    static func listsNoMembers(_ infoFile: URL) -> Bool {
+        guard let data = try? Data(contentsOf: infoFile), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["members"] == nil
+    }
+
+    // Gives a recording apps 4.1 to 4.5 finished its members, each hashed by reading it and acknowledged when the recording was uploaded, rewriting its recording.json; it is otherwise as this app writes it.
+    static func addMembers(_ directory: URL) throws -> RecordingInfo {
+        // recording.json as apps 4.1 to 4.5 wrote it.
+        struct Listed: Decodable {
+            let id: String
+            let name: String
+            let namedByUser: Bool
+            let startTime: Date
+            let durationSeconds: Double
+            let camera: DepthCamera
+            let uploaded: Bool
+        }
+        let infoFile = directory.appendingPathComponent(RecordingInfo.fileName)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let listed = try decoder.decode(Listed.self, from: Data(contentsOf: infoFile))
+        let members = try archiveMembers(listed.camera).map { member -> RecordingInfo.Member in
+            let read = try hash(directory.appendingPathComponent(member))
+            return RecordingInfo.Member(name: member, size: read.size, sha256: read.sha256, uploaded: listed.uploaded)
+        }
+        let info = RecordingInfo(id: listed.id, name: listed.name, namedByUser: listed.namedByUser, startTime: listed.startTime, durationSeconds: listed.durationSeconds, camera: listed.camera, members: members, uploaded: listed.uploaded)
+        try info.write(to: infoFile)
+        return info
+    }
+
     // Finishes a work directory where it lies, copying none of its frames: writes metadata.json, cutting each file to the frames that have a row, and recording.json with every member's size and SHA-256, removes start.json and renames the directory to Documents/<id>/, resuming a finish that was cut short. hashes holds the .bin files' sizes and SHA-256s taken as they were written, and is nil for a recording recovered after the app stopped. Returns nil, removing the directory, when a stream has no frames; a failed finish leaves the directory to be finished at the next launch, and its error names the directory.
     private static func finish(_ directory: URL, userName: String?, hashes: [String: (size: Int, sha256: String)]?) throws -> RecordingInfo? {
         do {
@@ -356,7 +393,7 @@ final class Recording {
         // An unnamed recording is named by its start date and time and its camera.
         let name = userName ?? "\(formatted(start.startTimeUtc, "yyyy-MM-dd HH:mm:ss")) \(start.camera == .front ? "Front" : "Rear")"
         let duration = max(color.last, depth.last) - min(color.first, depth.first)
-        metadata["format_version"] = "4.6"
+        metadata["format_version"] = "4.7"
         metadata["id"] = id
         metadata["name"] = name
         metadata["named_by_user"] = userName != nil
