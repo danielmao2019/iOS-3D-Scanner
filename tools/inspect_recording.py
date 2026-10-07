@@ -231,6 +231,12 @@ def is_pose(rec: Recording, row: Dict[str, str]) -> bool:
     return bool(np.allclose(rotation @ rotation.T, np.eye(3), rtol=0, atol=ROTATION_TOL)) and abs(np.linalg.det(rotation) - 1) < ROTATION_TOL
 
 
+def calibration_complete(calibration: Dict) -> bool:
+    """Whether a rear recording's avfoundation_calibration has both lens distortion lookup tables, non-empty and of one length, and positive reference dimensions."""
+    tables = (calibration["lens_distortion_lookup_table"], calibration["inverse_lens_distortion_lookup_table"])
+    return len(tables[0]) == len(tables[1]) > 0 and calibration["intrinsic_reference_width"] > 0 and calibration["intrinsic_reference_height"] > 0
+
+
 def depth_range(depth: np.ndarray) -> str:
     """The range of the depth readings, in metres."""
     assert depth.ndim == 1 and depth.size > 0, depth.shape
@@ -324,6 +330,8 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     if rear:
         checks["every color frame has a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = all(is_pose(rec, r) for r in rec.colors)
         checks["confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
+    if rear and rec.format_minor >= 4:
+        checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
     checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")

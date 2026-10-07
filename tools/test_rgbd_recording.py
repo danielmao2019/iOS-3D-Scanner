@@ -1,4 +1,4 @@
-"""Tests the tools on tiny synthetic format_version "4.3" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, whose color.csv lacks the three columns 4.3 added, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
+"""Tests the tools on tiny synthetic format_version "4.4" front and rear recordings laid out exactly as the app streams them: the reader's tables, its frames memory-mapped inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, that it still reads a "4.0" recording, whose color.csv lacks the three columns 4.3 added, decode_recording's output files, and that inspect_recording runs with every check passing but the two edge alignments, which need real images; and inspect_recording's spatial alignment on a larger synthetic rear recording whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened.
 
 Usage: python -m pytest tools/test_rgbd_recording.py
 """
@@ -26,8 +26,8 @@ TIMES = [f"{100 + i / 30:.9f}" for i in range(5)]
 COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
-# The synthetic recordings are app 4.3's, format_version "4.3".
-MINOR = 3
+# The synthetic recordings are app 4.4's, format_version "4.4".
+MINOR = 4
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 # The spatial alignment recording: a rear recording big enough to have structure, ALIGNED_PAIRS same-instant pairs, its depth a quarter of its color each way, each pair showing RECTANGLES random rectangles at NEAR_M before a background at FAR_M.
@@ -172,6 +172,22 @@ def recording_id(camera: str) -> str:
     return f"rgbd_20261002_120000_{camera}"
 
 
+def rear_calibration() -> Dict:
+    """A rear recording's avfoundation_calibration, at the reference dimensions, taken at lens position 0.8 just before the first frame."""
+    return {
+        "intrinsic_matrix_row_major": [[13.8, 0, 7.7], [0, 13.8, 5.6], [0, 0, 1]],
+        "intrinsic_reference_width": REFERENCE_WIDTH,
+        "intrinsic_reference_height": REFERENCE_HEIGHT,
+        "extrinsic_matrix_row_major_3x4": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]],
+        "pixel_size_mm": 0.0014,
+        "lens_distortion_center": [7.7, 5.6],
+        "lens_distortion_lookup_table": [0, 0.001, 0.002],
+        "inverse_lens_distortion_lookup_table": [0, -0.001, -0.002],
+        "lens_position": 0.8,
+        "captured_at": float(TIMES[0]) - 1,
+    }
+
+
 def metadata(camera: str, matrix: str, minor: int) -> Dict:
     meta = {
         "format_version": f"4.{minor}",
@@ -215,6 +231,8 @@ def metadata(camera: str, matrix: str, minor: int) -> Dict:
             "arkit_video_format": "1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera",
             "arkit_video_formats": ["1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera"],
         })
+        if minor >= 4:
+            meta.update({"avfoundation_calibration": rear_calibration(), "avfoundation_calibration_description": "synthetic"})
     else:
         meta.update({"calibration_description": "synthetic", "available_depth_formats": ["640x480 fdep"]})
     return meta
