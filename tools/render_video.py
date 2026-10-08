@@ -1,6 +1,6 @@
-"""Renders every color frame of an RGBD Scanner recording (.tar, format_version "4.<minor>"), converted from color.bin to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel.
+"""Renders every color frame of an RGBD Scanner recording (a format_version "4.8" directory or a "4.0" to "4.7" .tar), converted to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel, turned upright as the latest delivered color frame was.
 
-Usage: python tools/render_video.py <recording.tar> <out.mp4> --ffmpeg <ffmpeg with libx264>
+Usage: python tools/render_video.py <recording directory or .tar> <out.mp4> --ffmpeg <ffmpeg with libx264>
 """
 
 import argparse
@@ -37,17 +37,19 @@ def legend(width: int, lo: float, hi: float) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("tar", type=Path)
+    parser.add_argument("recording", type=Path)
     parser.add_argument("out", type=Path)
     parser.add_argument("--ffmpeg", required=True)
     args = parser.parse_args()
 
-    rec = Recording(args.tar)
-    assert rec.color.shape[0] == len(rec.colors), f"color.bin holds {rec.color.shape[0]} frames, color.csv delivers {len(rec.colors)}"
+    rec = Recording(args.recording)
+    assert rec.color.shape[0] == len(rec.colors), f"the color frames are {rec.color.shape[0]}, the delivered color rows {len(rec.colors)}"
     lo, hi = np.percentile(rec.depth[valid(rec.depth)], [2, 98])
     depth_at = {c["timestamp"]: d for c, d in rec.pairs()}
     writer = None
     rendered = 0
+    # Each pair is turned upright by its color frame's rotation, a dropped one's by the latest delivered color frame's, or the first's before any.
+    rotation = rec.colors[0]["upright_rotation_deg"]
     for row in rec.color_rows:
         d = depth_at.get(row["timestamp"])
         if row["index"] == "-1":
@@ -56,7 +58,8 @@ def main() -> None:
             color = np.zeros((BOX, BOX, 3), np.uint8)
             cv2.putText(color, "color lost", (BOX // 2 - 80, BOX // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
         else:
-            color = fit(upright(rec.color_bgr(int(row["index"])), row["upright_rotation_deg"]), cv2.INTER_AREA)
+            rotation = row["upright_rotation_deg"]
+            color = fit(upright(rec.color_bgr(int(row["index"])), rotation), cv2.INTER_AREA)
         if d is None:
             vis = np.zeros_like(color)
             text = f"color {row['index']} t={float(row['timestamp']):.3f}s  no depth at this instant"
@@ -65,7 +68,7 @@ def main() -> None:
             ok = valid(z)
             vis = cv2.applyColorMap((np.clip((np.nan_to_num(z) - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
             vis[~ok] = 0
-            vis = fit(upright(vis, d["upright_rotation_deg"]), cv2.INTER_NEAREST)
+            vis = fit(upright(vis, rotation), cv2.INTER_NEAREST)
             color_label = f"color lost ({row['dropped']})" if row["index"] == "-1" else f"color {row['index']}"
             text = f"{color_label} / depth {d['index']}  t={float(row['timestamp']):.3f}s  valid {ok.mean() * 100:.1f}%"
         width = color.shape[1] + vis.shape[1]

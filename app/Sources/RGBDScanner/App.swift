@@ -49,7 +49,7 @@ enum UploadState: Equatable {
     }
 }
 
-// A finished recording's Documents/<id>/recording.json, beside the archive's members in that directory; the uploader rewrites it as the receiver acknowledges each member.
+// A finished recording's Documents/<id>/recording.json, beside the recording's files, its members, in that directory; the uploader rewrites it as the receiver acknowledges each member.
 struct RecordingInfo: Codable {
     let id: String
     let name: String
@@ -57,12 +57,12 @@ struct RecordingInfo: Codable {
     let startTime: Date
     let durationSeconds: Double
     let camera: DepthCamera
-    // The archive's members in the order the archive holds them.
+    // The recording's files, in the order the manifest lists them.
     var members: [Member]
-    // Whether the receiver has acknowledged the manifest, and so holds the whole archive.
+    // Whether the receiver has acknowledged the manifest, and so holds the whole recording.
     var uploaded: Bool
 
-    // An archive member: its file name, its size in bytes, its SHA-256 as 64 lowercase hex characters, and whether the receiver has acknowledged it.
+    // One of the recording's files: its name, its size in bytes, its SHA-256 as 64 lowercase hex characters, and whether the receiver has acknowledged it.
     struct Member: Codable {
         let name: String
         let size: Int
@@ -75,7 +75,7 @@ struct RecordingInfo: Codable {
     static func directory(_ id: String) -> URL { Recording.documents.appendingPathComponent(id, isDirectory: true) }
     var directory: URL { Self.directory(id) }
     var file: URL { directory.appendingPathComponent(Self.fileName) }
-    // The manifest the uploader writes for the receiver once every member is acknowledged; never part of the archive.
+    // The manifest the uploader writes for the receiver once every member is acknowledged; never one of the recording's files.
     var manifest: URL { directory.appendingPathComponent("manifest.json") }
 
     func write(to url: URL) throws {

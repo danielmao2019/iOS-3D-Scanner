@@ -14,7 +14,7 @@ struct CaptureStats {
     var depthMedianMeters: Double = 0
 }
 
-// How the phone was held at a moment, as recorded with each frame.
+// How the phone was held at a moment, as recorded with each color frame.
 struct Orientation {
     // Clockwise rotation, in degrees, that turns a sensor-oriented frame upright (horizon-level).
     var uprightRotationDegrees = 0
@@ -180,7 +180,7 @@ final class Recorder: CaptureSink {
         }
         guard let active else { return }
         stats.depthFrames += 1
-        active.appendDepth(depth, orientation: orientation.snapshot())
+        active.appendDepth(depth)
     }
 
     func droppedDepth(at time: CMTime, reason: String) {

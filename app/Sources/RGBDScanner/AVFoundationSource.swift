@@ -107,11 +107,10 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        let received = CMClockGetTime(CMClockGetHostTimeClock())
         guard let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { preconditionFailure("a video sample without an image") }
         if let pending {
             self.pending = nil
-            pending.ready(.success(pending.format.stream(firstFrame: image, focus: device.focusMode == .continuousAutoFocus ? "autofocus" : "fixed")))
+            pending.ready(.success(pending.format.stream(firstFrame: image)))
         }
         let matrix = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data
         guard let exif = CMGetAttachment(sampleBuffer, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? [String: Any],
@@ -121,8 +120,6 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             image: image,
             intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } },
             exposureDuration: exposureDuration,
-            lensPosition: device.lensPosition,
-            received: received,
             pose: nil))
     }
 
@@ -145,8 +142,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             metres: depthData.depthDataType == kCVPixelFormatType_DepthFloat32 ? map : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap,
             confidence: nil,
             intrinsics: intrinsics,
-            sourceCells: [depthData.isDepthDataFiltered ? "1" : "0", depthData.depthDataAccuracy == .absolute ? "absolute" : "relative", depthData.depthDataQuality == .high ? "high" : "low"],
-            calibration: cal.map { cal in { Self.describe(cal) } }))
+            flags: DepthFlags(filtered: depthData.isDepthDataFiltered, accuracy: depthData.depthDataAccuracy, quality: depthData.depthDataQuality),
+            calibration: cal.map(Self.calibration)))
     }
 
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection, reason: AVCaptureOutput.DataDroppedReason) {
@@ -172,31 +169,11 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         }
     }
 
-    private static func describe(_ cal: AVCameraCalibrationData) -> [String: Any] {
-        let k = cal.intrinsicMatrix
-        let e = cal.extrinsicMatrix
-        func floats(_ data: Data?) -> [Float] {
-            guard let data else { return [] }
-            return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        }
-        return [
-            "intrinsic_matrix_row_major": [
-                [k.columns.0.x, k.columns.1.x, k.columns.2.x],
-                [k.columns.0.y, k.columns.1.y, k.columns.2.y],
-                [k.columns.0.z, k.columns.1.z, k.columns.2.z],
-            ],
-            "intrinsic_reference_width": cal.intrinsicMatrixReferenceDimensions.width,
-            "intrinsic_reference_height": cal.intrinsicMatrixReferenceDimensions.height,
-            "extrinsic_matrix_row_major_3x4": [
-                [e.columns.0.x, e.columns.1.x, e.columns.2.x, e.columns.3.x],
-                [e.columns.0.y, e.columns.1.y, e.columns.2.y, e.columns.3.y],
-                [e.columns.0.z, e.columns.1.z, e.columns.2.z, e.columns.3.z],
-            ],
-            "pixel_size_mm": cal.pixelSize,
-            "lens_distortion_center": [cal.lensDistortionCenter.x, cal.lensDistortionCenter.y],
-            "lens_distortion_lookup_table": floats(cal.lensDistortionLookupTable),
-            "inverse_lens_distortion_lookup_table": floats(cal.inverseLensDistortionLookupTable),
-        ]
+    // The parts of a depth map's calibration the recording writes beside its intrinsics.
+    private static func calibration(_ cal: AVCameraCalibrationData) -> Calibration {
+        func floats(_ data: Data) -> [Float] { data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
+        return Calibration(referenceDimensions: cal.intrinsicMatrixReferenceDimensions, distortionCenter: cal.lensDistortionCenter,
+                           lookupTable: cal.lensDistortionLookupTable.map(floats), inverseLookupTable: cal.inverseLensDistortionLookupTable.map(floats), extrinsicMatrix: cal.extrinsicMatrix)
     }
 
     // Shows the session's color stream; AVCaptureVideoPreviewLayer mirrors the front camera by default.
@@ -213,24 +190,16 @@ private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     let frameDuration: CMTime
 
-    // The stream format, the color size and YCbCr matrix read from the first delivered color frame; focus is metadata.json's: autofocus or fixed.
-    func stream(firstFrame image: CVPixelBuffer, focus: String) -> StreamFormat {
+    // The stream format, the color size and YCbCr matrix read from the first delivered color frame.
+    func stream(firstFrame image: CVPixelBuffer) -> StreamFormat {
         let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
         return StreamFormat(
             colorWidth: CVPixelBufferGetWidth(image), colorHeight: CVPixelBufferGetHeight(image), colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
             frameRate: 1 / CMTimeGetSeconds(frameDuration),
-            details: [
-                "focus": focus,
-                "intrinsics_convention": "color.csv's fx,fy,cx,cy are each color frame's kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, in color pixels; depth.csv's are each depth map's own AVDepthData.cameraCalibrationData.intrinsicMatrix carried from intrinsic_reference_width x intrinsic_reference_height to the depth map: with sx = depth_width / intrinsic_reference_width and sy = depth_height / intrinsic_reference_height, fx_d = fx * sx, fy_d = fy * sy, cx_d = cx * sx, cy_d = cy * sy; Apple measures both principal points from \"the upper left of the frame\", the frame's corner, so plain scaling is exact; neither stream is distortion-corrected: calibration.jsonl carries each depth map's lens distortion lookup tables and center, which describe the color camera the depth is registered to",
-                "exposure_lens_arrival_convention": "color.csv's exposure_duration_s is each delivered frame's own exposure time in seconds, its sample buffer's Exif ExposureTime; lens_position is the TrueDepth camera's AVCaptureDevice.lensPosition (0 to 1) and received_ts the host-clock seconds at which the app's video data output delegate received the frame, both read when the frame reached the app and so later than its exposure by the capture pipeline's latency",
-                "calibration_description": "calibration.jsonl: one line per delivered depth map, in depth.csv's order, {\"index\": n, \"timestamp\": t, \"calibration\": c} with n and t the map's depth.csv index and timestamp, and c the map's AVDepthData.cameraCalibrationData, null when the map came without one: intrinsic_matrix_row_major (intrinsicMatrix, at intrinsic_reference_width x intrinsic_reference_height, its intrinsicMatrixReferenceDimensions), extrinsic_matrix_row_major_3x4 (extrinsicMatrix), pixel_size_mm (pixelSize), lens_distortion_center (lensDistortionCenter), lens_distortion_lookup_table and inverse_lens_distortion_lookup_table (lensDistortionLookupTable and inverseLensDistortionLookupTable as Float32 arrays)",
-                "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
-                    let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                    return "\(d.width)x\(d.height) \(fourCC(CMFormatDescriptionGetMediaSubType(f.formatDescription)))"
-                },
-            ])
+            // Apple measures the principal points of the frames' intrinsic matrices and of the depth calibration's from "the upper left of the frame".
+            principalPointOrigin: .upperLeftPixelCorner)
     }
 
     // Bytes per second of uncompressed frames a recording may ask the storage to write: the iPhone 13 Pro Max's storage kept up with about 0.37 GB/s of frame writes once the first few GB were in (measured 2026-10-05 with app 4.1), and the budget leaves about 20% for an upload reading the same storage.

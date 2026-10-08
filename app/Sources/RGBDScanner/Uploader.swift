@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-// Uploads finished recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Each member the receiver has not acknowledged goes up from its file as PUT /upload/<id>/<member>, with its SHA-256 from recording.json in X-Content-SHA256; once every member is acknowledged, PUT /upload/<id>/manifest.json from the manifest written beside them, the members in the archive's order with their sizes and SHA-256s, lets the receiver assemble the archive. Each acknowledgement is recorded in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
+// Uploads finished recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Each member the receiver has not acknowledged goes up from its file as PUT /upload/<id>/<member>, with its SHA-256 from recording.json in X-Content-SHA256; once every member is acknowledged, PUT /upload/<id>/manifest.json from the manifest written beside them, the members in recording.json's order with their sizes and SHA-256s, lets the receiver complete the recording. Each acknowledgement is recorded in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
 final class Uploader: NSObject, URLSessionDataDelegate {
     // The one uploader; the app delegate makes it at every launch, so its background session reconnects to the tasks iOS carried on while the app was not running.
     static let shared = Uploader()
@@ -71,7 +71,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         task.resume()
     }
 
-    // Writes the recording's manifest beside its members, the members in the archive's order with their sizes and SHA-256s, and starts its PUT to root/manifest.json.
+    // Writes the recording's manifest beside its members, the members in recording.json's order with their sizes and SHA-256s, and starts its PUT to root/manifest.json.
     private func startManifest(_ info: RecordingInfo, root: URL) throws {
         let members = info.members.map { ["name": $0.name, "size": $0.size, "sha256": $0.sha256] as [String: Any] }
         let manifest = try JSONSerialization.data(withJSONObject: ["members": members], options: [.prettyPrinted, .sortedKeys])

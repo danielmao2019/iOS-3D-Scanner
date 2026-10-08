@@ -1,9 +1,10 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.<minor>") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (a format_version "4.8" directory or a "4.0" to "4.7" .tar) and prints its statistics, then each check as PASS or FAIL.
 
-Usage: python tools/inspect_recording.py <recording.tar>
+Usage: python tools/inspect_recording.py <recording directory or .tar>
 """
 
 import argparse
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -11,7 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, Recording, valid, ycbcr_planes
+from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, SCAN_METADATA_KEYS, Recording, valid, ycbcr_planes
 
 TRACKING_STATES = {"normal", "not_available", "limited_initializing", "limited_excessive_motion", "limited_insufficient_features", "limited_relocalizing"}
 # How far a Float32 intrinsic recomputed here may differ from the app's: a few units in the last place, far below the 0.43 depth px that the wrong origin convention moves cx, cy.
@@ -39,6 +40,14 @@ SCALE_TOL = 0.005
 SHIFT_TOL = 0.15
 # The intrinsics coordinate of pixel (0, 0)'s center for each camera: ARKit's origin is that center, Apple's AVFoundation origin the frame's upper-left corner, half a pixel before it.
 PIXEL_CENTER = {"front": 0.5, "rear": 0.0}
+# Frame files are hashed this many bytes at a time.
+CHUNK = 8 << 20
+
+
+def metres(depth: np.ndarray) -> np.ndarray:
+    """Depth readings, Float32 or a 4.8 recording's Float16 metres as recorded, as float32 metres."""
+    assert depth.dtype in (np.float32, np.float16), depth.dtype
+    return depth.astype(np.float32, copy=False)
 
 
 def luma_gradient(rec: Recording, index: int) -> np.ndarray:
@@ -60,7 +69,7 @@ def alignment_offset(rec: Recording, grads: List[np.ndarray]) -> Dict[int, float
         ci = int(c["index"])
         if ci < 3 or ci + 3 >= len(grads) or np.abs(grads[ci + 1] - grads[ci - 1]).mean() < 0.15:
             continue
-        z = np.nan_to_num(rec.depth[int(d["index"])])
+        z = np.nan_to_num(metres(rec.depth[int(d["index"])]))
         log_z = np.log(np.clip(z, 0.1, 10))
         edges = cv2.Canny((np.clip((log_z - log_z.min()) / (np.ptp(log_z) + 1e-6), 0, 1) * 255).astype(np.uint8), 40, 120) > 0
         edges = cv2.dilate((edges & (z > 0)).astype(np.uint8), None) > 0
@@ -171,13 +180,13 @@ def median_interval(values: np.ndarray) -> Tuple[float, float]:
 def spatial_alignment(rec: Recording, intrinsics_override: Optional[Callable[[Dict[str, str]], List[float]]] = None) -> Dict[str, Union[bool, int, float, Tuple[float, float]]]:
     """How well depth edges land on the same-instant color frame's edges when each depth pixel is mapped into the color frame through the two rows' intrinsics (`intrinsics_override(depth row)` in place of the depth row's, when given), from the residual scale k, shift and fattening fitted per pair over up to ALIGNMENT_FRAMES evenly spaced pairs: frames, k_median, k_iqr, dx_median, dy_median, their 95% bootstrap intervals dx_median_ci95 and dy_median_ci95, fattening_x_median, fattening_y_median (depth px), corr_median, and aligned, whether they pass."""
     depth_intrinsics = intrinsics_override or row_intrinsics
-    origin = PIXEL_CENTER[rec.meta["camera"]]
+    origin = PIXEL_CENTER[rec.camera]
     pairs = [(c, d) for c, d in rec.pairs() if c["index"] != "-1" and all(c[k] and d[k] for k in INTRINSICS) and valid(rec.depth[int(d["index"])]).mean() >= ALIGNMENT_MIN_VALID]
     n = min(ALIGNMENT_FRAMES, len(pairs))
     fits = []
     for i in range(n):
         c, d = pairs[i * (len(pairs) - 1) // max(n - 1, 1)]
-        depth_g, mask = depth_gradients(rec.depth[int(d["index"])])
+        depth_g, mask = depth_gradients(metres(rec.depth[int(d["index"])]))
         # A map no larger than its border, like the synthetic tests' 4 x 3 ones, leaves no pixel to compare.
         if not mask.any():
             continue
@@ -196,29 +205,36 @@ def spatial_alignment(rec: Recording, intrinsics_override: Optional[Callable[[Di
     return result
 
 
-def arkit_depth_intrinsics_match(rec: Recording) -> bool:
-    """Whether every delivered depth row with a delivered same-instant color row, and there is one, has that row's intrinsics carried to the depth map as ARKit's depth grid lies on the color image, f * s, cx * sx and (cy + 0.5) * sy - 0.5 with s = depth size / color size, computed in Float32 as the app does."""
-    meta = rec.meta
+def arkit_carried(color: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Float32 color intrinsics fx, fy, cx, cy, one row per frame, carried to a depth map s = (sx, sy) times the color frame's size as ARKit's depth grid lies on the color image: f * s, cx * sx and (cy + 0.5) * sy - 0.5."""
+    half = np.float32(0.5)
+    return np.concatenate([color[:, :2] * s, color[:, 2:3] * s[0], (color[:, 3:] + half) * s[1] - half], axis=1)
+
+
+def plainly_scaled(color: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Float32 color intrinsics fx, fy, cx, cy, one row per frame, scaled plainly to a depth map s = (sx, sy) times the color frame's size, f * s and c * s, as both measured from the frame's corner are."""
+    return color * np.concatenate([s, s])
+
+
+def carried_intrinsics_match(rec: Recording, carry: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> bool:
+    """Whether every delivered depth row with a delivered same-instant color row, and there is one, has that row's intrinsics carried to the depth map by `carry` with s = depth size / color size, computed in Float32 as the app does."""
     pairs = [(c, d) for c, d in rec.pairs() if c["index"] != "-1"]
     if not pairs:
         return False
-    s = np.array([meta["depth_width"], meta["depth_height"]], np.float32) / np.array([meta["color_width"], meta["color_height"]], np.float32)
-    half = np.float32(0.5)
+    s = np.array([rec.depth_width, rec.depth_height], np.float32) / np.array([rec.color_width, rec.color_height], np.float32)
     color = np.array([[float(c[k]) for k in INTRINSICS] for c, _ in pairs], np.float32)
     depth = np.array([[float(d[k]) for k in INTRINSICS] for _, d in pairs], np.float32)
-    carried = np.concatenate([color[:, :2] * s, color[:, 2:3] * s[0], (color[:, 3:] + half) * s[1] - half], axis=1)
-    return bool(np.allclose(depth, carried, rtol=FLOAT32_RTOL, atol=0))
+    return bool(np.allclose(depth, carry(color, s), rtol=FLOAT32_RTOL, atol=0))
 
 
 def scaled_to_depth(rec: Recording) -> bool:
     """Whether every delivered depth row has its calibration.jsonl line's intrinsic matrix scaled from the reference dimensions to the depth map with Apple's corner origin, f * s and c * s, computed in Float32 as the app does."""
-    meta = rec.meta
     calibrations = [line["calibration"] for line in rec.calibrations]
     if any(cal is None for cal in calibrations):
         return False
     k = np.array([[cal["intrinsic_matrix_row_major"][r][c] for r, c in ((0, 0), (1, 1), (0, 2), (1, 2))] for cal in calibrations], np.float32)
     reference = np.array([[cal["intrinsic_reference_width"], cal["intrinsic_reference_height"]] for cal in calibrations], np.float32)
-    s = np.array([meta["depth_width"], meta["depth_height"]], np.float32) / reference
+    s = np.array([rec.depth_width, rec.depth_height], np.float32) / reference
     depth = np.array([[float(d[key]) for key in INTRINSICS] for d in rec.depths], np.float32)
     return bool(np.allclose(depth, k * np.concatenate([s, s], axis=1), rtol=FLOAT32_RTOL, atol=0))
 
@@ -235,6 +251,22 @@ def calibration_complete(calibration: Dict) -> bool:
     """Whether a rear recording's avfoundation_calibration has both lens distortion lookup tables, non-empty and of one length, and positive reference dimensions."""
     tables = (calibration["lens_distortion_lookup_table"], calibration["inverse_lens_distortion_lookup_table"])
     return len(tables[0]) == len(tables[1]) > 0 and calibration["intrinsic_reference_width"] > 0 and calibration["intrinsic_reference_height"] > 0
+
+
+def sha256(path: Path) -> str:
+    """A file's SHA-256 as 64 lowercase hex characters, read CHUNK bytes at a time."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(CHUNK):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def frame_counts_match(rec: Recording) -> bool:
+    """Whether a format 4.8 recording's color_frames.bin, depth_frames.bin and rear depth_frames_confidence.bin each hold, by their size on disk, their frames metadata's frame_count frames, one per frames entry."""
+    color, depth = rec.color_frames_metadata, rec.depth_frames_metadata
+    files = [(color["file"], rec.color, color), (depth["file"], rec.depth, depth)] + ([(depth["confidence"]["file"], rec.confidence, depth)] if rec.confidence is not None else [])
+    return all((rec.path / name).stat().st_size == frames.nbytes and frames.shape[0] == metadata["frame_count"] == len(metadata["frames"]) for name, frames, metadata in files)
 
 
 def depth_range(depth: np.ndarray) -> str:
@@ -255,11 +287,13 @@ def fx_range(rows: List[Dict[str, str]]) -> str:
     return f"{min(fx):.3f}..{max(fx):.3f} px over {len(fx)} frames" if fx else "no frame has intrinsics"
 
 
-def inspect(tar_path: Path) -> Dict[str, bool]:
+def inspect(path: Path) -> Dict[str, bool]:
     """Prints a recording's statistics and each check as PASS or FAIL, and returns the checks."""
-    rec = Recording(tar_path)
+    rec = Recording(path)
     meta = rec.meta
-    rear = meta["camera"] == "rear"
+    rear = rec.camera == "rear"
+    # Format 4.8 is a directory of JSON files and frame files; 4.0 to 4.7 a tar of tables, its meta the metadata.json.
+    directory = rec.format_minor >= 8
     h, w = rec.depth.shape[1:]
     grads = [luma_gradient(rec, i) for i in range(rec.color.shape[0])]
 
@@ -278,62 +312,97 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     spatial = spatial_alignment(rec)
     coverage = is_valid.mean(axis=(1, 2)) * 100
 
-    print(f"device {meta['device_model']} iOS {meta['system_version']} camera {meta['camera']} depth source {meta['depth_source']} focus {meta['focus']}")
-    print(f"color {meta['color_width']}x{meta['color_height']} {meta['color_pixel_format']} {meta['color_ycbcr_matrix']}, depth {w}x{h} {meta['depth_pixel_format']}, filtering_enabled={meta['depth_filtering_enabled']}")
-    print(f"configured {meta['frame_rate']:.2f} fps; color {len(rec.colors)} frames at {(len(color_ts) - 1) / (color_ts[-1] - color_ts[0]):.2f} fps; depth {len(rec.depths)} frames at {(len(depth_ts) - 1) / (depth_ts[-1] - depth_ts[0]):.2f} fps")
+    if directory:
+        scan = rec.scan_metadata
+        print(f"phone {scan['phone_model']} iOS {scan['ios_version']} camera {rec.camera}")
+        print(f"color {rec.color_width}x{rec.color_height} 420f {rec.ycbcr_matrix}, depth {w}x{h} {rec.depth_frames_metadata['pixel_format']}")
+    else:
+        print(f"device {meta['device_model']} iOS {meta['system_version']} camera {meta['camera']} depth source {meta['depth_source']} focus {meta['focus']}")
+        print(f"color {meta['color_width']}x{meta['color_height']} {meta['color_pixel_format']} {meta['color_ycbcr_matrix']}, depth {w}x{h} {meta['depth_pixel_format']}, filtering_enabled={meta['depth_filtering_enabled']}")
+    print(f"configured {rec.frame_rate:.2f} fps; color {len(rec.colors)} frames at {(len(color_ts) - 1) / (color_ts[-1] - color_ts[0]):.2f} fps; depth {len(rec.depths)} frames at {(len(depth_ts) - 1) / (depth_ts[-1] - depth_ts[0]):.2f} fps")
     print(f"dropped: color {dropped(rec.color_rows)}, depth {dropped(rec.depth_rows)}")
-    print(f"depth frames with a color.csv row at the same instant: {len(pairs)}, of which with a delivered color frame: {pairs_with_color}")
+    print(f"depth frames with a color row at the same instant: {len(pairs)}, of which with a delivered color frame: {pairs_with_color}")
     print(f"depth frames outside the color stream's time span: {len(rec.depths) - len(depth_in_span)}")
     print(f"upright rotations used: {sorted({r['upright_rotation_deg'] for r in rec.colors})}; |gravity| mean {np.linalg.norm(gravity, axis=1).mean():.3f} g")
     print(f"fx: color {fx_range(rec.colors)}, depth {fx_range(rec.depths)}")
     if rec.format_minor >= 3:
         exposure = np.array([float(r["exposure_duration_s"]) for r in rec.colors])
-        lens = np.array([float(r["lens_position"]) for r in rec.colors])
-        latency = np.array([float(r["received_ts"]) - float(r["timestamp"]) for r in rec.colors])
-        print(f"color exposure_duration_s {exposure.min() * 1e3:.3f}..{exposure.max() * 1e3:.3f} ms, median {np.median(exposure) * 1e3:.3f} ms; lens_position {lens.min():.3f}..{lens.max():.3f}; delivery latency received_ts - timestamp median {np.median(latency) * 1e3:.1f} ms, max {latency.max() * 1e3:.1f} ms")
+        line = f"color exposure_duration_s {exposure.min() * 1e3:.3f}..{exposure.max() * 1e3:.3f} ms, median {np.median(exposure) * 1e3:.3f} ms"
+        # Minors 3 to 7 also recorded each color frame's lens position and when the app received it.
+        if not directory:
+            lens = np.array([float(r["lens_position"]) for r in rec.colors])
+            latency = np.array([float(r["received_ts"]) - float(r["timestamp"]) for r in rec.colors])
+            line += f"; lens_position {lens.min():.3f}..{lens.max():.3f}; delivery latency received_ts - timestamp median {np.median(latency) * 1e3:.1f} ms, max {latency.max() * 1e3:.1f} ms"
+        print(line)
     print("depth valid % per frame: min {:.1f} p5 {:.1f} p25 {:.1f} median {:.1f} p75 {:.1f} p95 {:.1f} max {:.1f}".format(coverage.min(), *np.percentile(coverage, [5, 25, 50, 75, 95]), coverage.max()))
-    print("depth range: " + depth_range(rec.depth[is_valid]))
+    print("depth range: " + depth_range(metres(rec.depth[is_valid])))
     if rear:
-        print("depth range, high-confidence pixels only: " + depth_range(rec.depth[is_valid & (rec.confidence == HIGH_CONFIDENCE)]))
+        print("depth range, high-confidence pixels only: " + depth_range(metres(rec.depth[is_valid & (rec.confidence == HIGH_CONFIDENCE)])))
         print("confidence of valid pixels: " + " ".join(f"{level}:{(rec.confidence[is_valid] == level).mean() * 100:.1f}%" for level in range(3)))
         states = Counter(r["tracking_state"] for r in rec.colors)
         print("tracking state of color frames: " + " ".join(f"{state}:{n / len(rec.colors) * 100:.1f}%" for state, n in sorted(states.items())))
-    bytes_per_row = sorted({int(r["bytes_per_row"]) for r in rec.depths})
-    print(f"depth map bytes per row: {bytes_per_row} (packed: {w * meta['depth_bytes_per_pixel']})")
+    if not directory:
+        bytes_per_row = sorted({int(r["bytes_per_row"]) for r in rec.depths})
+        print(f"depth map bytes per row: {bytes_per_row} (packed: {w * meta['depth_bytes_per_pixel']})")
     print("edge alignment of depth to color frame at offset: " + " ".join(f"{o:+d}:{s:.3f}" for o, s in offsets.items()))
     dx_low, dx_high = spatial["dx_median_ci95"]
     dy_low, dy_high = spatial["dy_median_ci95"]
     print(f"spatial alignment of depth to its same-instant color frame through their intrinsics, over {spatial['frames']} frames: residual scale k median {spatial['k_median']:.4f} (IQR {spatial['k_iqr']:.4f}), shift median dx {spatial['dx_median']:+.3f} (95% {dx_low:+.3f}..{dx_high:+.3f}) dy {spatial['dy_median']:+.3f} (95% {dy_low:+.3f}..{dy_high:+.3f}) depth px, depth edge fattening median x {spatial['fattening_x_median']:+.3f} y {spatial['fattening_y_median']:+.3f} depth px, edge correlation median {spatial['corr_median']:.3f}")
 
     has_intrinsics = all(r[k] for r in rec.colors + rec.depths for k in INTRINSICS)
-    checks = {
-        "color.bin holds color_frames frames, one per color.csv row with an index": rec.color.shape[0] == len(rec.colors) == meta["color_frames"],
-        "depth.bin holds depth_frames maps, one per depth.csv row with an index": rec.depth.shape[0] == len(rec.depths) == meta["depth_frames"],
-        "indices are 0..n-1": [int(r["index"]) for r in rec.colors] == list(range(len(rec.colors))) and [int(r["index"]) for r in rec.depths] == list(range(len(rec.depths))),
+    if directory:
+        checks = {
+            "color_frames.bin, depth_frames.bin and the rear's depth_frames_confidence.bin each hold, by their size, frame_count frames, one per frames entry": frame_counts_match(rec),
+            "each frame file's size and SHA-256 are those its frames metadata records": all((rec.path / name).stat().st_size == size and sha256(rec.path / name) == digest for name, (size, digest) in rec.frame_files.items()),
+        }
+    else:
+        checks = {
+            "color.bin holds color_frames frames, one per color.csv row with an index": rec.color.shape[0] == len(rec.colors) == meta["color_frames"],
+            "depth.bin holds depth_frames maps, one per depth.csv row with an index": rec.depth.shape[0] == len(rec.depths) == meta["depth_frames"],
+            "indices are 0..n-1": [int(r["index"]) for r in rec.colors] == list(range(len(rec.colors))) and [int(r["index"]) for r in rec.depths] == list(range(len(rec.depths))),
+        }
+    checks |= {
         "timestamps strictly increasing": bool(np.all(np.diff(color_ts) > 0) and np.all(np.diff(depth_ts) > 0)),
-        "every depth frame within the color stream's time span has a color.csv row (delivered or dropped) at the same instant": paired_in_span == len(depth_in_span),
+        "every depth frame within the color stream's time span has a color row (delivered or dropped) at the same instant": paired_in_span == len(depth_in_span),
         "depth aligns best with its same-instant color frame": best_offset == 0,
         "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames": spatial["aligned"],
-        "metadata's depth_filtering_enabled is false": meta["depth_filtering_enabled"] is False,
     }
+    if not directory:
+        checks["metadata's depth_filtering_enabled is false"] = meta["depth_filtering_enabled"] is False
     if not rear:
         checks["every depth map unfiltered"] = all(r["filtered"] == "0" for r in rec.depths)
     checks["every color and depth frame has intrinsics"] = has_intrinsics
+    if directory:
+        checks["color_intrinsics.json and depth_intrinsics.json have one frames entry per frame"] = len(rec.color_intrinsics["frames"]) == rec.color.shape[0] and len(rec.depth_intrinsics["frames"]) == rec.depth.shape[0]
     if rear:
-        checks["every depth frame's intrinsics are its same-instant color frame's carried as ARKit's depth grid lies on the color image, f * s, cx * sx and (cy + 0.5) * sy - 0.5"] = has_intrinsics and arkit_depth_intrinsics_match(rec)
+        checks["every depth frame's intrinsics are its same-instant color frame's carried as ARKit's depth grid lies on the color image, f * s, cx * sx and (cy + 0.5) * sy - 0.5"] = has_intrinsics and carried_intrinsics_match(rec, arkit_carried)
+    elif directory:
+        checks["every depth frame's intrinsics are its same-instant color frame's scaled to the depth map, f * s and c * s, both measured from the frame's corner"] = has_intrinsics and carried_intrinsics_match(rec, plainly_scaled)
     else:
         lines_match = len(rec.calibrations) == len(rec.depths) and all(line["index"] == int(d["index"]) and abs(line["timestamp"] - float(d["timestamp"])) < SAME_INSTANT_S for line, d in zip(rec.calibrations, rec.depths, strict=True))
         checks["calibration.jsonl has one line per depth frame, with its index and timestamp"] = lines_match
         checks["every depth frame's intrinsics are its calibration's scaled to the depth map, f * s and c * s"] = lines_match and has_intrinsics and scaled_to_depth(rec)
-    checks["every depth map has its bytes per row, at least a packed row"] = all(r["bytes_per_row"] and int(r["bytes_per_row"]) >= w * meta["depth_bytes_per_pixel"] for r in rec.depths) and all(r["bytes_per_row"] == "" for r in rec.depth_rows if r["index"] == "-1")
-    checks["every frame has orientation and gravity"] = all(r[k] for r in rec.colors + rec.depths for k in ORIENTATION)
-    if rear:
+    if not directory:
+        checks["every depth map has its bytes per row, at least a packed row"] = all(r["bytes_per_row"] and int(r["bytes_per_row"]) >= w * meta["depth_bytes_per_pixel"] for r in rec.depths) and all(r["bytes_per_row"] == "" for r in rec.depth_rows if r["index"] == "-1")
+        checks["every frame has orientation and gravity"] = all(r[k] for r in rec.colors + rec.depths for k in ORIENTATION)
+    else:
+        checks["every color frame has orientation and gravity"] = all(r[k] for r in rec.colors for k in ORIENTATION)
+    if directory and not rear:
+        # The reader has checked that no frame is in two runs.
+        checks["every color and depth frame has a distortion and every depth frame a depth_to_color, the runs covering each frame exactly once"] = all(x is not None for x in rec.color_distortions + rec.depth_distortions + rec.depth_to_color)
+    if rear and directory:
+        checks["extrinsics.json has one camera pose per color frame, each a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = len(rec.extrinsics["camera_poses"]) == rec.color.shape[0] and all(is_pose(rec, r) for r in rec.colors)
+        checks["depth_frames_confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
+    elif rear:
         checks["every color frame has a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = all(is_pose(rec, r) for r in rec.colors)
         checks["confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
     # Apps 4.4 to 4.6 recorded it.
     if rear and 4 <= rec.format_minor <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
-    checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
+    if directory:
+        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == SCAN_METADATA_KEYS and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
+    else:
+        checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
     return checks
@@ -341,9 +410,9 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("tar", type=Path)
+    parser.add_argument("recording", type=Path)
     args = parser.parse_args()
-    inspect(args.tar)
+    inspect(args.recording)
 
 
 if __name__ == "__main__":
