@@ -1,6 +1,6 @@
-"""Receives recordings uploaded by the RGBD Scanner app and stores them in the --out folder.
+"""Receives recordings uploaded by the RGBD Scanner app and stores each as the single file <out>/<scan_id>.tar.
 
-PUT /upload/<name>.tar with headers X-Upload-Token (must match server/token) and X-Content-SHA256. Each request streams its body into its own temporary file in the output directory, checks the SHA-256, then renames it to <name>.tar, so concurrent uploads of the same recording cannot interfere and a stored file is always complete. GET /ping answers {"ok": true}.
+The app uploads a recording (format_version "4.8", as tools/rgbd_recording.py documents) one file at a time, each a PUT with headers X-Upload-Token (must match server/token) and X-Content-SHA256 (the file's SHA-256 as 64 lowercase hex characters): PUT /upload/<scan_id>/<file> for each of the recording's files (scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, depth_frames_confidence.bin for the rear, color_intrinsics.json, depth_intrinsics.json, extrinsics.json), then PUT /upload/<scan_id>/manifest.json, {"members": [{"name", "size", "sha256"}, ...]}; any other file name is refused with 404. Each request streams its body into its own temporary file in <out>/.staging/<scan_id>/ while hashing it and, when the hash matches, renames it to the file's name beside <name>.sha256, the hash it was checked against, so concurrent uploads of one file cannot interfere and a stored file is always complete; a body whose hash does not match is refused with 400. After each stored file, once the manifest and every file it lists are stored with its size and SHA-256, the listed files are written as <out>/<scan_id>.tar, an uncompressed GNU tar (a member can exceed 8 GiB) holding exactly them under <scan_id>/ in the manifest's order, through a temporary file in <out> renamed into place, so the archive appears whole, and <out>/.staging/<scan_id>, with the manifest and the hashes, is removed. A recording whose <out>/<scan_id>.tar already exists is not stored over it: that is logged and its staging directory kept. GET /ping answers {"ok": true}.
 """
 
 import argparse
@@ -8,17 +8,56 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import tarfile
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Type
+from typing import Any, Dict, List, Optional, Type
 
-NAME = re.compile(r"^/upload/([A-Za-z0-9_.-]+\.tar)$")
+PATH = re.compile(r"^/upload/([A-Za-z0-9_][A-Za-z0-9_.-]*)/([a-z_]+\.[a-z]+)$")
+FILES = {"scan_metadata.json", "color_frames.bin", "color_frames_metadata.json", "depth_frames.bin", "depth_frames_metadata.json", "depth_frames_confidence.bin", "color_intrinsics.json", "depth_intrinsics.json", "extrinsics.json"}
+MANIFEST = "manifest.json"
 CHUNK = 8 << 20
 
 
+def staged_files(staging: Path) -> Optional[List[str]]:
+    """The names of the files the manifest in a staging directory lists, once it and every file it lists are stored there with their sizes and SHA-256s; None while a file is missing."""
+    if not (staging / MANIFEST).is_file():
+        return None
+    members = json.loads((staging / MANIFEST).read_text())["members"]
+    assert all(m["name"] in FILES for m in members), members
+    for m in members:
+        path = staging / m["name"]
+        if not path.is_file() or path.stat().st_size != m["size"] or (staging / f"{m['name']}.sha256").read_text() != m["sha256"]:
+            return None
+    return [m["name"] for m in members]
+
+
+def store(out_dir: Path, scan_id: str, names: List[str]) -> Path:
+    """Writes the staged files `names` of a recording as <out>/<scan_id>.tar, an uncompressed GNU tar holding them under <scan_id>/ in that order, through a temporary file in <out> renamed into place, then removes its staging directory; returns the archive's path."""
+    staging = out_dir / ".staging" / scan_id
+    archive = out_dir / f"{scan_id}.tar"
+    fd, part_name = tempfile.mkstemp(dir=out_dir, prefix=f".{archive.name}.", suffix=".part")
+    part = Path(part_name)
+    try:
+        with os.fdopen(fd, "wb") as f, tarfile.open(fileobj=f, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            for name in names:
+                tar.add(staging / name, arcname=f"{scan_id}/{name}", recursive=False)
+        part.chmod(0o664)
+        os.replace(part, archive)
+    finally:
+        part.unlink(missing_ok=True)
+    shutil.rmtree(staging)
+    return archive
+
+
 def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
+    # One recording is stored at a time, so two files completing it together cannot both write its archive.
+    storing = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def reply(self, code: int, body: Dict[str, Any]) -> None:
             data = json.dumps(body).encode()
@@ -49,16 +88,18 @@ def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
                 # A body of unknown length cannot be read past, so the connection closes after the reply.
                 self.close_connection = True
                 return self.reply(411, {"error": "length required"})
-            match = NAME.match(self.path)
-            if match is None:
+            match = PATH.match(self.path)
+            if match is None or match.group(2) not in FILES | {MANIFEST}:
                 return self.reject(404, {"error": "bad path"}, length)
             if self.headers.get("X-Upload-Token") != token:
                 return self.reject(403, {"error": "bad token"}, length)
+            scan_id, name = match.group(1), match.group(2)
             expected = self.headers.get("X-Content-SHA256", "")
 
-            out_dir.mkdir(parents=True, exist_ok=True)
-            final = out_dir / match.group(1)
-            fd, part_name = tempfile.mkstemp(dir=out_dir, prefix=f".{final.name}.", suffix=".part")
+            staging = out_dir / ".staging" / scan_id
+            staging.mkdir(parents=True, exist_ok=True)
+            stored = staging / name
+            fd, part_name = tempfile.mkstemp(dir=staging, prefix=f".{name}.", suffix=".part")
             part = Path(part_name)
             try:
                 digest = hashlib.sha256()
@@ -74,13 +115,24 @@ def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
                 if remaining != 0:
                     return self.reply(400, {"error": f"connection closed with {remaining} bytes missing"})
                 if digest.hexdigest() != expected:
-                    return self.reply(400, {"error": "sha256 mismatch", "got": digest.hexdigest()})
+                    return self.reply(400, {"error": "sha256 mismatch", "got": digest.hexdigest(), "expected": expected})
+                (staging / f"{name}.sha256").write_text(expected)
                 part.chmod(0o664)
-                os.replace(part, final)
+                os.replace(part, stored)
             finally:
                 part.unlink(missing_ok=True)
-            self.log_message("stored %s (%d bytes)", final, length)
-            self.reply(200, {"stored": str(final), "size": length, "sha256": expected})
+            self.log_message("stored %s (%d bytes)", stored, length)
+            self.reply(200, {"stored": str(stored), "size": length, "sha256": expected})
+            # After the reply, so the phone is not kept waiting while a long recording's files are copied into its archive.
+            with storing:
+                names = staged_files(staging)
+                if names is None:
+                    return
+                archive = out_dir / f"{scan_id}.tar"
+                if archive.exists():
+                    self.log_message("not stored: %s exists, %s kept", archive, staging)
+                else:
+                    self.log_message("stored recording %s", store(out_dir, scan_id, names))
 
     return Handler
 

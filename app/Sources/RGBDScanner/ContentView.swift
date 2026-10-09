@@ -11,33 +11,15 @@ struct ContentView: View {
                     ForEach(model.availableCameras) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                .disabled(model.isRecording || model.isFinishing)
+                .disabled(model.isRecording)
                 .onChange(of: model.camera) { _, _ in model.startPreview() }
             } else if let only = model.availableCameras.first {
                 Text(only.label).font(.headline)
             }
 
-            if model.camera == .rear {
-                Picker("Depth source", selection: $model.rearDepthSource) {
-                    Text("Depth source AVFoundation").tag(DepthSource.avfoundationLiDAR)
-                    Text("Depth source ARKit").tag(DepthSource.arkitSceneDepth)
-                }
-                .pickerStyle(.segmented)
-                .disabled(model.isStarting || model.isRecording || model.isFinishing)
-                .onChange(of: model.rearDepthSource) { _, _ in model.startPreview() }
-            }
-
-            Picker("Depth filter", selection: $model.depthFiltering) {
-                Text("Depth filter Off").tag(false)
-                Text("Depth filter On").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .disabled(model.isStarting || model.isRecording || model.isFinishing)
-            .onChange(of: model.depthFiltering) { _, _ in model.startPreview() }
-
             ZStack {
                 if model.availableCameras.contains(model.camera) {
-                    PreviewView(view: model.recorder.preview(for: model.depthSource)).id(model.depthSource)
+                    PreviewView(view: model.recorder.preview(for: model.camera)).id(model.camera)
                 }
                 if model.showsDepth {
                     Color.black
@@ -53,7 +35,7 @@ struct ContentView: View {
                 if model.isRecording {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         let s = Int(context.date.timeIntervalSince(model.recordingStart))
-                        Text(String(format: "● REC %d:%02d", s / 60, s % 60))
+                        Text(String(format: "REC %d:%02d", s / 60, s % 60))
                             .font(.caption.monospacedDigit()).padding(4)
                             .background(.red).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 4)).padding(6)
                     }
@@ -70,19 +52,19 @@ struct ContentView: View {
             }
 
             Text(model.formatSummary).font(.caption)
-            Text(String(format: "depth valid %.0f%% · median %.2f m", model.stats.depthValidFraction * 100, model.stats.depthMedianMeters))
+            Text(String(format: "depth valid %.0f%%, median %.2f m", model.stats.depthValidFraction * 100, model.stats.depthMedianMeters))
                 .font(.caption2.monospacedDigit())
-            Text(String(format: "recorded: color %d · depth %d · dropped %d / %d",
+            Text(String(format: "recorded: color %d, depth %d, dropped %d / %d",
                         model.stats.colorFrames, model.stats.depthFrames, model.stats.droppedColor, model.stats.droppedDepth))
                 .font(.caption2.monospacedDigit())
 
             Button(action: model.recordTapped) {
-                Text(model.isRecording ? "Stop" : (model.isFinishing ? "Packaging…" : "Record"))
+                Text(model.isRecording ? "Stop" : "Record")
                     .font(.title2.bold()).frame(maxWidth: .infinity).padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
             .tint(model.isRecording ? .red : .accentColor)
-            .disabled(model.isStarting || model.isFinishing || model.formatSummary.isEmpty)
+            .disabled(model.isStarting || model.formatSummary.isEmpty)
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 
@@ -100,10 +82,7 @@ struct ContentView: View {
                         file.info.startTime.formatted(date: .abbreviated, time: .standard),
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
                         ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
-                    ].joined(separator: " · ")).font(.caption2.monospacedDigit())
-                    if let error = file.info.colorVideoError {
-                        Text("color video failed: \(error)").font(.caption2).foregroundStyle(.red)
-                    }
+                    ].joined(separator: ", ")).font(.caption2.monospacedDigit())
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()

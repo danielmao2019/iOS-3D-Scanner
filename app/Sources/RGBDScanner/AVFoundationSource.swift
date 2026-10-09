@@ -1,13 +1,12 @@
 import AVFoundation
+import ImageIO
 import UIKit
 
-// The front TrueDepth camera or the rear LiDAR depth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered unless the start asks for Apple's filter.
+// The front TrueDepth camera through an AVCaptureSession: color and depth come from two outputs, each frame with its own timestamp; depth is unfiltered, and the lens autofocuses when it can move.
 final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
     static var frontDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) }
-    static var rearDevice: AVCaptureDevice? { AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) }
 
     let device: AVCaptureDevice
-    private let depthSource: DepthSource
     let preview: UIView
     private let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -15,11 +14,13 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     private weak var sink: CaptureSink?
     private let queue: DispatchQueue
 
+    // Owned by queue: the start's ready and the formats it configured, until the first color frame gives the stream format.
+    private var pending: (ready: (Result<StreamFormat, Error>) -> Void, format: CaptureFormat)?
+
     // Both outputs deliver on queue, so the sink sees the frames in arrival order.
-    init(device: AVCaptureDevice, depthSource: DepthSource, sink: CaptureSink, queue: DispatchQueue) {
-        precondition(depthSource != .arkitSceneDepth, "ARKit's scene depth is not an AVFoundation source")
+    init(sink: CaptureSink, queue: DispatchQueue) {
+        guard let device = Self.frontDevice else { preconditionFailure("the front TrueDepth camera is not available") }
         self.device = device
-        self.depthSource = depthSource
         self.sink = sink
         self.queue = queue
         let view = PreviewLayerView()
@@ -38,21 +39,24 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         }
     }
 
-    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void) {
-        ready(Result {
-            // Intrinsic matrix delivery can be enabled only while the session is stopped.
-            if session.isRunning { session.stopRunning() }
-            let format = try configure(depthFiltering: depthFiltering)
+    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void) {
+        // Intrinsic matrix delivery can be enabled only while the session is stopped.
+        if session.isRunning { session.stopRunning() }
+        do {
+            let format = try configure()
+            queue.sync { pending = (ready, format) }
             session.startRunning()
-            return format.stream(depthFiltering: depthFiltering, depthSource: depthSource)
-        })
+        } catch {
+            ready(.failure(error))
+        }
     }
 
     func stop() {
         session.stopRunning()
+        queue.sync { pending = nil }
     }
 
-    private func configure(depthFiltering: Bool) throws -> CaptureFormat {
+    private func configure() throws -> CaptureFormat {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
@@ -70,8 +74,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         guard session.canAddOutput(videoOutput) else { throw RecorderError("cannot add video output") }
         session.addOutput(videoOutput)
 
-        // Off gives raw sensor depth; Apple's filter smooths the stream over time and interpolates missing values.
-        depthOutput.isFilteringEnabled = depthFiltering
+        // Raw sensor depth: Apple's filter would smooth the stream over time and interpolate missing values.
+        depthOutput.isFilteringEnabled = false
         depthOutput.alwaysDiscardsLateDepthData = false
         depthOutput.setDelegate(self, callbackQueue: queue)
         guard session.canAddOutput(depthOutput) else { throw RecorderError("cannot add depth output") }
@@ -85,6 +89,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         device.activeVideoMinFrameDuration = format.frameDuration
         device.activeVideoMaxFrameDuration = format.frameDuration
         device.activeDepthDataMinFrameDuration = format.frameDuration
+        // A lens that cannot move is fixed-focus hardware.
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
         device.unlockForConfiguration()
 
         // Frames are kept in the sensor's own orientation and unmirrored, the orientation Apple's calibration describes; how the phone was held is recorded with each frame instead.
@@ -101,8 +107,20 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { preconditionFailure("a video sample without an image") }
+        if let pending {
+            self.pending = nil
+            pending.ready(.success(pending.format.stream(firstFrame: image)))
+        }
         let matrix = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data
-        sink?.captured(color: sampleBuffer, intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } })
+        guard let exif = CMGetAttachment(sampleBuffer, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? [String: Any],
+              let exposureDuration = exif[kCGImagePropertyExifExposureTime as String] as? Double else { preconditionFailure("a video sample without its Exif exposure time") }
+        sink?.captured(color: ColorSample(
+            time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+            image: image,
+            intrinsics: matrix.map { m in m.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) } },
+            exposureDuration: exposureDuration,
+            pose: nil))
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -112,7 +130,7 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
         let map = depthData.depthDataMap
         let cal = depthData.cameraCalibrationData
-        // The depth is registered to the color camera; the calibration's intrinsics are at its reference dimensions.
+        // The depth is registered to the color camera; the calibration's intrinsics are at its reference dimensions, measured from the upper left of the frame.
         let intrinsics = cal.map { cal in
             scaled(cal.intrinsicMatrix,
                    scaleX: Float(CVPixelBufferGetWidth(map)) / Float(cal.intrinsicMatrixReferenceDimensions.width),
@@ -124,10 +142,8 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
             metres: depthData.depthDataType == kCVPixelFormatType_DepthFloat32 ? map : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap,
             confidence: nil,
             intrinsics: intrinsics,
-            calibration: cal.map { cal in { Self.describe(cal) } },
-            filtered: depthData.isDepthDataFiltered ? "1" : "0",
-            accuracy: depthData.depthDataAccuracy == .absolute ? "absolute" : "relative",
-            quality: depthData.depthDataQuality == .high ? "high" : "low"))
+            flags: DepthFlags(filtered: depthData.isDepthDataFiltered, accuracy: depthData.depthDataAccuracy, quality: depthData.depthDataQuality),
+            calibration: cal.map(Self.calibration)))
     }
 
     func depthDataOutput(_ output: AVCaptureDepthDataOutput, didDrop depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection, reason: AVCaptureOutput.DataDroppedReason) {
@@ -153,31 +169,11 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         }
     }
 
-    private static func describe(_ cal: AVCameraCalibrationData) -> [String: Any] {
-        let k = cal.intrinsicMatrix
-        let e = cal.extrinsicMatrix
-        func floats(_ data: Data?) -> [Float] {
-            guard let data else { return [] }
-            return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        }
-        return [
-            "intrinsic_matrix_row_major": [
-                [k.columns.0.x, k.columns.1.x, k.columns.2.x],
-                [k.columns.0.y, k.columns.1.y, k.columns.2.y],
-                [k.columns.0.z, k.columns.1.z, k.columns.2.z],
-            ],
-            "intrinsic_reference_width": cal.intrinsicMatrixReferenceDimensions.width,
-            "intrinsic_reference_height": cal.intrinsicMatrixReferenceDimensions.height,
-            "extrinsic_matrix_row_major_3x4": [
-                [e.columns.0.x, e.columns.1.x, e.columns.2.x, e.columns.3.x],
-                [e.columns.0.y, e.columns.1.y, e.columns.2.y, e.columns.3.y],
-                [e.columns.0.z, e.columns.1.z, e.columns.2.z, e.columns.3.z],
-            ],
-            "pixel_size_mm": cal.pixelSize,
-            "lens_distortion_center": [cal.lensDistortionCenter.x, cal.lensDistortionCenter.y],
-            "lens_distortion_lookup_table": floats(cal.lensDistortionLookupTable),
-            "inverse_lens_distortion_lookup_table": floats(cal.inverseLensDistortionLookupTable),
-        ]
+    // The parts of a depth map's calibration the recording writes beside its intrinsics.
+    private static func calibration(_ cal: AVCameraCalibrationData) -> Calibration {
+        func floats(_ data: Data) -> [Float] { data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
+        return Calibration(referenceDimensions: cal.intrinsicMatrixReferenceDimensions, distortionCenter: cal.lensDistortionCenter,
+                           lookupTable: cal.lensDistortionLookupTable.map(floats), inverseLookupTable: cal.inverseLensDistortionLookupTable.map(floats), extrinsicMatrix: cal.extrinsicMatrix)
     }
 
     // Shows the session's color stream; AVCaptureVideoPreviewLayer mirrors the front camera by default.
@@ -194,40 +190,40 @@ private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     let frameDuration: CMTime
 
-    func stream(depthFiltering: Bool, depthSource: DepthSource) -> StreamFormat {
-        let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
+    // The stream format, the color size and YCbCr matrix read from the first delivered color frame.
+    func stream(firstFrame image: CVPixelBuffer) -> StreamFormat {
         let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
         return StreamFormat(
-            colorWidth: Int(colorDims.width), colorHeight: Int(colorDims.height), colorPixelFormat: CMFormatDescriptionGetMediaSubType(color.formatDescription),
+            colorWidth: CVPixelBufferGetWidth(image), colorHeight: CVPixelBufferGetHeight(image), colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
             frameRate: 1 / CMTimeGetSeconds(frameDuration),
-            depthFilteringEnabled: depthFiltering,
-            depthSource: depthSource,
-            details: [
-                "available_depth_formats": color.supportedDepthDataFormats.map { f -> String in
-                    let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                    return "\(d.width)x\(d.height) \(fourCC(CMFormatDescriptionGetMediaSubType(f.formatDescription)))"
-                },
-            ])
+            // Apple measures the principal points of the frames' intrinsic matrices and of the depth calibration's from "the upper left of the frame".
+            principalPointOrigin: .upperLeftPixelCorner)
     }
 
-    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, at the highest frame rate both formats support.
+    // Bytes per second of uncompressed frames a recording may ask the storage to write: the iPhone 13 Pro Max's storage kept up with about 0.37 GB/s of frame writes once the first few GB were in (measured 2026-10-05 with app 4.1), and the budget leaves about 20% for an upload reading the same storage.
+    private static let storageWriteBudget = 300_000_000
+
+    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, among the pairs with a whole frame rate both formats support whose frames stay within storageWriteBudget, at the highest such rate.
     static func best(for device: AVCaptureDevice) -> CaptureFormat? {
-        let depthTypeRank: [OSType: Int] = [
-            kCVPixelFormatType_DepthFloat32: 3,
-            kCVPixelFormatType_DepthFloat16: 2,
-            kCVPixelFormatType_DisparityFloat32: 1,
-            kCVPixelFormatType_DisparityFloat16: 0,
+        // Each depth type's precision rank and bytes per pixel.
+        let depthTypes: [OSType: (rank: Int, bytesPerPixel: Int)] = [
+            kCVPixelFormatType_DepthFloat32: (3, 4),
+            kCVPixelFormatType_DepthFloat16: (2, 2),
+            kCVPixelFormatType_DisparityFloat32: (1, 4),
+            kCVPixelFormatType_DisparityFloat16: (0, 2),
         ]
         var best: (CaptureFormat, [Int])?
         for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
             let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
             for depth in color.supportedDepthDataFormats {
-                guard let rank = depthTypeRank[CMFormatDescriptionGetMediaSubType(depth.formatDescription)],
-                      let frameDuration = shortestCommonFrameDuration(color, depth) else { continue }
+                guard let depthType = depthTypes[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
                 let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                let key = [Int(depthDims.width) * Int(depthDims.height), rank, Int(colorDims.width) * Int(colorDims.height)]
+                // A 420f color frame has a Y byte per pixel, then a Cb, Cr byte pair per 2x2 pixels.
+                let bytesPerFrame = Int(colorDims.width) * Int(colorDims.height) * 3 / 2 + Int(depthDims.width) * Int(depthDims.height) * depthType.bytesPerPixel
+                guard let frameDuration = frameDurationWithinBudget(color, depth, bytesPerFrame: bytesPerFrame) else { continue }
+                let key = [Int(depthDims.width) * Int(depthDims.height), depthType.rank, Int(colorDims.width) * Int(colorDims.height)]
                 if best == nil || best!.1.lexicographicallyPrecedes(key) {
                     best = (CaptureFormat(color: color, depth: depth, frameDuration: frameDuration), key)
                 }
@@ -236,13 +232,13 @@ private struct CaptureFormat {
         return best?.0
     }
 
-    // The shortest frame duration inside a supported range of both formats.
-    private static func shortestCommonFrameDuration(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format) -> CMTime? {
+    // The frame duration, 1 / fps, of the highest whole frame rate fps inside a supported range of both formats at which bytesPerFrame a frame stays within storageWriteBudget; nil when not even 1 fps does.
+    private static func frameDurationWithinBudget(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format, bytesPerFrame: Int) -> CMTime? {
         func supports(_ format: AVCaptureDevice.Format, _ duration: CMTime) -> Bool {
             format.videoSupportedFrameRateRanges.contains { $0.minFrameDuration <= duration && duration <= $0.maxFrameDuration }
         }
-        return (color.videoSupportedFrameRateRanges + depth.videoSupportedFrameRateRanges).map(\.minFrameDuration)
-            .filter { supports(color, $0) && supports(depth, $0) }
-            .min()
+        return stride(from: storageWriteBudget / bytesPerFrame, through: 1, by: -1).lazy
+            .map { CMTime(value: 1, timescale: Int32($0)) }
+            .first { supports(color, $0) && supports(depth, $0) }
     }
 }

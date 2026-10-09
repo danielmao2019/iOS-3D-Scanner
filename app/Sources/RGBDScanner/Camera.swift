@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// A depth camera the phone may have: the front TrueDepth camera, recorded through AVFoundation, or the rear LiDAR camera, recorded through AVFoundation or ARKit as the rear depth-source setting chooses.
+// A depth camera the phone may have: the front TrueDepth camera, recorded through AVFoundation, or the rear LiDAR camera, recorded through ARKit's scene depth.
 enum DepthCamera: String, CaseIterable, Identifiable, Codable {
     case front, rear
 
@@ -13,69 +13,84 @@ enum DepthCamera: String, CaseIterable, Identifiable, Codable {
     var isAvailable: Bool {
         switch self {
         case .front: return AVFoundationSource.frontDevice != nil
-        case .rear: return AVFoundationSource.rearDevice != nil && ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        case .rear: return ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
         }
     }
 }
 
-// Where a recording's depth comes from, as metadata.json's depth_source names it: the front camera has one source, the rear camera two.
-enum DepthSource: String, CaseIterable, Decodable {
-    // The TrueDepth camera through AVFoundation.
-    case avfoundationTrueDepth = "avfoundation_truedepth"
-    // The LiDAR depth camera through AVFoundation, at its highest depth resolution.
-    case avfoundationLiDAR = "avfoundation_lidar"
-    // ARKit's scene depth, densified by Apple, down to about 0.2 m, with confidence; with the depth filter on, its temporally smoothed variant.
-    case arkitSceneDepth = "arkit_scene_depth"
-
-    var camera: DepthCamera { self == .avfoundationTrueDepth ? .front : .rear }
+// Where a camera's intrinsics measure the principal point from, as the recording's intrinsics files name it.
+enum PrincipalPointOrigin: String, Codable {
+    // The corner of the frame: AVFoundation's "upper left of the frame".
+    case upperLeftPixelCorner = "upper_left_pixel_corner"
+    // The center of the upper-left pixel, as ARCamera.h says of ARCamera.intrinsics.
+    case upperLeftPixelCenter = "upper_left_pixel_center"
 }
 
-// The streams a capture source delivers, as a recording writes and describes them.
-struct StreamFormat {
+// The streams a capture source delivers, as a recording writes them; every color frame is 420f.
+struct StreamFormat: Codable {
     let colorWidth: Int
     let colorHeight: Int
-    let colorPixelFormat: OSType
+    // The first color frame's kCVImageBufferYCbCrMatrixKey, e.g. ITU_R_709_2: the matrix that turns its YCbCr into RGB.
+    let colorYCbCrMatrix: String
     let depthWidth: Int
     let depthHeight: Int
     let depthPixelFormat: OSType
     // The pixel format of the per-pixel confidence maps, the size of the depth maps; nil when the source delivers none.
     let confidencePixelFormat: OSType?
     let frameRate: Double
-    // Whether the source smooths depth over time and fills holes: AVCaptureDepthDataOutput.isFilteringEnabled through AVFoundation, smoothedSceneDepth instead of sceneDepth through ARKit.
-    let depthFilteringEnabled: Bool
-    let depthSource: DepthSource
-    // Source-specific entries for metadata.json.
-    let details: [String: Any]
+    // Where both streams' intrinsics measure the principal point from.
+    let principalPointOrigin: PrincipalPointOrigin
 
+    // A Y byte per pixel, then a Cb, Cr byte pair per 2x2 pixels.
+    var colorBytesPerFrame: Int { colorWidth * colorHeight * 3 / 2 }
     var depthBytesPerPixel: Int { [kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DisparityFloat16].contains(depthPixelFormat) ? 2 : 4 }
+    var depthBytesPerFrame: Int { depthWidth * depthHeight * depthBytesPerPixel }
 
     var summary: String {
-        "color \(colorWidth)×\(colorHeight) · depth \(depthWidth)×\(depthHeight) \(fourCC(depthPixelFormat))\(depthFilteringEnabled ? " filtered" : "") · \(String(format: "%.0f", frameRate)) fps"
+        "color \(colorWidth)x\(colorHeight), depth \(depthWidth)x\(depthHeight) \(fourCC(depthPixelFormat)), \(String(format: "%.0f", frameRate)) fps"
     }
+}
 
-    // Describes the streams for metadata.json.
-    func describe() -> [String: Any] {
-        var described: [String: Any] = [
-            "color_width": colorWidth,
-            "color_height": colorHeight,
-            "color_pixel_format": fourCC(colorPixelFormat),
-            "depth_width": depthWidth,
-            "depth_height": depthHeight,
-            "depth_pixel_format": fourCC(depthPixelFormat),
-            "depth_bytes_per_pixel": depthBytesPerPixel,
-            "depth_source": depthSource.rawValue,
-            "depth_filtering_enabled": depthFilteringEnabled,
-            "frame_rate": frameRate,
-        ]
-        if let confidencePixelFormat {
-            precondition(confidencePixelFormat == kCVPixelFormatType_OneComponent8, "confidence pixel format \(fourCC(confidencePixelFormat)) is not one byte per pixel")
-            described["confidence_pixel_format"] = fourCC(confidencePixelFormat)
-            described["confidence_bytes_per_pixel"] = 1
-            described["confidence_description"] = "confidence.bin: one map per depth map, in depth.bin's order and layout (map n occupies bytes [n*depth_width*depth_height, (n+1)*depth_width*depth_height), rows tightly packed), UInt8 per pixel, ARConfidenceLevel of the depth pixel: 0 low, 1 medium, 2 high"
-        }
-        described.merge(details) { _, _ in preconditionFailure("source details repeat a stream key") }
-        return described
-    }
+// Where ARKit placed the rear camera when it captured a color frame.
+struct Pose {
+    // ARKit's tracking state when it estimated the pose: normal, not_available or limited_<reason>.
+    let trackingState: String
+    // ARCamera.transform: from ARKit's camera frame to its world frame, in metres.
+    let worldFromCamera: simd_float4x4
+}
+
+// A color frame as a source delivers it, with what the recording writes about it.
+struct ColorSample {
+    let time: CMTime
+    // As delivered, 420f.
+    let image: CVPixelBuffer
+    // In color pixels; nil when the frame came without them.
+    let intrinsics: matrix_float3x3?
+    // The frame's own exposure time, in seconds.
+    let exposureDuration: Double
+    // ARKit's pose of the rear camera; nil for the front, which has none.
+    let pose: Pose?
+}
+
+// What AVDepthData says of a front depth map.
+struct DepthFlags {
+    // isDepthDataFiltered.
+    let filtered: Bool
+    let accuracy: AVDepthData.Accuracy
+    let quality: AVDepthData.Quality
+}
+
+// What a front depth map's AVCameraCalibrationData says beyond the map's intrinsics; it describes the color camera the depth is registered to.
+struct Calibration {
+    // intrinsicMatrixReferenceDimensions: the image size the intrinsic matrix and the distortion center are in.
+    let referenceDimensions: CGSize
+    // lensDistortionCenter, in reference pixels, measured from the frame's corner as the intrinsic matrix is.
+    let distortionCenter: CGPoint
+    // lensDistortionLookupTable and inverseLensDistortionLookupTable, radius-normalized; nil when Apple gives none, which leaves the lens distortion unknown.
+    let lookupTable: [Float]?
+    let inverseLookupTable: [Float]?
+    // extrinsicMatrix: from the depth camera to the color camera, rotation and translation in metres.
+    let extrinsicMatrix: matrix_float4x3
 }
 
 // A depth map as a source delivers it, with what the recording writes about it.
@@ -89,17 +104,15 @@ struct DepthSample {
     let confidence: CVPixelBuffer?
     // In depth-map pixels; nil when the map came without calibration.
     let intrinsics: matrix_float3x3?
-    // The full calibration, described for metadata.json, computed only for the recording's first depth map.
-    let calibration: (() -> [String: Any])?
-    // The depth.csv cells filtered, accuracy and quality.
-    let filtered: String
-    let accuracy: String
-    let quality: String
+    // The front's; nil for the rear.
+    let flags: DepthFlags?
+    // The front's calibration of this map; nil when the map came without one, and always for the rear, which has none.
+    let calibration: Calibration?
 }
 
 // Where a capture source delivers frames, on the queue it was given; a color frame comes before a depth frame with the same timestamp.
 protocol CaptureSink: AnyObject {
-    func captured(color: CMSampleBuffer, intrinsics: matrix_float3x3?)
+    func captured(color: ColorSample)
     func droppedColor(at time: CMTime, reason: String)
     func captured(depth: DepthSample)
     func droppedDepth(at time: CMTime, reason: String)
@@ -111,20 +124,37 @@ protocol CaptureSink: AnyObject {
 protocol CaptureSource: AnyObject {
     // Shows the live color stream; made on the main queue.
     var preview: UIView { get }
-    // The capture device whose rotation gives each frame's upright rotation.
+    // The capture device whose rotation gives each color frame's upright rotation.
     var device: AVCaptureDevice { get }
-    // Starts delivering frames, depth filtered or not; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
-    func start(depthFiltering: Bool, ready: @escaping (Result<StreamFormat, Error>) -> Void)
+    // Starts delivering frames; calls ready, on any queue, once with the stream format, or the reason capture cannot start.
+    func start(ready: @escaping (Result<StreamFormat, Error>) -> Void)
     func stop()
 }
 
-// An intrinsic matrix with x scaled by scaleX and y by scaleY, e.g. from one image size to another.
+// The YCbCr matrix of a delivered color frame, which must be 420f: its kCVImageBufferYCbCrMatrixKey, e.g. ITU_R_709_2.
+func ycbcrMatrix(_ image: CVPixelBuffer) -> String {
+    precondition(CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "color frame is \(fourCC(CVPixelBufferGetPixelFormatType(image))), not 420f")
+    guard let matrix = CVBufferCopyAttachment(image, kCVImageBufferYCbCrMatrixKey, nil) as? String else { preconditionFailure("color frame names no YCbCr matrix") }
+    return matrix
+}
+
+// An intrinsic matrix whose principal point is measured from the upper-left corner of the image (AVFoundation's "upper left of the frame"), carried to an image of the same view scaleX times as wide and scaleY times as tall: f' = f * scale, c' = c * scale.
 func scaled(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3x3 {
     var s = k
     s.columns.0.x *= scaleX
     s.columns.2.x *= scaleX
     s.columns.1.y *= scaleY
     s.columns.2.y *= scaleY
+    return s
+}
+
+// ARKit's intrinsics, in capturedImage pixels with the principal point measured from the center of the upper-left pixel, carried to its scene depth map, scaleX times as wide and scaleY times as tall, as the depth grid lies on the image, which six rear scans (2026-09-30 to 2026-10-02) measured from where depth edges land on color edges, x and y differing: along x the depth grid's first column center sits on the image's first column center, cx' = cx * scaleX; along y the depth rows span the image rows edge to edge, cy' = (cy + 0.5) * scaleY - 0.5; the focal lengths scale, f' = f * scale.
+func arkitDepthIntrinsics(_ k: matrix_float3x3, scaleX: Float, scaleY: Float) -> matrix_float3x3 {
+    var s = k
+    s.columns.0.x *= scaleX
+    s.columns.1.y *= scaleY
+    s.columns.2.x *= scaleX
+    s.columns.2.y = (k.columns.2.y + 0.5) * scaleY - 0.5
     return s
 }
 
