@@ -1,6 +1,6 @@
-"""Reads an RGBD Scanner recording, a format_version "4.8" directory or a "4.0" to "4.7" tar, through one interface: its per-frame color and depth rows, its color frames, depth maps and the rear's confidence maps memory-mapped in place, never copied (a front recording is about 0.55 GB per second), the rear's poses and, from 4.8, the front frames' lens distortion, each depth frame's depth-to-color transform and the frame files' recorded sizes and SHA-256s. format_version is "4.<minor>", the version of the app that wrote it, the minor naming the app build. This docstring is the format's document; app/Sources/RGBDScanner/Recording.swift's header comment describes the writer.
+"""Reads an RGBD Scanner recording, an uncompressed tar of format_version "4.0" to "4.8", through one interface: its per-frame color and depth rows, its color frames, depth maps and the rear's confidence maps memory-mapped in place at each member's data offset inside the tar, never extracted (a front recording is about 0.55 GB per second), the rear's poses and, from 4.8, the front frames' lens distortion, each depth frame's depth-to-color transform and the frame files' recorded sizes and SHA-256s. format_version is "4.<minor>", the version of the app that wrote it, the minor naming the app build. This docstring is the format's document; app/Sources/RGBDScanner/Recording.swift's header comment describes the writer.
 
-Format 4.8. A recording is a directory <scan_id>/ holding exactly scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, color_intrinsics.json, depth_intrinsics.json, extrinsics.json and, for the rear, depth_frames_confidence.bin; the phone keeps it as Documents/<scan_id>/, and server/receive.py stores it as <out>/<scan_id>/. scan_id is rgbd_<yyyyMMdd_HHmmss>_<camera>, followed by _<the user's name for it reduced to [A-Za-z0-9_-], at most 40 characters> when the user named it. Each concern has one file: intrinsic parameters and extrinsics never share a file, and no file repeats another's indices or timestamps, frame n of a .bin file being entry n of its frames list.
+Format 4.8. A recording is <scan_id>.tar, whose members are exactly <scan_id>/<file> for scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, color_intrinsics.json, depth_intrinsics.json, extrinsics.json and, for the rear, depth_frames_confidence.bin. The phone keeps these files as Documents/<scan_id>/ and uploads them one by one, and server/receive.py, once all of them have arrived with their checksums, writes them into <out>/<scan_id>.tar in the upload manifest's order, a GNU tar (a member can exceed 8 GiB). scan_id is rgbd_<yyyyMMdd_HHmmss>_<camera>, followed by _<the user's name for it reduced to [A-Za-z0-9_-], at most 40 characters> when the user named it. Each concern has one file: intrinsic parameters and extrinsics never share a file, and no file repeats another's indices or timestamps, frame n of a .bin file being entry n of its frames list.
 
 The camera is "front", the TrueDepth camera through AVFoundation (color 4032x3024 and depth 640x480 at 15 fps on the test phone), or "rear", the LiDAR camera through ARKit world tracking (color 1920x1440, scene depth 256x192 with its confidence, 60 fps); depth filtering is always off. Every timestamp is a capture time in host-clock (CMClockGetHostTimeClock) seconds, one clock for every file; a color frame and a depth frame were captured together when their timestamps are equal (`pairs`). Pixels, intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; `upright` turns a frame the way the phone was held.
 
@@ -16,9 +16,9 @@ color_intrinsics.json and depth_intrinsics.json each hold image_width and image_
 
 extrinsics.json holds depth_to_color, each distinct 3x4 row-major transform (rotation, then translation in metres) from a depth frame's camera to the color camera once, with depth_frame_ranges, inclusive runs of the depth frames it applies to, which together cover every depth frame with a known transform exactly once: for the front, each depth frame's AVCameraCalibrationData.extrinsicMatrix (identity in practice, Apple registering depth to color), a depth frame without a calibration in no run; for the rear, identity for every depth frame (ARKit registering scene depth to the captured image). The rear's camera_poses[n] is color frame n's pose: tracking_state (normal, not_available, limited_initializing, limited_excessive_motion, limited_insufficient_features or limited_relocalizing) and world_from_camera, rows 0 to 2 of ARCamera.transform, row-major: the transform from ARKit's camera frame (+x toward increasing column of the sensor-oriented image, +y toward decreasing row, +z toward the viewer, looking along -z) to its gravity-aligned world frame (+y up, origin where tracking started), metres; `world_from_camera` returns it as a 4x4 matrix.
 
-`color_rows` and `depth_rows` give both layouts one row per frame, delivered or dropped, in time order, every value a string: index (-1 on a dropped row), timestamp, dropped (a dropped row's reason; its other cells are empty) and fx, fy, cx, cy (empty when the frame came without intrinsics); color rows add upright_rotation_deg, gravity_x, gravity_y, gravity_z, gravity_ts (empty before the first motion sample), exposure_duration_s and, for the rear, tracking_state and world_from_camera_00 to world_from_camera_23; front depth rows add filtered ("1" or "0"), accuracy and quality. `colors` and `depths` are the delivered rows, frame n the row with index n.
+`color_rows` and `depth_rows` give every version one row per frame, delivered or dropped, in time order, every value a string: index (-1 on a dropped row), timestamp, dropped (a dropped row's reason; its other cells are empty) and fx, fy, cx, cy (empty when the frame came without intrinsics); color rows add upright_rotation_deg, gravity_x, gravity_y, gravity_z, gravity_ts (empty before the first motion sample), exposure_duration_s and, for the rear, tracking_state and world_from_camera_00 to world_from_camera_23; front depth rows add filtered ("1" or "0"), accuracy and quality. `colors` and `depths` are the delivered rows, frame n the row with index n.
 
-Formats 4.0 to 4.7 differ as follows. A recording is an uncompressed POSIX ustar tar whose members sit under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front); color.bin, depth.bin (always "fdep") and confidence.bin are laid out as color_frames.bin, depth_frames.bin and depth_frames_confidence.bin and are memory-mapped at each member's data offset inside the tar. metadata.json holds the scan's facts under other names (id, device_model, system_version, color_width, color_ycbcr_matrix, depth_width, ...) with frame counts, byte sizes, depth_source, focus and prose conventions, and no file records the frames' sizes or SHA-256s. color.csv and depth.csv are `color_rows` and `depth_rows` as written, but depth rows also carry upright_rotation_deg, gravity and bytes_per_row (the delivered map's row stride, which depth.bin drops), and color.csv lacks exposure_duration_s before minor 3 and, from minor 3, also has lens_position (the capture device's lensPosition, 0 to 1) and received_ts (the host-clock seconds at which the app received the frame), both read when the frame reached the app and so later than its exposure by the capture pipeline's latency. The front's calibration.jsonl holds one line per delivered depth map, in depth.csv's order, {"index", "timestamp", "calibration"}, the map's AVCameraCalibrationData described at its reference dimensions, or null when it came without one; nothing records the color frames' distortion or depth-to-color transform. Minors 4 to 6 add to a rear recording's metadata.json avfoundation_calibration, Apple's calibration of the wide camera ARKit captures through, taken through AVFoundation as the rear camera started: its intrinsic matrix at its own reference dimensions, extrinsics, pixel size, lens distortion center and lookup tables, with the camera's lens position and the host-clock seconds when it was taken. It does not describe ARKit's frames, whatever its avfoundation_calibration_description says: measured on four rear takes (2026-10-06 and 2026-10-07), their straight edges bow against its tables' prediction with the opposite sign and a different radial profile, 1.3 times the prediction near the center and 0.6 times toward the edges; minor 7 no longer records it.
+Formats 4.0 to 4.7 differ as follows. A recording's tar, POSIX ustar as apps 4.0 to 4.5 streamed it and GNU from app 4.6 on, when the receiver began assembling it, has its members under <id>/: metadata.json, color.bin, color.csv, depth.bin, depth.csv, and confidence.bin (rear) or calibration.jsonl (front); color.bin, depth.bin (always "fdep") and confidence.bin are laid out as color_frames.bin, depth_frames.bin and depth_frames_confidence.bin. metadata.json holds the scan's facts under other names (id, device_model, system_version, color_width, color_ycbcr_matrix, depth_width, ...) with frame counts, byte sizes, depth_source, focus and prose conventions, and no file records the frames' sizes or SHA-256s. color.csv and depth.csv are `color_rows` and `depth_rows` as written, but depth rows also carry upright_rotation_deg, gravity and bytes_per_row (the delivered map's row stride, which depth.bin drops), and color.csv lacks exposure_duration_s before minor 3 and, from minor 3, also has lens_position (the capture device's lensPosition, 0 to 1) and received_ts (the host-clock seconds at which the app received the frame), both read when the frame reached the app and so later than its exposure by the capture pipeline's latency. The front's calibration.jsonl holds one line per delivered depth map, in depth.csv's order, {"index", "timestamp", "calibration"}, the map's AVCameraCalibrationData described at its reference dimensions, or null when it came without one; nothing records the color frames' distortion or depth-to-color transform. Minors 4 to 6 add to a rear recording's metadata.json avfoundation_calibration, Apple's calibration of the wide camera ARKit captures through, taken through AVFoundation as the rear camera started: its intrinsic matrix at its own reference dimensions, extrinsics, pixel size, lens distortion center and lookup tables, with the camera's lens position and the host-clock seconds when it was taken. It does not describe ARKit's frames, whatever its avfoundation_calibration_description says: measured on four rear takes (2026-10-06 and 2026-10-07), their straight edges bow against its tables' prediction with the opposite sign and a different radial profile, 1.3 times the prediction near the center and 0.6 times toward the edges; minor 7 no longer records it.
 """
 
 import csv
@@ -61,12 +61,12 @@ YCBCR_MATRICES = {"ITU_R_601_4": (0.299, 0.114), "ITU_R_709_2": (0.2126, 0.0722)
 
 
 class Recording:
-    """A format_version "4.8" recording directory or "4.0" to "4.7" recording tar: its metadata and per-frame rows read, its frames memory-mapped in place."""
+    """A format_version "4.0" to "4.8" recording tar: its metadata and per-frame rows read, its frames memory-mapped in place inside it."""
 
     # Every format's.
     path: Path
     format_version: str
-    # The minor of format_version: 0 to 7 for a tar, 8 for a directory.
+    # The minor of format_version, 0 to 8.
     format_minor: int
     camera: str
     scan_id: str
@@ -89,22 +89,22 @@ class Recording:
     color: np.memmap
     depth: np.memmap
     confidence: Optional[np.memmap]
-    # A tar's metadata.json and, for the front, calibration.jsonl's lines; None for a directory.
+    # Format 4.0 to 4.7's metadata.json and, for the front, calibration.jsonl's lines; None for 4.8.
     meta: Optional[Dict]
     calibrations: Optional[List[Dict]]
-    # A directory's JSON files as read; None for a tar.
+    # Format 4.8's JSON files as read; None for 4.0 to 4.7.
     scan_metadata: Optional[Dict]
     color_frames_metadata: Optional[Dict]
     depth_frames_metadata: Optional[Dict]
     color_intrinsics: Optional[Dict]
     depth_intrinsics: Optional[Dict]
     extrinsics: Optional[Dict]
-    # A directory's frame files, each with the size and SHA-256 its frames metadata records; None for a tar.
+    # Format 4.8's frame files, each with the size and SHA-256 its frames metadata records; None for 4.0 to 4.7.
     frame_files: Optional[Dict[str, Tuple[int, str]]]
-    # A front directory's distortions entry of each color and depth frame, or None for a frame in no run; None for a rear directory and a tar.
+    # A front 4.8 recording's distortions entry of each color and depth frame, or None for a frame in no run; None for a rear one and for 4.0 to 4.7.
     color_distortions: Optional[List[Optional[Dict]]]
     depth_distortions: Optional[List[Optional[Dict]]]
-    # A directory's depth_to_color matrix of each depth frame, 3 x 4 float64, or None for a frame in no run; None for a tar.
+    # Format 4.8's depth_to_color matrix of each depth frame, 3 x 4 float64, or None for a frame in no run; None for 4.0 to 4.7.
     depth_to_color: Optional[List[Optional[np.ndarray]]]
 
     def __init__(self, path: Union[str, Path]) -> None:
@@ -119,34 +119,35 @@ class Recording:
         path = _normalize_inputs()
 
         self.path = path
-        if path.is_dir():
-            self._read_directory()
-        else:
-            self._read_tar()
+        # Mode "r:" opens an uncompressed tar only, the one whose members can be memory-mapped in place.
+        with tarfile.open(path, "r:") as tar:
+            members = {Path(m.name).name: m for m in tar.getmembers()}
+            # Format 4.8 names its metadata scan_metadata.json, 4.0 to 4.7 metadata.json.
+            if "scan_metadata.json" in members:
+                self._read_4_8(tar, members)
+            else:
+                self._read_4_0_to_4_7(tar, members)
         self.colors = [r for r in self.color_rows if r["index"] != "-1"]
         self.depths = [r for r in self.depth_rows if r["index"] != "-1"]
 
-    def _read_tar(self) -> None:
-        """Reads a format 4.0 to 4.7 tar, its .bin members memory-mapped in place inside it."""
-        # Mode "r:" opens an uncompressed tar only, the one whose members can be memory-mapped in place.
-        with tarfile.open(self.path, "r:") as tar:
-            members = {Path(m.name).name: m for m in tar.getmembers()}
-            assert "metadata.json" in members, sorted(members)
-            self.meta = json.load(tar.extractfile(members["metadata.json"]))
-            # Major 4, the minor naming the app build that wrote it; from minor 8 on, a recording is a directory.
-            version = re.fullmatch(r"4\.([0-7])", self.meta["format_version"])
-            assert version is not None, self.meta["format_version"]
-            self.format_version = self.meta["format_version"]
-            self.format_minor = int(version.group(1))
-            camera = self.meta["camera"]
-            assert camera in CAMERA_MEMBERS, camera
-            names = sorted(m.name for m in tar.getmembers())
-            assert names == sorted(f"{self.meta['id']}/{name}" for name in MEMBERS | CAMERA_MEMBERS[camera]), names
-            self.color_rows = read_table(tar, members["color.csv"], color_header(camera, self.format_minor))
-            self.depth_rows = read_table(tar, members["depth.csv"], DEPTH_HEADERS[camera])
-            self.calibrations = None
-            if camera == "front":
-                self.calibrations = [json.loads(line) for line in tar.extractfile(members["calibration.jsonl"]).read().decode().splitlines()]
+    def _read_4_0_to_4_7(self, tar: tarfile.TarFile, members: Dict[str, tarfile.TarInfo]) -> None:
+        """Reads a format 4.0 to 4.7 tar's members, its .bin members memory-mapped in place inside it."""
+        assert "metadata.json" in members, sorted(members)
+        self.meta = json.load(tar.extractfile(members["metadata.json"]))
+        # Major 4, the minor naming the app build that wrote it; minor 8 names its metadata scan_metadata.json.
+        version = re.fullmatch(r"4\.([0-7])", self.meta["format_version"])
+        assert version is not None, self.meta["format_version"]
+        self.format_version = self.meta["format_version"]
+        self.format_minor = int(version.group(1))
+        camera = self.meta["camera"]
+        assert camera in CAMERA_MEMBERS, camera
+        names = sorted(m.name for m in tar.getmembers())
+        assert names == sorted(f"{self.meta['id']}/{name}" for name in MEMBERS | CAMERA_MEMBERS[camera]), names
+        self.color_rows = read_table(tar, members["color.csv"], color_header(camera, self.format_minor))
+        self.depth_rows = read_table(tar, members["depth.csv"], DEPTH_HEADERS[camera])
+        self.calibrations = None
+        if camera == "front":
+            self.calibrations = [json.loads(line) for line in tar.extractfile(members["calibration.jsonl"]).read().decode().splitlines()]
         meta = self.meta
         self.camera, self.scan_id, self.frame_rate = camera, meta["id"], meta["frame_rate"]
         self.color_width, self.color_height, self.ycbcr_matrix = meta["color_width"], meta["color_height"], meta["color_ycbcr_matrix"]
@@ -165,21 +166,17 @@ class Recording:
         self.scan_metadata = self.color_frames_metadata = self.depth_frames_metadata = self.color_intrinsics = self.depth_intrinsics = self.extrinsics = None
         self.frame_files = self.color_distortions = self.depth_distortions = self.depth_to_color = None
 
-    def _read_directory(self) -> None:
-        """Reads a format 4.8 directory, checking that it holds exactly its camera's files, every list one entry per frame, every run within the frames and disjoint from the others, and every frame file the frames its metadata counts at the size it records."""
-        directory = self.path
-        names = sorted(p.name for p in directory.iterdir())
-        assert "scan_metadata.json" in names, names
-
+    def _read_4_8(self, tar: tarfile.TarFile, members: Dict[str, tarfile.TarInfo]) -> None:
+        """Reads a format 4.8 tar's members, checking that they are exactly its camera's files under <scan_id>/, every list one entry per frame, every run within the frames and disjoint from the others, and every frame member the frames its metadata counts at the size it records, memory-mapped in place inside the tar."""
         def load(name: str) -> Dict:
-            return json.loads((directory / name).read_text())
+            return json.load(tar.extractfile(members[name]))
 
         self.scan_metadata = load("scan_metadata.json")
         assert self.scan_metadata["format_version"] == "4.8", self.scan_metadata["format_version"]
         camera = self.scan_metadata["camera"]
         assert camera in CAMERA_FILES, camera
-        assert names == sorted(FILES | CAMERA_FILES[camera]), names
-        assert directory.name == self.scan_metadata["scan_id"], (directory.name, self.scan_metadata["scan_id"])
+        names = sorted(m.name for m in tar.getmembers())
+        assert names == sorted(f"{self.scan_metadata['scan_id']}/{name}" for name in FILES | CAMERA_FILES[camera]), names
         self.format_version, self.format_minor = "4.8", 8
         self.camera, self.scan_id, self.frame_rate = camera, self.scan_metadata["scan_id"], self.scan_metadata["frame_rate"]
         self.meta = self.calibrations = None
@@ -192,18 +189,18 @@ class Recording:
         assert color["file"] == "color_frames.bin" and color["pixel_format"] == "420f" and width % 2 == 0 and height % 2 == 0, (color["file"], color["pixel_format"], width, height)
         assert depth["file"] == "depth_frames.bin" and depth["pixel_format"] in DEPTH_DTYPES, (depth["file"], depth["pixel_format"])
         assert color["frame_count"] == len(color["frames"]) and depth["frame_count"] == len(depth["frames"]), (color["frame_count"], len(color["frames"]), depth["frame_count"], len(depth["frames"]))
-        self.color = map_file(directory, color, np.dtype(np.uint8), (height * 3 // 2, width), color["frame_count"])
+        self.color = map_counted_frames(self.path, members[color["file"]], color, np.dtype(np.uint8), (height * 3 // 2, width), color["frame_count"])
         depth_shape = (self.depth_height, self.depth_width)
-        self.depth = map_file(directory, depth, DEPTH_DTYPES[depth["pixel_format"]], depth_shape, depth["frame_count"])
+        self.depth = map_counted_frames(self.path, members[depth["file"]], depth, DEPTH_DTYPES[depth["pixel_format"]], depth_shape, depth["frame_count"])
         assert ("confidence" in depth) == (camera == "rear"), sorted(depth)
         frame_files = [color, depth]
         self.confidence = None
         if camera == "rear":
             confidence = depth["confidence"]
             assert confidence["file"] == "depth_frames_confidence.bin" and confidence["pixel_format"] == "L008", (confidence["file"], confidence["pixel_format"])
-            self.confidence = map_file(directory, confidence, np.dtype(np.uint8), depth_shape, depth["frame_count"])
+            self.confidence = map_counted_frames(self.path, members[confidence["file"]], confidence, np.dtype(np.uint8), depth_shape, depth["frame_count"])
             frame_files.append(confidence)
-        # Whether each SHA-256 is the file's own is for inspect_recording to check, which reads every byte.
+        # Whether each SHA-256 is its member's own is for inspect_recording to check, which reads every byte.
         assert all(re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) for f in frame_files), [f["sha256"] for f in frame_files]
         self.frame_files = {f["file"]: (f["size"], f["sha256"]) for f in frame_files}
 
@@ -302,14 +299,14 @@ def map_frames(tar_path: Path, member: tarfile.TarInfo, dtype: np.dtype, frame_s
     return np.memmap(tar_path, dtype=dtype, mode="r", offset=member.offset_data, shape=(frames, *frame_shape))
 
 
-def map_file(directory: Path, entry: Dict, dtype: np.dtype, frame_shape: Tuple[int, int], frames: int) -> np.memmap:
-    """A format 4.8 frame file, named by its frames metadata entry, memory-mapped read-only as frames x frame_shape of dtype, once the size the entry records and its size on disk both hold exactly that many frames."""
+def map_counted_frames(tar_path: Path, member: tarfile.TarInfo, entry: Dict, dtype: np.dtype, frame_shape: Tuple[int, int], frames: int) -> np.memmap:
+    """A format 4.8 frame member memory-mapped as `map_frames` maps it, once the size its frames metadata entry records and its size in the tar both hold exactly `frames` frames."""
     def _validate_inputs() -> None:
-        assert entry["size"] == frames * dtype.itemsize * frame_shape[0] * frame_shape[1] == (directory / entry["file"]).stat().st_size, (entry["file"], entry["size"], frames, frame_shape, (directory / entry["file"]).stat().st_size)
+        assert entry["size"] == frames * dtype.itemsize * frame_shape[0] * frame_shape[1] == member.size, (member.name, entry["size"], frames, frame_shape, member.size)
 
     _validate_inputs()
 
-    return np.memmap(directory / entry["file"], dtype=dtype, mode="r", shape=(frames, *frame_shape))
+    return map_frames(tar_path, member, dtype, frame_shape)
 
 
 def per_frame(entries: List[Dict], ranges_key: str, count: int) -> List[Optional[Dict]]:

@@ -1,8 +1,8 @@
-"""Decodes RGBD Scanner recordings (format_version "4.8" directories and "4.0" to "4.7" .tars) into per-frame files in a directory next to each recording: a tar's named like the tar without .tar, a directory's named like it with _decoded added.
+"""Decodes RGBD Scanner recordings (.tar, format_version "4.0" to "4.8") into per-frame files in a directory next to each tar, named like the tar without .tar.
 
-Each output directory holds color/<index:06d>.png (every color frame converted from full-range YCbCr 4:2:0 to BGR through the recording's ycbcr_matrix, 8-bit lossless PNG, sensor orientation), depth/<index:06d>.npy (metres, sensor orientation, the map as stored, Float32 or a 4.8 "hdep" recording's Float16, NaN and 0 kept), confidence/<index:06d>.npy (uint8 ARConfidenceLevel, rear recordings), the recording's every other file copied verbatim (a directory's six JSON files; a tar's tables, metadata.json and, for a front recording, calibration.jsonl), and decoded.json, a machine summary. A directory is decoded under <name>.partial and renamed when complete, so an existing output directory is complete and is skipped unless --force.
+Each output directory holds color/<index:06d>.png (every color frame converted from full-range YCbCr 4:2:0 to BGR through the recording's ycbcr_matrix, 8-bit lossless PNG, sensor orientation), depth/<index:06d>.npy (metres, sensor orientation, the map as stored, Float32 or a 4.8 "hdep" recording's Float16, NaN and 0 kept), confidence/<index:06d>.npy (uint8 ARConfidenceLevel, rear recordings), the recording's every other member copied verbatim (4.8's six JSON files; 4.0 to 4.7's tables, metadata.json and, for a front recording, calibration.jsonl), and decoded.json, a machine summary. A directory is decoded under <name>.partial and renamed when complete, so an existing output directory is complete and is skipped unless --force.
 
-Usage: python tools/decode_recording.py <recording directory, recording.tar, or directory of recordings...> [--force]
+Usage: python tools/decode_recording.py <recording.tar or directory of recordings...> [--force]
 """
 
 import argparse
@@ -50,29 +50,22 @@ def size(folder: Path) -> int:
     return sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
 
 
-def decode(path: Path, out: Path) -> Dict:
+def decode(tar_path: Path, out: Path) -> Dict:
     """Decodes one recording into out and returns its decoded.json summary."""
-    rec = Recording(path)
-    # Format 4.8 is a directory; 4.0 to 4.7 a tar.
-    directory = rec.format_minor >= 8
-    color_bin, depth_bin, confidence_bin = ("color_frames.bin", "depth_frames.bin", "depth_frames_confidence.bin") if directory else ("color.bin", "depth.bin", "confidence.bin")
+    rec = Recording(tar_path)
+    # The frame members' names, format 4.8's or 4.0 to 4.7's.
+    color_bin, depth_bin, confidence_bin = ("color_frames.bin", "depth_frames.bin", "depth_frames_confidence.bin") if rec.format_minor >= 8 else ("color.bin", "depth.bin", "confidence.bin")
     print(f"  {rec.camera}, {len(rec.colors)} color rows with an index, {len(rec.depths)} depth rows with an index", flush=True)
     out.mkdir()
 
-    # The .bin files are decoded below; every other file is text, copied as it is.
     copied = []
-    if directory:
-        for p in sorted(rec.path.iterdir()):
-            if p.suffix != ".bin":
-                shutil.copyfile(p, out / p.name)
-                copied.append(p.name)
-    else:
-        with tarfile.open(rec.path, "r:") as tar:
-            for m in tar.getmembers():
-                name = Path(m.name).name
-                if not name.endswith(".bin"):
-                    (out / name).write_bytes(tar.extractfile(m).read())
-                    copied.append(name)
+    with tarfile.open(tar_path, "r:") as tar:
+        for m in tar.getmembers():
+            name = Path(m.name).name
+            # The .bin members are decoded below; every other member is text, copied as it is.
+            if not name.endswith(".bin"):
+                (out / name).write_bytes(tar.extractfile(m).read())
+                copied.append(name)
 
     assert rec.color.shape[0] == len(rec.colors), f"{color_bin} holds {rec.color.shape[0]} frames, the color rows {len(rec.colors)} with an index"
     n_color = write_color(rec, out)
@@ -81,7 +74,7 @@ def decode(path: Path, out: Path) -> Dict:
     write_maps(rec.depth, out / "depth")
     depth_shape = {"width": rec.depth_width, "height": rec.depth_height}
     summary = {
-        "source": rec.path.name,
+        "source": tar_path.name,
         "format_version": rec.format_version,
         "camera": rec.camera,
         "copied": sorted(copied),
@@ -108,19 +101,15 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    # A format 4.8 recording is a directory holding color_frames.bin, which no decoded directory does.
-    recordings: List[Path] = []
+    tars: List[Path] = []
     for p in args.inputs:
         assert p.exists(), p
-        if p.is_file() or (p / "color_frames.bin").is_file():
-            recordings.append(p)
-        else:
-            recordings += sorted(p.rglob("*.tar")) + sorted(f.parent for f in p.rglob("color_frames.bin"))
-    assert recordings and all(r.suffix == ".tar" or (r / "color_frames.bin").is_file() for r in recordings), recordings
+        tars += sorted(p.rglob("*.tar")) if p.is_dir() else [p]
+    assert tars and all(t.suffix == ".tar" for t in tars), tars
 
-    for path in recordings:
-        out = path.with_suffix("") if path.suffix == ".tar" else path.with_name(f"{path.name}_decoded")
-        print(f"{path}", flush=True)
+    for tar_path in tars:
+        out = tar_path.with_suffix("")
+        print(f"{tar_path}", flush=True)
         if out.exists() and not args.force:
             assert (out / "decoded.json").is_file(), f"{out} exists without decoded.json"
             print(f"  skipped: {out} is complete", flush=True)
@@ -130,7 +119,7 @@ def main() -> None:
         if partial.exists():
             shutil.rmtree(partial)
         start = time.time()
-        summary = decode(path, partial)
+        summary = decode(tar_path, partial)
         if out.exists():
             shutil.rmtree(out)
         partial.rename(out)

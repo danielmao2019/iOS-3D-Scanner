@@ -1,6 +1,6 @@
-"""Receives recordings uploaded by the RGBD Scanner app and stores each as the directory <out>/<scan_id>/.
+"""Receives recordings uploaded by the RGBD Scanner app and stores each as the single file <out>/<scan_id>.tar.
 
-The app uploads a recording (format_version "4.8", as tools/rgbd_recording.py documents) one file at a time, each a PUT with headers X-Upload-Token (must match server/token) and X-Content-SHA256 (the file's SHA-256 as 64 lowercase hex characters): PUT /upload/<scan_id>/<file> for each of the recording's files (scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, depth_frames_confidence.bin for the rear, color_intrinsics.json, depth_intrinsics.json, extrinsics.json), then PUT /upload/<scan_id>/manifest.json, {"members": [{"name", "size", "sha256"}, ...]}; any other file name is refused with 404. Each request streams its body into its own temporary file in <out>/.staging/<scan_id>/ while hashing it and, when the hash matches, renames it to the file's name beside <name>.sha256, the hash it was checked against, so concurrent uploads of one file cannot interfere and a stored file is always complete; a body whose hash does not match is refused with 400. After each stored file, once the manifest and every file it lists are stored with its size and SHA-256, the listed files are moved into a temporary directory in <out> that is renamed to <out>/<scan_id>/, so the recording appears whole, holding exactly those files, and <out>/.staging/<scan_id>, with the manifest and the hashes, is removed. A recording whose <out>/<scan_id>/ already exists is not stored over it: that is logged and its staging directory kept. GET /ping answers {"ok": true}.
+The app uploads a recording (format_version "4.8", as tools/rgbd_recording.py documents) one file at a time, each a PUT with headers X-Upload-Token (must match server/token) and X-Content-SHA256 (the file's SHA-256 as 64 lowercase hex characters): PUT /upload/<scan_id>/<file> for each of the recording's files (scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, depth_frames_confidence.bin for the rear, color_intrinsics.json, depth_intrinsics.json, extrinsics.json), then PUT /upload/<scan_id>/manifest.json, {"members": [{"name", "size", "sha256"}, ...]}; any other file name is refused with 404. Each request streams its body into its own temporary file in <out>/.staging/<scan_id>/ while hashing it and, when the hash matches, renames it to the file's name beside <name>.sha256, the hash it was checked against, so concurrent uploads of one file cannot interfere and a stored file is always complete; a body whose hash does not match is refused with 400. After each stored file, once the manifest and every file it lists are stored with its size and SHA-256, the listed files are written as <out>/<scan_id>.tar, an uncompressed GNU tar (a member can exceed 8 GiB) holding exactly them under <scan_id>/ in the manifest's order, through a temporary file in <out> renamed into place, so the archive appears whole, and <out>/.staging/<scan_id>, with the manifest and the hashes, is removed. A recording whose <out>/<scan_id>.tar already exists is not stored over it: that is logged and its staging directory kept. GET /ping answers {"ok": true}.
 """
 
 import argparse
@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,20 +37,25 @@ def staged_files(staging: Path) -> Optional[List[str]]:
 
 
 def store(out_dir: Path, scan_id: str, names: List[str]) -> Path:
-    """Moves the staged files `names` of a recording into a temporary directory in <out> renamed to <out>/<scan_id>/, then removes its staging directory; returns the recording's directory."""
+    """Writes the staged files `names` of a recording as <out>/<scan_id>.tar, an uncompressed GNU tar holding them under <scan_id>/ in that order, through a temporary file in <out> renamed into place, then removes its staging directory; returns the archive's path."""
     staging = out_dir / ".staging" / scan_id
-    part = Path(tempfile.mkdtemp(dir=out_dir, prefix=f".{scan_id}.", suffix=".part"))
-    for name in names:
-        os.rename(staging / name, part / name)
-    part.chmod(0o775)
-    recording = out_dir / scan_id
-    os.rename(part, recording)
+    archive = out_dir / f"{scan_id}.tar"
+    fd, part_name = tempfile.mkstemp(dir=out_dir, prefix=f".{archive.name}.", suffix=".part")
+    part = Path(part_name)
+    try:
+        with os.fdopen(fd, "wb") as f, tarfile.open(fileobj=f, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            for name in names:
+                tar.add(staging / name, arcname=f"{scan_id}/{name}", recursive=False)
+        part.chmod(0o664)
+        os.replace(part, archive)
+    finally:
+        part.unlink(missing_ok=True)
     shutil.rmtree(staging)
-    return recording
+    return archive
 
 
 def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
-    # One recording is stored at a time, so two files completing it together cannot both move it.
+    # One recording is stored at a time, so two files completing it together cannot both write its archive.
     storing = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -117,14 +123,14 @@ def make_handler(out_dir: Path, token: str) -> Type[BaseHTTPRequestHandler]:
                 part.unlink(missing_ok=True)
             self.log_message("stored %s (%d bytes)", stored, length)
             self.reply(200, {"stored": str(stored), "size": length, "sha256": expected})
-            # After the reply, so the phone is not kept waiting while the recording is moved into place.
+            # After the reply, so the phone is not kept waiting while a long recording's files are copied into its archive.
             with storing:
                 names = staged_files(staging)
                 if names is None:
                     return
-                recording = out_dir / scan_id
-                if recording.exists():
-                    self.log_message("not stored: %s exists, %s kept", recording, staging)
+                archive = out_dir / f"{scan_id}.tar"
+                if archive.exists():
+                    self.log_message("not stored: %s exists, %s kept", archive, staging)
                 else:
                     self.log_message("stored recording %s", store(out_dir, scan_id, names))
 

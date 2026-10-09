@@ -1,6 +1,6 @@
-"""Renders every color frame of an RGBD Scanner recording (a format_version "4.8" directory or a "4.0" to "4.7" .tar), converted to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel, turned upright as the latest delivered color frame was.
+"""Renders every color frame of an RGBD Scanner recording (.tar, format_version "4.0" to "4.8"), converted to BGR, upright, side by side with the depth map captured at the same instant, as an H.264 video; a depth map whose color frame was dropped is shown next to a "color lost" panel, turned upright as the latest delivered color frame was.
 
-Usage: python tools/render_video.py <recording directory or .tar> <out.mp4> --ffmpeg <ffmpeg with libx264>
+Usage: python tools/render_video.py <recording.tar> <out.mp4> --ffmpeg <ffmpeg with libx264>
 """
 
 import argparse
@@ -37,12 +37,12 @@ def legend(width: int, lo: float, hi: float) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("recording", type=Path)
+    parser.add_argument("tar", type=Path)
     parser.add_argument("out", type=Path)
     parser.add_argument("--ffmpeg", required=True)
     args = parser.parse_args()
 
-    rec = Recording(args.recording)
+    rec = Recording(args.tar)
     assert rec.color.shape[0] == len(rec.colors), f"the color frames are {rec.color.shape[0]}, the delivered color rows {len(rec.colors)}"
     lo, hi = np.percentile(rec.depth[valid(rec.depth)], [2, 98])
     depth_at = {c["timestamp"]: d for c, d in rec.pairs()}
