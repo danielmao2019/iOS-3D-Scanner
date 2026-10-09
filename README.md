@@ -1,5 +1,39 @@
 # iOS-3D-Scanner
 
+## Setup
+
+You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth camera (TrueDepth on the front; LiDAR on the back of Pro models), a USB cable, and an Apple ID (a free one works).
+
+### 1. Prepare the computer (once)
+- Mac: install Xcode from the App Store and open it once, run `brew install xtool-org/tap/xtool`, then run `xtool setup`, choose Password and sign in with your Apple ID.
+- Linux: install Swift from swift.org/install/linux, run `sudo apt-get install usbmuxd`, download Xcode.xip from developer.apple.com/download/all, put the xtool AppImage from the xtool GitHub releases on your PATH as `xtool`, then run `xtool setup`, choose Password, sign in, and give it the path to Xcode.xip.
+- Windows: install WSL (Ubuntu) and usbipd, attach the iPhone to WSL with usbipd, and follow the Linux steps inside WSL.
+
+### 2. Get the code
+- `git clone https://github.com/danielmao2019/iOS-3D-Scanner && cd iOS-3D-Scanner`
+- `git checkout daniel/tasks/20261001_conclude_ablation_and_improve` (v4.8 lives on this branch until it is merged into main).
+- `echo http://<computer-ip>:8765 > server/url`, the address the app uploads to; it can be changed later in the app.
+- Linux and WSL: `export USBMUXD_SOCKET_ADDRESS=UNIX:/var/run/usbmuxd` in every new terminal before building.
+- Mac: delete the line `. ~/.local/share/swiftly/env.sh` from `app/build.sh`, since Swift comes with Xcode there.
+
+### 3. Install the app
+- Plug in the iPhone, unlock it and tap Trust.
+- `cd app && ./build.sh run` builds, signs and installs RGBD Scanner.
+- On the iPhone, turn on Settings > Privacy & Security > Developer Mode and restart, then trust your Apple ID under Settings > General > VPN & Device Management.
+- With a free Apple ID the app stops opening after 7 days; run `./build.sh run` again, and recordings already on the phone are kept.
+
+### 4. Receive recordings
+- In the same clone, run `python3 server/receive.py --out <folder>`; it listens on port 8765 and checks the upload token the build wrote to `server/token`.
+- Put the phone and the computer on the same Wi-Fi and allow port 8765 through the firewall. Campus Wi-Fi often blocks traffic between devices.
+- Each recording arrives as `<folder>/<scan_id>.tar`. `tools/rgbd_recording.py` reads it and documents its format, and `python3 tools/inspect_recording.py <tar>` checks it.
+
+### 5. Record
+- Open the app and allow the camera and local network access.
+- Choose Front or Rear, tap Record, name the recording or tap Later, then tap Stop.
+- Uploads start by themselves and continue after the app leaves the screen, but stop if the app is closed from the app switcher.
+- Recordings are uncompressed: about 18 GB per minute for the front and 16 GB per minute for the rear.
+- The rear lens distortion and the front depth offset are not in the recordings; they are measured once per phone.
+
 ## App versions
 
 Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on.
