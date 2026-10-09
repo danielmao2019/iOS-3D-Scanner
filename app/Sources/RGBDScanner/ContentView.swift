@@ -35,7 +35,7 @@ struct ContentView: View {
                 if model.isRecording {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         let s = Int(context.date.timeIntervalSince(model.recordingStart))
-                        Text(String(format: "● REC %d:%02d", s / 60, s % 60))
+                        Text(String(format: "REC %d:%02d", s / 60, s % 60))
                             .font(.caption.monospacedDigit()).padding(4)
                             .background(.red).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 4)).padding(6)
                     }
@@ -52,9 +52,9 @@ struct ContentView: View {
             }
 
             Text(model.formatSummary).font(.caption)
-            Text(String(format: "depth valid %.0f%% · median %.2f m", model.stats.depthValidFraction * 100, model.stats.depthMedianMeters))
+            Text(String(format: "depth valid %.0f%%, median %.2f m", model.stats.depthValidFraction * 100, model.stats.depthMedianMeters))
                 .font(.caption2.monospacedDigit())
-            Text(String(format: "recorded: color %d · depth %d · dropped %d / %d",
+            Text(String(format: "recorded: color %d, depth %d, dropped %d / %d",
                         model.stats.colorFrames, model.stats.depthFrames, model.stats.droppedColor, model.stats.droppedDepth))
                 .font(.caption2.monospacedDigit())
 
@@ -82,7 +82,7 @@ struct ContentView: View {
                         file.info.startTime.formatted(date: .abbreviated, time: .standard),
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
                         ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
-                    ].joined(separator: " · ")).font(.caption2.monospacedDigit())
+                    ].joined(separator: ", ")).font(.caption2.monospacedDigit())
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()

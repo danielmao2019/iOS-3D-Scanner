@@ -96,7 +96,7 @@ final class DepthPreview {
         case (90, true): return .leftMirrored
         case (180, true): return .downMirrored
         case (270, true): return .rightMirrored
-        default: preconditionFailure("upright rotation \(degrees)° is not a multiple of 90°")
+        default: preconditionFailure("upright rotation \(degrees) deg is not a multiple of 90 deg")
         }
     }
 }

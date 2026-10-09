@@ -47,7 +47,7 @@ struct StreamFormat: Codable {
     var depthBytesPerFrame: Int { depthWidth * depthHeight * depthBytesPerPixel }
 
     var summary: String {
-        "color \(colorWidth)×\(colorHeight) · depth \(depthWidth)×\(depthHeight) \(fourCC(depthPixelFormat)) · \(String(format: "%.0f", frameRate)) fps"
+        "color \(colorWidth)x\(colorHeight), depth \(depthWidth)x\(depthHeight) \(fourCC(depthPixelFormat)), \(String(format: "%.0f", frameRate)) fps"
     }
 }
 

@@ -194,7 +194,7 @@ final class Recording {
         precondition(CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "color frame is \(fourCC(CVPixelBufferGetPixelFormatType(image))), not 420f")
         precondition(CVPixelBufferGetWidthOfPlane(image, 0) == width && CVPixelBufferGetHeightOfPlane(image, 0) == height
                      && CVPixelBufferGetWidthOfPlane(image, 1) == width / 2 && CVPixelBufferGetHeightOfPlane(image, 1) == height / 2,
-                     "a \(CVPixelBufferGetWidth(image))×\(CVPixelBufferGetHeight(image)) 420f frame differs from the stream format's \(width)×\(height)")
+                     "a \(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) 420f frame differs from the stream format's \(width)x\(height)")
         // Plane 0 has a Y byte per pixel, plane 1 a Cb, Cr byte pair per 2x2 pixels, so a row of either is width bytes.
         let planeRows = [height, height / 2]
         let buffer = bufferLock.withLock { freeColorBuffers.popLast() } ?? newColorBuffer()
@@ -223,7 +223,7 @@ final class Recording {
     // Copies the map's rows without their padding, then writes and hashes them off the capture queue.
     private func writeMap(_ map: CVPixelBuffer, width: Int, height: Int, pixelFormat: OSType, bytesPerPixel: Int, to file: FramesFile) {
         precondition(CVPixelBufferGetWidth(map) == width && CVPixelBufferGetHeight(map) == height && CVPixelBufferGetPixelFormatType(map) == pixelFormat,
-                     "\(CVPixelBufferGetWidth(map))×\(CVPixelBufferGetHeight(map)) \(fourCC(CVPixelBufferGetPixelFormatType(map))) map differs from the stream format's \(width)×\(height) \(fourCC(pixelFormat))")
+                     "\(CVPixelBufferGetWidth(map))x\(CVPixelBufferGetHeight(map)) \(fourCC(CVPixelBufferGetPixelFormatType(map))) map differs from the stream format's \(width)x\(height) \(fourCC(pixelFormat))")
         let rowBytes = width * bytesPerPixel
         var bytes = Data(count: rowBytes * height)
         CVPixelBufferLockBaseAddress(map, .readOnly)

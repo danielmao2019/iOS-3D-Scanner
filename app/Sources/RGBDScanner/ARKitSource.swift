@@ -114,7 +114,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         let map = depth.depthMap
         let depthWidth = CVPixelBufferGetWidth(map), depthHeight = CVPixelBufferGetHeight(map)
         guard colorWidth * depthHeight == colorHeight * depthWidth else {
-            return .failure(RecorderError("ARKit color \(colorWidth)×\(colorHeight) and depth \(depthWidth)×\(depthHeight) differ in aspect ratio"))
+            return .failure(RecorderError("ARKit color \(colorWidth)x\(colorHeight) and depth \(depthWidth)x\(depthHeight) differ in aspect ratio"))
         }
         guard let confidence = depth.confidenceMap else { return .failure(RecorderError("ARKit scene depth came without confidence")) }
         precondition(CVPixelBufferGetWidth(confidence) == depthWidth && CVPixelBufferGetHeight(confidence) == depthHeight, "confidence map differs in size from the depth map")

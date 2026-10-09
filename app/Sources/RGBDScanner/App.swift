@@ -43,7 +43,7 @@ enum UploadState: Equatable {
         switch self {
         case .notUploaded: return "not uploaded"
         case .inProgress(let step): return step
-        case .uploaded: return "uploaded ✓"
+        case .uploaded: return "uploaded"
         case .failed(let message): return "upload failed: \(message)"
         }
     }
@@ -254,7 +254,7 @@ final class AppModel: ObservableObject {
     }
 
     private func finish(_ recording: Recording, userName: String?, stopNote: String?) {
-        message = [stopNote, "Saving…"].compactMap { $0 }.joined(separator: ". ")
+        message = [stopNote, "Saving..."].compactMap { $0 }.joined(separator: ". ")
         recording.finish(userName: userName) { result in
             DispatchQueue.main.async { self.finished(result, note: stopNote) }
         }
