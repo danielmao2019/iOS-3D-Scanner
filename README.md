@@ -38,14 +38,13 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 
 Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on.
 
-### v4.8 (2026-10-08, 0fb92cb; fixed 2026-10-09 in 7404d9f and 2a93830)
+### v4.8 (2026-10-08, 0fb92cb; fixed 2026-10-09 in 7404d9f)
 - Package contents: v4.7 packed `metadata.json`, `color.csv`, `depth.csv`, `color.bin`, `depth.bin`, and `calibration.jsonl` (front) or `confidence.bin` (rear). v4.8 packs `scan_metadata.json`, `color_frames.bin`, `color_frames_metadata.json`, `depth_frames.bin`, `depth_frames_metadata.json`, `color_intrinsics.json`, `depth_intrinsics.json`, `extrinsics.json`, and `depth_frames_confidence.bin` (rear).
 - Intrinsic parameters and extrinsics: v4.7 stored each color frame's intrinsic matrix in `color.csv` next to ARKit's pose, and Apple's intrinsic parameters in `calibration.jsonl` next to Apple's extrinsic matrix. v4.8 stores all intrinsic parameters in `color_intrinsics.json` and `depth_intrinsics.json`, and all extrinsics in `extrinsics.json`.
 - Front calibration: v4.7 repeated Apple's full calibration on every depth frame. v4.8 stores each distinct distortion table and depth-to-color transform once, with the ranges of frames it applies to.
 - Checksums: v4.7 sent each file's SHA-256 only in the upload manifest. v4.8 also stores the size and SHA-256 of each frame file in `color_frames_metadata.json` and `depth_frames_metadata.json`.
 - Phone identity: v4.7 recorded the phone model. v4.8 also records the phone's ID, which names the phone's correction file.
 - Removed fields: v4.7 recorded the lens position, the arrival time, orientation on depth rows, the row stride, byte counts, the filter flag, the focus mode, the depth source, the camera's format lists and prose descriptions of the format. v4.8 records none of them, and the format is documented in `tools/rgbd_recording.py`.
-- Displayed text: v4.7 showed non-ASCII symbols in the recording indicator, status lines, gallery rows and messages. v4.8 shows ASCII text only.
 
 ### v4.7 (2026-10-07, 9b4b230)
 - Rear calibration: v4.6 stored Apple's AVFoundation calibration in every rear recording. v4.7 stores none, because measurements showed that calibration does not describe ARKit's frames.
