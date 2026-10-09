@@ -220,7 +220,7 @@ private struct CaptureFormat {
             for depth in color.supportedDepthDataFormats {
                 guard let depthType = depthTypes[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
                 let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                // A 420f color frame has a Y byte per pixel, then a Cb, Cr byte pair per 2 × 2 pixels.
+                // A 420f color frame has a Y byte per pixel, then a Cb, Cr byte pair per 2x2 pixels.
                 let bytesPerFrame = Int(colorDims.width) * Int(colorDims.height) * 3 / 2 + Int(depthDims.width) * Int(depthDims.height) * depthType.bytesPerPixel
                 guard let frameDuration = frameDurationWithinBudget(color, depth, bytesPerFrame: bytesPerFrame) else { continue }
                 let key = [Int(depthDims.width) * Int(depthDims.height), depthType.rank, Int(colorDims.width) * Int(colorDims.height)]

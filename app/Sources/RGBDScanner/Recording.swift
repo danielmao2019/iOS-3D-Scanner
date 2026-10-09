@@ -13,7 +13,7 @@ import simd
 //
 // The recording's files (format_version "4.8", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build), under <id>/:
 //   scan_metadata.json             the scan as a whole: format_version, scan_id, name, start time, duration, phone model, id and iOS version, camera, frame rate, and whether it was recovered after the app stopped
-//   color_frames.bin               every delivered color frame exactly as the camera delivered it, uncompressed, with no header: frame n occupies bytes [n*w*h*3/2, (n+1)*w*h*3/2); each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, h rows of w bytes (a Y byte per pixel), then its CbCr plane, h/2 rows of w bytes (a Cb, Cr byte pair per 2×2 pixels), rows tightly packed; its RGB is through ycbcr_matrix
+//   color_frames.bin               every delivered color frame exactly as the camera delivered it, uncompressed, with no header: frame n occupies bytes [n*w*h*3/2, (n+1)*w*h*3/2); each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, h rows of w bytes (a Y byte per pixel), then its CbCr plane, h/2 rows of w bytes (a Cb, Cr byte pair per 2x2 pixels), rows tightly packed; its RGB is through ycbcr_matrix
 //   color_frames_metadata.json     color_frames.bin's size, SHA-256, format and frame count; each delivered frame's timestamp, upright rotation (the clockwise rotation that turns it upright), CoreMotion gravity in the phone's device frame with its sample's timestamp, and exposure time; the dropped frames, each with its timestamp and why it was dropped (e.g. late, out_of_buffers, writer_busy)
 //   depth_frames.bin               depth maps exactly as delivered, concatenated with no header, rows tightly packed, little-endian, pixel_format "fdep" (Float32 metres) or "hdep" (Float16 metres); NaN or 0 marks a pixel without a reading
 //   depth_frames_metadata.json     depth_frames.bin's size, SHA-256, format and frame count, and the rear's depth_frames_confidence.bin's; each delivered map's timestamp and, for the front, AVDepthData's filtered, accuracy and quality; the dropped maps (e.g. no_scene_depth)
@@ -195,7 +195,7 @@ final class Recording {
         precondition(CVPixelBufferGetWidthOfPlane(image, 0) == width && CVPixelBufferGetHeightOfPlane(image, 0) == height
                      && CVPixelBufferGetWidthOfPlane(image, 1) == width / 2 && CVPixelBufferGetHeightOfPlane(image, 1) == height / 2,
                      "a \(CVPixelBufferGetWidth(image))×\(CVPixelBufferGetHeight(image)) 420f frame differs from the stream format's \(width)×\(height)")
-        // Plane 0 has a Y byte per pixel, plane 1 a Cb, Cr byte pair per 2 × 2 pixels, so a row of either is width bytes.
+        // Plane 0 has a Y byte per pixel, plane 1 a Cb, Cr byte pair per 2x2 pixels, so a row of either is width bytes.
         let planeRows = [height, height / 2]
         let buffer = bufferLock.withLock { freeColorBuffers.popLast() } ?? newColorBuffer()
         CVPixelBufferLockBaseAddress(image, .readOnly)

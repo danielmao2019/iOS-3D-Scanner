@@ -41,7 +41,7 @@ struct StreamFormat: Codable {
     // Where both streams' intrinsics measure the principal point from.
     let principalPointOrigin: PrincipalPointOrigin
 
-    // A Y byte per pixel, then a Cb, Cr byte pair per 2 × 2 pixels.
+    // A Y byte per pixel, then a Cb, Cr byte pair per 2x2 pixels.
     var colorBytesPerFrame: Int { colorWidth * colorHeight * 3 / 2 }
     var depthBytesPerPixel: Int { [kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DisparityFloat16].contains(depthPixelFormat) ? 2 : 4 }
     var depthBytesPerFrame: Int { depthWidth * depthHeight * depthBytesPerPixel }

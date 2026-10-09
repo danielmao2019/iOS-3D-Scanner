@@ -17,7 +17,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     // The session delivers its frames on queue.
     init(sink: CaptureSink, queue: DispatchQueue) {
-        // The world-tracking video format with the largest captured image, then the highest frame rate, among those with the scene depth map's 4:3 aspect ratio (256×192), since the depth intrinsics are carried over from the color image.
+        // The world-tracking video format with the largest captured image, then the highest frame rate, among those with the scene depth map's 4:3 aspect ratio (256x192), since the depth intrinsics are carried over from the color image.
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats.filter { $0.imageResolution.width * 3 == $0.imageResolution.height * 4 }
         guard let videoFormat = formats.max(by: { a, b in
             (a.imageResolution.width * a.imageResolution.height, a.framesPerSecond) < (b.imageResolution.width * b.imageResolution.height, b.framesPerSecond)
@@ -141,7 +141,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
         required init?(coder: NSCoder) { preconditionFailure("not used from a storyboard") }
 
-        // ponytail: a fixed 90° turns the rear camera's landscape images upright on a portrait-only screen; follow the interface orientation if the app ever rotates.
+        // ponytail: a fixed 90 deg turns the rear camera's landscape images upright on a portrait-only screen; follow the interface orientation if the app ever rotates.
         override func layoutSubviews() {
             super.layoutSubviews()
             CATransaction.begin()
