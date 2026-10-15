@@ -11,6 +11,8 @@ goal: improve user experience
 
 ## 1. Guidelines
 
+The builds this task produces are enumerated from 5.0. Every solved problem is a subversion (doesn't have to happen in order). e.g., once you solve problem 2, then that's 5.0, and once you solve problem 1 afterwards, that's 5.1.
+
 ### 1.1. Problem 1
 
 Long scans may cause the device out of space (study the logs to see the details of the issue).
