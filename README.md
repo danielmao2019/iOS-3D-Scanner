@@ -11,7 +11,6 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 
 ### 2. Get the code
 - `git clone https://github.com/danielmao2019/iOS-3D-Scanner && cd iOS-3D-Scanner`
-- `git checkout daniel/tasks/20261001_conclude_ablation_and_improve` (v4.8 lives on this branch until it is merged into main).
 - `echo http://<computer-ip>:8765 > server/url`, the address the app uploads to; it can be changed later in the app.
 - Linux and WSL: `export USBMUXD_SOCKET_ADDRESS=UNIX:/var/run/usbmuxd` in every new terminal before building.
 - Mac: delete the line `. ~/.local/share/swiftly/env.sh` from `app/build.sh`, since Swift comes with Xcode there.
