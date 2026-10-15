@@ -31,7 +31,11 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 - Choose Front or Rear, tap Record, name the recording or tap Later, then tap Stop.
 - With a server config, a recording's frames upload while it records, in segments of about 64 MB, each deleted from the phone once the computer has stored it; the rest uploads after Stop, and once the computer answers that the recording is stored in its data root, the recording leaves the phone, and the config's list shows the recordings the computer holds in that data root. With This phone, every user's first config, it stays on the phone and uploads nowhere, and only these recordings have a delete button. Uploads continue after the app leaves the screen, but stop if the app is closed from the app switcher.
 - Recordings are compressed losslessly, both cameras at 15 fps: about 1.6 GB per minute for the front and 1.3 GB per minute for the rear, depending on the scene.
-- The rear lens distortion and the front depth offset are not in the recordings; they are measured once per phone.
+- Three things the frames need are not in the recordings and are measured once per phone (step 6): the rear lens distortion, the front lens distortion left after Apple's table, and the front depth offset from color.
+
+### 6. Align recordings
+- `python3 tools/phone_corrections.py --phone-id <phone_id> --phone-model <model> --rear <tars> --front-lens <tars> --front-corners <tars> --out <folder>` measures the phone's corrections from recordings that phone made and writes `<folder>/<phone_id>.json`. The rear and front-lens recordings show long straight edges, such as door frames, whiteboards and ceiling tiles; each front-corner recording sweeps across an outward corner with the phone held upright, upside down and sideways both ways. `phone_id` is in each recording's `scan_metadata.json`.
+- `python3 tools/align_recording.py <scan_id>.tar --corrections <phone_id>.json --out <folder>` writes `<folder>/<scan_id>.tar`, the aligned recording: each color frame matches its color intrinsic matrix, each depth frame matches its depth intrinsic matrix, and each depth frame lies on its same-instant color frame. `tools/rgbd_recording.py` reads it like any recording, and `tools/align_recording.py` documents how it differs.
 
 ## App versions
 
