@@ -12,6 +12,8 @@ goal: improve user experience
 
 ### 1.1. Problem 1
 
+Long scans may cause the device out of space (study the logs to see the details of the issue).
+
 ## 2. Definition of Done
 
 All problems listed above solved.
