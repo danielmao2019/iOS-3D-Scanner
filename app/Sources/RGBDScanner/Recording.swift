@@ -11,7 +11,7 @@ import simd
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal. Frame n of a .bin file is entry n of every frames list that describes it.
 // All pixels, the intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; each color frame records how the phone was held.
 //
-// The recording's files (format_version "4.8", the version of the app that wrote it, <major>.<minor>, the major the app version (v4) and the minor naming the app build), under <id>/:
+// The recording's files (format_version "5.0.0", the version of the app that wrote it, <major>.<minor>.<patch>), under <id>/:
 //   scan_metadata.json             the scan as a whole: format_version, scan_id, name, start time, duration, phone model, id and iOS version, camera, frame rate, and whether it was recovered after the app stopped
 //   color_frames.bin               every delivered color frame exactly as the camera delivered it, uncompressed, with no header: frame n occupies bytes [n*w*h*3/2, (n+1)*w*h*3/2); each is "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, h rows of w bytes (a Y byte per pixel), then its CbCr plane, h/2 rows of w bytes (a Cb, Cr byte pair per 2x2 pixels), rows tightly packed; its RGB is through ycbcr_matrix
 //   color_frames_metadata.json     color_frames.bin's size, SHA-256, format and frame count; each delivered frame's timestamp, upright rotation (the clockwise rotation that turns it upright), CoreMotion gravity in the phone's device frame with its sample's timestamp, and exposure time; the dropped frames, each with its timestamp and why it was dropped (e.g. late, out_of_buffers, writer_busy)
@@ -420,7 +420,7 @@ final class Recording {
         let depthToColor: [[[Float]]?] = front ? depth.map(\.depthToColor) : Array(repeating: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], count: depth.count)
         let members = try [
             json("scan_metadata.json", ScanMetadata(
-                formatVersion: "4.8", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
+                formatVersion: "5.0.0", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
                 phoneId: Nullable(start.phoneId), iosVersion: start.iosVersion, camera: start.camera, frameRate: format.frameRate, recovered: hashes == nil)),
             colorFrames,
             json("color_frames_metadata.json", ColorFramesMetadata(

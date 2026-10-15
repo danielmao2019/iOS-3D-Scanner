@@ -38,6 +38,8 @@ struct StreamFormat: Codable {
     // The pixel format of the per-pixel confidence maps, the size of the depth maps; nil when the source delivers none.
     let confidencePixelFormat: OSType?
     let frameRate: Double
+    // Every source delivers color and depth at this rate.
+    static let framesPerSecond = 15
     // Where both streams' intrinsics measure the principal point from.
     let principalPointOrigin: PrincipalPointOrigin
 

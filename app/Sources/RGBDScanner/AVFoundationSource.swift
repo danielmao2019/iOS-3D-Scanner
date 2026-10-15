@@ -86,9 +86,9 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
         try device.lockForConfiguration()
         device.activeFormat = format.color
         device.activeDepthDataFormat = format.depth
-        device.activeVideoMinFrameDuration = format.frameDuration
-        device.activeVideoMaxFrameDuration = format.frameDuration
-        device.activeDepthDataMinFrameDuration = format.frameDuration
+        device.activeVideoMinFrameDuration = CaptureFormat.frameDuration
+        device.activeVideoMaxFrameDuration = CaptureFormat.frameDuration
+        device.activeDepthDataMinFrameDuration = CaptureFormat.frameDuration
         // A lens that cannot move is fixed-focus hardware.
         if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
         device.unlockForConfiguration()
@@ -185,10 +185,11 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
 
 // The color and depth formats a recording uses, and the frame duration both streams share.
 private struct CaptureFormat {
+    // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
+    static let frameDuration = CMTime(value: 1, timescale: CMTimeScale(StreamFormat.framesPerSecond))
+
     let color: AVCaptureDevice.Format
     let depth: AVCaptureDevice.Format
-    // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
-    let frameDuration: CMTime
 
     // The stream format, the color size and YCbCr matrix read from the first delivered color frame.
     func stream(firstFrame image: CVPixelBuffer) -> StreamFormat {
@@ -197,48 +198,37 @@ private struct CaptureFormat {
             colorWidth: CVPixelBufferGetWidth(image), colorHeight: CVPixelBufferGetHeight(image), colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
-            frameRate: 1 / CMTimeGetSeconds(frameDuration),
+            frameRate: Double(StreamFormat.framesPerSecond),
             // Apple measures the principal points of the frames' intrinsic matrices and of the depth calibration's from "the upper left of the frame".
             principalPointOrigin: .upperLeftPixelCorner)
     }
 
-    // Bytes per second of uncompressed frames a recording may ask the storage to write: the iPhone 13 Pro Max's storage kept up with about 0.37 GB/s of frame writes once the first few GB were in (measured 2026-10-05 with app 4.1), and the budget leaves about 20% for an upload reading the same storage.
-    private static let storageWriteBudget = 300_000_000
-
-    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, among the pairs with a whole frame rate both formats support whose frames stay within storageWriteBudget, at the highest such rate.
+    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, among the pairs whose formats both run at frameDuration.
     static func best(for device: AVCaptureDevice) -> CaptureFormat? {
-        // Each depth type's precision rank and bytes per pixel.
-        let depthTypes: [OSType: (rank: Int, bytesPerPixel: Int)] = [
-            kCVPixelFormatType_DepthFloat32: (3, 4),
-            kCVPixelFormatType_DepthFloat16: (2, 2),
-            kCVPixelFormatType_DisparityFloat32: (1, 4),
-            kCVPixelFormatType_DisparityFloat16: (0, 2),
+        // Each depth type's precision rank.
+        let depthRanks: [OSType: Int] = [
+            kCVPixelFormatType_DepthFloat32: 3,
+            kCVPixelFormatType_DepthFloat16: 2,
+            kCVPixelFormatType_DisparityFloat32: 1,
+            kCVPixelFormatType_DisparityFloat16: 0,
         ]
         var best: (CaptureFormat, [Int])?
-        for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+        for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && supportsFrameDuration(color) {
             let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
-            for depth in color.supportedDepthDataFormats {
-                guard let depthType = depthTypes[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
+            for depth in color.supportedDepthDataFormats where supportsFrameDuration(depth) {
+                guard let depthRank = depthRanks[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
                 let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                // A 420f color frame has a Y byte per pixel, then a Cb, Cr byte pair per 2 × 2 pixels.
-                let bytesPerFrame = Int(colorDims.width) * Int(colorDims.height) * 3 / 2 + Int(depthDims.width) * Int(depthDims.height) * depthType.bytesPerPixel
-                guard let frameDuration = frameDurationWithinBudget(color, depth, bytesPerFrame: bytesPerFrame) else { continue }
-                let key = [Int(depthDims.width) * Int(depthDims.height), depthType.rank, Int(colorDims.width) * Int(colorDims.height)]
+                let key = [Int(depthDims.width) * Int(depthDims.height), depthRank, Int(colorDims.width) * Int(colorDims.height)]
                 if best == nil || best!.1.lexicographicallyPrecedes(key) {
-                    best = (CaptureFormat(color: color, depth: depth, frameDuration: frameDuration), key)
+                    best = (CaptureFormat(color: color, depth: depth), key)
                 }
             }
         }
         return best?.0
     }
 
-    // The frame duration, 1 / fps, of the highest whole frame rate fps inside a supported range of both formats at which bytesPerFrame a frame stays within storageWriteBudget; nil when not even 1 fps does.
-    private static func frameDurationWithinBudget(_ color: AVCaptureDevice.Format, _ depth: AVCaptureDevice.Format, bytesPerFrame: Int) -> CMTime? {
-        func supports(_ format: AVCaptureDevice.Format, _ duration: CMTime) -> Bool {
-            format.videoSupportedFrameRateRanges.contains { $0.minFrameDuration <= duration && duration <= $0.maxFrameDuration }
-        }
-        return stride(from: storageWriteBudget / bytesPerFrame, through: 1, by: -1).lazy
-            .map { CMTime(value: 1, timescale: Int32($0)) }
-            .first { supports(color, $0) && supports(depth, $0) }
+    // Whether frameDuration lies inside one of the format's supported frame rate ranges.
+    private static func supportsFrameDuration(_ format: AVCaptureDevice.Format) -> Bool {
+        format.videoSupportedFrameRateRanges.contains { $0.minFrameDuration <= frameDuration && frameDuration <= $0.maxFrameDuration }
     }
 }

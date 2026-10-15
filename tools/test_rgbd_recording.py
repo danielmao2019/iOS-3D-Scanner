@@ -515,13 +515,16 @@ def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
 
 
 # The rear's depth is always Float32: ARKit delivers scene depth in no other type.
+# 5.0.0 keeps 4.8's format.
+@pytest.mark.parametrize("version", ["4.8", "5.0.0"])
 @pytest.mark.parametrize("camera, depth_format", [("front", "fdep"), ("front", "hdep"), ("rear", "fdep")])
-def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str) -> None:
+def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str) -> None:
     files = members_4_8(camera, "ITU_R_709_2") if depth_format == "fdep" else float16_depth(members_4_8(camera, "ITU_R_709_2"))
+    files = with_json(files, "scan_metadata.json", {"format_version": version})
     tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
     rec = Recording(str(tar_path))
 
-    assert (rec.path, rec.format_version, rec.format_minor, rec.camera, rec.scan_id) == (tar_path, "4.8", 8, camera, recording_id(camera))
+    assert (rec.path, rec.format_version, rec.format_minor, rec.camera, rec.scan_id) == (tar_path, version, 8, camera, recording_id(camera))
     assert (rec.color_width, rec.color_height, rec.depth_width, rec.depth_height, rec.ycbcr_matrix, rec.frame_rate) == (COLOR_WIDTH, COLOR_HEIGHT, DEPTH_WIDTH, DEPTH_HEIGHT, "ITU_R_709_2", 30)
     origin = "upper_left_pixel_corner" if camera == "front" else "upper_left_pixel_center"
     assert rec.color_principal_point_origin == rec.depth_principal_point_origin == origin

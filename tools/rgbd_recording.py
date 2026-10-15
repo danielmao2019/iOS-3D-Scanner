@@ -1,10 +1,10 @@
-"""Reads an RGBD Scanner recording, an uncompressed tar of format_version "4.0" to "4.8", through one interface: its per-frame color and depth rows, its color frames, depth maps and the rear's confidence maps memory-mapped in place at each member's data offset inside the tar, never extracted (a front recording is about 0.55 GB per second), the rear's poses and, from 4.8, the front frames' lens distortion, each depth frame's depth-to-color transform and the frame files' recorded sizes and SHA-256s. format_version is "4.<minor>", the version of the app that wrote it, the minor naming the app build. This docstring is the format's document; app/Sources/RGBDScanner/Recording.swift's header comment describes the writer.
+"""Reads an RGBD Scanner recording, an uncompressed tar of format_version "4.0" to "4.8" or "5.0.0", through one interface: its per-frame color and depth rows, its color frames, depth maps and the rear's confidence maps memory-mapped in place at each member's data offset inside the tar, never extracted (a front recording is about 0.55 GB per second), the rear's poses and, from 4.8, the front frames' lens distortion, each depth frame's depth-to-color transform and the frame files' recorded sizes and SHA-256s. format_version is the version of the app that wrote it: "4.<minor>", the minor naming the app build, then "<major>.<minor>.<patch>" from 5.0.0. This docstring is the format's document; app/Sources/RGBDScanner/Recording.swift's header comment describes the writer.
 
-Format 4.8. A recording is <scan_id>.tar, whose members are exactly <scan_id>/<file> for scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, color_intrinsics.json, depth_intrinsics.json, extrinsics.json and, for the rear, depth_frames_confidence.bin. The phone keeps these files as Documents/<scan_id>/ and uploads them one by one, and server/receive.py, once all of them have arrived with their checksums, writes them into <out>/<scan_id>.tar in the upload manifest's order, a GNU tar (a member can exceed 8 GiB). scan_id is rgbd_<yyyyMMdd_HHmmss>_<camera>, followed by _<the user's name for it reduced to [A-Za-z0-9_-], at most 40 characters> when the user named it. Each concern has one file: intrinsic parameters and extrinsics never share a file, and no file repeats another's indices or timestamps, frame n of a .bin file being entry n of its frames list.
+Format 4.8, which 5.0.0 keeps. A recording is <scan_id>.tar, whose members are exactly <scan_id>/<file> for scan_metadata.json, color_frames.bin, color_frames_metadata.json, depth_frames.bin, depth_frames_metadata.json, color_intrinsics.json, depth_intrinsics.json, extrinsics.json and, for the rear, depth_frames_confidence.bin. The phone keeps these files as Documents/<scan_id>/ and uploads them one by one, and server/receive.py, once all of them have arrived with their checksums, writes them into <out>/<scan_id>.tar in the upload manifest's order, a GNU tar (a member can exceed 8 GiB). scan_id is rgbd_<yyyyMMdd_HHmmss>_<camera>, followed by _<the user's name for it reduced to [A-Za-z0-9_-], at most 40 characters> when the user named it. Each concern has one file: intrinsic parameters and extrinsics never share a file, and no file repeats another's indices or timestamps, frame n of a .bin file being entry n of its frames list.
 
-The camera is "front", the TrueDepth camera through AVFoundation (color 4032x3024 and depth 640x480 at 15 fps on the test phone), or "rear", the LiDAR camera through ARKit world tracking (color 1920x1440, scene depth 256x192 with its confidence, 60 fps); depth filtering is always off. Every timestamp is a capture time in host-clock (CMClockGetHostTimeClock) seconds, one clock for every file; a color frame and a depth frame were captured together when their timestamps are equal (`pairs`). Pixels, intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; `upright` turns a frame the way the phone was held.
+The camera is "front", the TrueDepth camera through AVFoundation (color 4032x3024 and depth 640x480 on the test phone), or "rear", the LiDAR camera through ARKit world tracking (color 1920x1440, scene depth 256x192 with its confidence, every fourth of ARKit's 60 fps frames); both record at 15 fps, the rear at 60 fps before 5.0.0; depth filtering is always off. Every timestamp is a capture time in host-clock (CMClockGetHostTimeClock) seconds, one clock for every file; a color frame and a depth frame were captured together when their timestamps are equal (`pairs`). Pixels, intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; `upright` turns a frame the way the phone was held.
 
-scan_metadata.json holds exactly format_version ("4.8"), scan_id, name, start_time_utc, duration_s (the last minus the first timestamp over every color and depth frame, delivered or dropped), phone_model, phone_id (UIDevice's identifierForVendor, or null when iOS gives none), ios_version, camera, frame_rate (the configured frames per second) and recovered (whether the recording was finished at a later launch, the app having been closed mid-recording).
+scan_metadata.json holds exactly format_version ("4.8" or "5.0.0"), scan_id, name, start_time_utc, duration_s (the last minus the first timestamp over every color and depth frame, delivered or dropped), phone_model, phone_id (UIDevice's identifierForVendor, or null when iOS gives none), ios_version, camera, frame_rate (the configured frames per second) and recovered (whether the recording was finished at a later launch, the app having been closed mid-recording).
 
 color_frames.bin holds every delivered color frame uncompressed, frame n at bytes [n*w*h*3/2, (n+1)*w*h*3/2) for a w x h frame, no header: the camera's 420f buffer, 8-bit full-range YCbCr 4:2:0, its luma plane (h rows of w bytes, one Y per pixel) then its CbCr plane (h/2 rows of w bytes, one Cb, Cr byte pair per 2x2 pixels), rows tightly packed; `color_bgr` converts a frame to BGR through its ycbcr_matrix. depth_frames.bin holds every delivered depth map as the camera delivered it, in metres as little-endian Float32 ("fdep", 4 bytes per pixel) or Float16 ("hdep", 2 bytes), the most precise depth type the capture format offers (the rear's always Float32), map n at bytes [n*w*h*b, (n+1)*w*h*b) for b bytes per pixel, rows tightly packed, NaN or 0 meaning no reading. The rear's depth_frames_confidence.bin holds one UInt8 ARConfidenceLevel map per depth map, in depth_frames.bin's order and layout: 0 low, 1 medium, 2 high.
 
@@ -61,12 +61,12 @@ YCBCR_MATRICES = {"ITU_R_601_4": (0.299, 0.114), "ITU_R_709_2": (0.2126, 0.0722)
 
 
 class Recording:
-    """A format_version "4.0" to "4.8" recording tar: its metadata and per-frame rows read, its frames memory-mapped in place inside it."""
+    """A format_version "4.0" to "4.8" or "5.0.0" recording tar: its metadata and per-frame rows read, its frames memory-mapped in place inside it."""
 
     # Every format's.
     path: Path
     format_version: str
-    # The minor of format_version, 0 to 8.
+    # The minor of format_version, 0 to 8, and 8 for 5.0.0, which keeps 4.8's format.
     format_minor: int
     camera: str
     scan_id: str
@@ -167,17 +167,17 @@ class Recording:
         self.frame_files = self.color_distortions = self.depth_distortions = self.depth_to_color = None
 
     def _read_4_8(self, tar: tarfile.TarFile, members: Dict[str, tarfile.TarInfo]) -> None:
-        """Reads a format 4.8 tar's members, checking that they are exactly its camera's files under <scan_id>/, every list one entry per frame, every run within the frames and disjoint from the others, and every frame member the frames its metadata counts at the size it records, memory-mapped in place inside the tar."""
+        """Reads a format 4.8 or 5.0.0 tar's members, checking that they are exactly its camera's files under <scan_id>/, every list one entry per frame, every run within the frames and disjoint from the others, and every frame member the frames its metadata counts at the size it records, memory-mapped in place inside the tar."""
         def load(name: str) -> Dict:
             return json.load(tar.extractfile(members[name]))
 
         self.scan_metadata = load("scan_metadata.json")
-        assert self.scan_metadata["format_version"] == "4.8", self.scan_metadata["format_version"]
+        assert self.scan_metadata["format_version"] in ("4.8", "5.0.0"), self.scan_metadata["format_version"]
         camera = self.scan_metadata["camera"]
         assert camera in CAMERA_FILES, camera
         names = sorted(m.name for m in tar.getmembers())
         assert names == sorted(f"{self.scan_metadata['scan_id']}/{name}" for name in FILES | CAMERA_FILES[camera]), names
-        self.format_version, self.format_minor = "4.8", 8
+        self.format_version, self.format_minor = self.scan_metadata["format_version"], 8
         self.camera, self.scan_id, self.frame_rate = camera, self.scan_metadata["scan_id"], self.scan_metadata["frame_rate"]
         self.meta = self.calibrations = None
 
