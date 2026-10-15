@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2", or an aligned recording from tools/align_recording.py) and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """
@@ -217,6 +217,12 @@ def plainly_scaled(color: np.ndarray, s: np.ndarray) -> np.ndarray:
     return color * np.concatenate([s, s])
 
 
+def centers_plainly_scaled(color: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Float32 color intrinsics fx, fy, cx, cy measured from pixel (0, 0)'s center, one row per frame, scaled plainly to a depth map s = (sx, sy) times the color frame's size: f * s and (c + 0.5) * s - 0.5."""
+    half = np.float32(0.5)
+    return np.concatenate([color[:, :2] * s, (color[:, 2:] + half) * s - half], axis=1)
+
+
 def carried_intrinsics_match(rec: Recording, carry: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> bool:
     """Whether every delivered depth row with a delivered same-instant color row, and there is one, has that row's intrinsics carried to the depth map by `carry` with s = depth size / color size, computed in Float32 as the app does."""
     pairs = [(c, d) for c, d in rec.pairs() if c["index"] != "-1"]
@@ -395,8 +401,10 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         "timestamps strictly increasing": bool(np.all(np.diff(color_ts) > 0) and np.all(np.diff(depth_ts) > 0)),
         "every depth frame within the color stream's time span has a color row (delivered or dropped) at the same instant": paired_in_span == len(depth_in_span),
         "depth aligns best with its same-instant color frame": best_offset == 0,
-        "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames": spatial["aligned"],
     }
+    # An aligned recording leaves no depth reading along occluding edges, which the edge comparison needs; front_depth_rotation_fit.py and lens_distortion_fit.py check its alignment.
+    if not rec.aligned:
+        checks["depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"] = spatial["aligned"]
     if not format_4_8:
         checks["metadata's depth_filtering_enabled is false"] = meta["depth_filtering_enabled"] is False
     if not rear:
@@ -404,7 +412,9 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     checks["every color and depth frame has intrinsics"] = has_intrinsics
     if format_4_8:
         checks["color_intrinsics.json and depth_intrinsics.json have one frames entry per frame"] = len(rec.color_intrinsics["frames"]) == rec.color.shape[0] and len(rec.depth_intrinsics["frames"]) == rec.depth.shape[0]
-    if rear:
+    if rear and rec.aligned:
+        checks["every depth frame's intrinsics are its same-instant color frame's scaled to the depth map, f * s, and (c + 0.5) * s - 0.5 from pixel (0, 0)'s center"] = has_intrinsics and carried_intrinsics_match(rec, centers_plainly_scaled)
+    elif rear:
         checks["every depth frame's intrinsics are its same-instant color frame's carried as ARKit's depth grid lies on the color image, f * s, cx * sx and (cy + 0.5) * sy - 0.5"] = has_intrinsics and carried_intrinsics_match(rec, arkit_carried)
     elif format_4_8:
         checks["every depth frame's intrinsics are its same-instant color frame's scaled to the depth map, f * s and c * s, both measured from the frame's corner"] = has_intrinsics and carried_intrinsics_match(rec, plainly_scaled)
@@ -417,7 +427,9 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         checks["every frame has orientation and gravity"] = all(r[k] for r in rec.colors + rec.depths for k in ORIENTATION)
     else:
         checks["every color frame has orientation and gravity"] = all(r[k] for r in rec.colors for k in ORIENTATION)
-    if format_4_8 and not rear:
+    if rec.aligned:
+        checks["no frame has a distortion and every depth frame's depth_to_color is the identity"] = rec.color_distortions is None and rec.depth_distortions is None and all(t is not None and np.array_equal(t, np.eye(3, 4)) for t in rec.depth_to_color)
+    elif format_4_8 and not rear:
         # The reader has checked that no frame is in two runs.
         checks["every color and depth frame has a distortion and every depth frame a depth_to_color, the runs covering each frame exactly once"] = all(x is not None for x in rec.color_distortions + rec.depth_distortions + rec.depth_to_color)
     if rear and format_4_8:
@@ -430,7 +442,8 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     if rear and 4 <= rec.format_minor <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
     if format_4_8:
-        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == scan_metadata_keys(rec.format_version) and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
+        keys = scan_metadata_keys(rec.format_version) | ({"alignment"} if rec.aligned else set())
+        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == keys and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
     else:
         checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():
