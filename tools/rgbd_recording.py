@@ -4,7 +4,7 @@ Format 4.8, which 5.0.0 and 5.0.1 keep and 5.0.2 to 5.2 encode as described belo
 
 The camera is "front", the TrueDepth camera through AVFoundation (color 1920x1440, and 4032x3024 before 5.0.1, and depth 640x480 on the test phone), or "rear", the LiDAR camera through ARKit world tracking (color 1920x1440, scene depth 256x192 with its confidence, every fourth of ARKit's 60 fps frames); both record at 15 fps, the rear at 60 fps before 5.0.0; depth filtering is always off. Every timestamp is a capture time in host-clock (CMClockGetHostTimeClock) seconds, one clock for every file; a color frame and a depth frame were captured together when their timestamps are equal (`pairs`). Pixels, intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; `upright` turns a frame the way the phone was held.
 
-scan_metadata.json holds exactly format_version ("4.8" or "5.0.0" to "5.2"), scan_id, name, start_time_utc, duration_s (the last minus the first timestamp over every color and depth frame, delivered or dropped), phone_model, phone_id (UIDevice's identifierForVendor, or null when iOS gives none), ios_version, camera, frame_rate (the configured frames per second), recovered (whether the recording was finished at a later launch, the app having been closed mid-recording) and, from 5.2, author (the app's user who recorded it, null when the app did not know it).
+scan_metadata.json holds exactly format_version ("4.8" or "5.0.0" to "5.2"), scan_id, name, start_time_utc, duration_s (the last minus the first timestamp over every color and depth frame, delivered or dropped), phone_model, phone_id (UIDevice's identifierForVendor, or null when iOS gives none), ios_version, camera, frame_rate (the configured frames per second), recovered (whether the recording was finished at a later launch, the app having been closed mid-recording), from 5.2, author (the app's user who recorded it, null when the app did not know it), and, in an aligned recording, which tools/align_recording.py writes from a recording and documents, alignment.
 
 color_frames.bin holds every delivered color frame uncompressed, frame n at bytes [n*w*h*3/2, (n+1)*w*h*3/2) for a w x h frame, no header: the camera's 420f buffer, 8-bit full-range YCbCr 4:2:0, its luma plane (h rows of w bytes, one Y per pixel) then its CbCr plane (h/2 rows of w bytes, one Cb, Cr byte pair per 2x2 pixels), rows tightly packed; `color_bgr` converts a frame to BGR through its ycbcr_matrix. depth_frames.bin holds every delivered depth map as the camera delivered it, in metres as little-endian Float32 ("fdep", 4 bytes per pixel) or Float16 ("hdep", 2 bytes), the most precise depth type the capture format offers (the rear's always Float32), map n at bytes [n*w*h*b, (n+1)*w*h*b) for b bytes per pixel, rows tightly packed, NaN or 0 meaning no reading. The rear's depth_frames_confidence.bin holds one UInt8 ARConfidenceLevel map per depth map, in depth_frames.bin's order and layout: 0 low, 1 medium, 2 high.
 
@@ -116,11 +116,13 @@ class Recording:
     extrinsics: Optional[Dict]
     # Format 4.8's frame files, each with the size and SHA-256 its frames metadata records, the SHA-256 None for 5.0.3 to 5.2; None for 4.0 to 4.7.
     frame_files: Optional[Dict[str, Tuple[int, Optional[str]]]]
-    # A front 4.8 recording's distortions entry of each color and depth frame, or None for a frame in no run; None for a rear one and for 4.0 to 4.7.
+    # Whether this is an aligned recording (tools/align_recording.py): format 4.8 with alignment in scan_metadata.json, its frames resampled onto their intrinsic matrices, no distortions and every depth_to_color the identity; False for 4.0 to 4.7.
+    aligned: bool
+    # A front recording's Apple distortion of each color and depth frame, center (in that frame's pixels), lookup_table and inverse_lookup_table, or None where unknown: 4.8's distortions entries, and for 4.0 to 4.7 each depth frame's calibration.jsonl line carried to the depth map and each color frame's taken from the depth frames by 4.8's rule (`front_distortions`); None for a rear or aligned recording.
     color_distortions: Optional[List[Optional[Dict]]]
     depth_distortions: Optional[List[Optional[Dict]]]
-    # Format 4.8's depth_to_color matrix of each depth frame, 3 x 4 float64, or None for a frame in no run; None for 4.0 to 4.7.
-    depth_to_color: Optional[List[Optional[np.ndarray]]]
+    # Each depth frame's depth_to_color matrix, 3 x 4 float64, or None where unknown: 4.8's runs, and for 4.0 to 4.7 a front frame's calibration.jsonl extrinsic matrix and the identity for every rear frame.
+    depth_to_color: List[Optional[np.ndarray]]
 
     def __init__(self, path: Union[str, Path]) -> None:
         def _validate_inputs() -> None:
@@ -180,7 +182,17 @@ class Recording:
             assert meta["confidence_pixel_format"] == "L008" and meta["confidence_bytes_per_pixel"] == 1, (meta["confidence_pixel_format"], meta["confidence_bytes_per_pixel"])
             self.confidence = map_frames(self.path, members["confidence.bin"], np.dtype(np.uint8), depth_shape)
         self.scan_metadata = self.color_frames_metadata = self.depth_frames_metadata = self.color_intrinsics = self.depth_intrinsics = self.extrinsics = None
-        self.frame_files = self.color_distortions = self.depth_distortions = self.depth_to_color = None
+        self.frame_files = self.color_distortions = self.depth_distortions = None
+        self.aligned = False
+        delivered_depths = [r for r in self.depth_rows if r["index"] != "-1"]
+        if camera == "rear":
+            self.depth_to_color = [np.eye(3, 4) for _ in delivered_depths]
+            return
+        assert len(self.calibrations) == len(delivered_depths), (len(self.calibrations), len(delivered_depths))
+        calibrations = [line["calibration"] for line in self.calibrations]
+        self.depth_to_color = [None if c is None else np.array(c["extrinsic_matrix_row_major_3x4"], np.float64) for c in calibrations]
+        colors = [r for r in self.color_rows if r["index"] != "-1"]
+        self.color_distortions, self.depth_distortions = front_distortions(calibrations, [float(r["timestamp"]) for r in delivered_depths], [float(r["timestamp"]) for r in colors], (self.color_width, self.color_height), (self.depth_width, self.depth_height))
 
     def _read_4_8(self, tar: tarfile.TarFile, members: Dict[str, tarfile.TarInfo]) -> None:
         """Reads a format 4.8 or 5.0.0 to 5.2 tar's members, checking that they are exactly its camera's files under <scan_id>/, every list one entry per frame, every run within the frames and disjoint from the others, and every frame member the frames its metadata counts at the size it records, memory-mapped in place inside the tar."""
@@ -194,6 +206,7 @@ class Recording:
         names = sorted(m.name for m in tar.getmembers())
         assert names == sorted(f"{self.scan_metadata['scan_id']}/{name}" for name in FILES | CAMERA_FILES[camera]), names
         self.format_version, self.format_minor = self.scan_metadata["format_version"], 8
+        self.aligned = "alignment" in self.scan_metadata
         self.camera, self.scan_id, self.frame_rate = camera, self.scan_metadata["scan_id"], self.scan_metadata["frame_rate"]
         self.meta = self.calibrations = None
 
@@ -237,12 +250,12 @@ class Recording:
             assert (intrinsics["image_width"], intrinsics["image_height"]) == (frames["width"], frames["height"]), (intrinsics["image_width"], intrinsics["image_height"], frames["width"], frames["height"])
             assert intrinsics["principal_point_origin"] == PRINCIPAL_POINT_ORIGINS[camera], (camera, intrinsics["principal_point_origin"])
             assert len(intrinsics["frames"]) == frames["frame_count"], (frames["file"], len(intrinsics["frames"]), frames["frame_count"])
-            # ARKit reports no distortion.
-            assert ("distortions" in intrinsics) == (camera == "front"), sorted(intrinsics)
+            # ARKit reports no distortion, and aligned frames have none left.
+            assert ("distortions" in intrinsics) == (camera == "front" and not self.aligned), sorted(intrinsics)
         self.color_principal_point_origin = self.color_intrinsics["principal_point_origin"]
         self.depth_principal_point_origin = self.depth_intrinsics["principal_point_origin"]
         self.color_distortions = self.depth_distortions = None
-        if camera == "front":
+        if camera == "front" and not self.aligned:
             self.color_distortions = per_frame(self.color_intrinsics["distortions"], "frame_ranges", color["frame_count"])
             self.depth_distortions = per_frame(self.depth_intrinsics["distortions"], "frame_ranges", depth["frame_count"])
 
@@ -417,6 +430,23 @@ def per_frame(entries: List[Dict], ranges_key: str, count: int) -> List[Optional
             assert all(f is None for f in frames[first:last + 1]), (ranges_key, "overlapping run", first, last)
             frames[first:last + 1] = [entry] * (last - first + 1)
     return frames
+
+
+def front_distortions(calibrations: List[Optional[Dict]], depth_times: List[float], color_times: List[float], color_size: Tuple[int, int], depth_size: Tuple[int, int]) -> Tuple[List[Optional[Dict]], List[Optional[Dict]]]:
+    """A format 4.0 to 4.7 front recording's per-frame distortions, as 4.8 records them: each depth frame's calibration.jsonl line (None where it has none) carried from its reference dimensions to the depth map, and each color frame's from the depth frame captured with it, else the latest earlier one, else the first, among the depth frames with a calibration, carried to the color frame."""
+    def carried(calibration: Dict, size: Tuple[int, int]) -> Dict:
+        scale_x, scale_y = size[0] / calibration["intrinsic_reference_width"], size[1] / calibration["intrinsic_reference_height"]
+        center = calibration["lens_distortion_center"]
+        return {"center": [center[0] * scale_x, center[1] * scale_y], "lookup_table": calibration["lens_distortion_lookup_table"], "inverse_lookup_table": calibration["inverse_lens_distortion_lookup_table"]}
+
+    depth = [None if c is None else carried(c, depth_size) for c in calibrations]
+    known = [(t, c) for t, c in zip(depth_times, calibrations, strict=True) if c is not None]
+    color: List[Optional[Dict]] = []
+    for t in color_times:
+        earlier = [c for depth_time, c in known if depth_time <= t + SAME_INSTANT_S]
+        source = earlier[-1] if earlier else (known[0][1] if known else None)
+        color.append(None if source is None else carried(source, color_size))
+    return color, depth
 
 
 def cell(value: Optional[float]) -> str:
