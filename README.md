@@ -30,14 +30,17 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 - Open the app and allow the camera and local network access.
 - Choose Front or Rear, tap Record, name the recording or tap Later, then tap Stop.
 - Uploads start by themselves and continue after the app leaves the screen, but stop if the app is closed from the app switcher.
-- Recordings are uncompressed, both cameras at 15 fps: about 4.8 GB per minute for the front and 4 GB per minute for the rear.
+- Recordings are compressed losslessly, both cameras at 15 fps: about 1.6 GB per minute for the front and 1.3 GB per minute for the rear, depending on the scene.
 - The rear lens distortion and the front depth offset are not in the recordings; they are measured once per phone.
 
 ## App versions
 
-Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" and "5.0.1" for v5.0.0 and v5.0.1.
+Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" to "5.0.2" for v5.0.0 to v5.0.2.
 
-### v5.0.1 (2026-10-16)
+### v5.0.2 (2026-10-16)
+- Frame storage: v5.0.1 stored every frame uncompressed. v5.0.2 compresses every frame losslessly on the phone before writing it: each color frame's rows are delta-coded against the row above and deflated with zlib's run-length strategy, and each depth and confidence map is deflated, so a recording takes 2.2 to 3.5 times less space and upload time, depending on the scene (3.5 times on a front test recording at 4032x3024 and 3.1 times on a rear one on 2026-10-16, 2.2 times on a noisier front scene). Each frame's metadata records its compressed size and the SHA-256 of its raw bytes, and `inspect_recording.py` checks that every frame decodes back to exactly those bytes.
+
+### v5.0.1 (2026-10-16, 6c49eb1)
 - Front color: v5.0.0 recorded the front's color at 4032x3024, 18.3 MB a frame, so a front recording wrote about 293 MB/s. v5.0.1 records it at 1920x1440, the camera's 4:3 view at 1920 wide, 4.1 MB a frame, with the same 640x480 depth, the largest and most precise depth that size offers, so a front recording writes about 81 MB/s, 4.8 GB per minute. Apple carries each color frame's intrinsic matrix from the calibration's 4032x3024 about pixel centers, which a frame of that size did not show; v5.0.1 carries its principal point about the frame's corner, as the depth intrinsics and the distortion centers are carried, 0.26 px further right and down, so the color and depth intrinsics agree.
 
 ### v5.0.0 (2026-10-15, 9845ed4)
