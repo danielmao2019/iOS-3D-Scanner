@@ -18,6 +18,11 @@ The builds this task produces are enumerated from 5.0. Every solved problem is a
 
 Long scans may cause the device out of space (study the logs to see the details of the issue).
 
+Solutions (all items to be implemented):
+1. record both color and depth streams at 15fps, hard coded.
+2. implement lossless compression (encode on the app and decode in the data pipeline).
+3. implement immediate upload to server and delete after upload.
+
 ### 1.2. Problem 2: Recording Naming UI
 
 Once the record button is clicked, it then prompts for a name before recording, which is correct. There are two sub-problems
