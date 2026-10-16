@@ -129,13 +129,13 @@ final class Recorder: CaptureSink {
         }
     }
 
-    // Starts writing frames to a new recording.
-    func startRecording(completion: @escaping (Result<Void, Error>) -> Void) {
+    // Starts writing frames to a new recording, going to target, which hands each segment it closes to onSegment.
+    func startRecording(target: RecordingTarget, onSegment: @escaping (Segment) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
         dataQueue.async {
             do {
                 guard let format = self.format else { throw RecorderError("camera not ready") }
                 guard self.active == nil else { throw RecorderError("already recording") }
-                self.active = try Recording(camera: self.camera, format: format)
+                self.active = try Recording(camera: self.camera, format: format, target: target, onSegment: onSegment)
                 (self.stats.colorFrames, self.stats.depthFrames, self.stats.droppedColor, self.stats.droppedDepth) = (0, 0, 0, 0)
                 self.publishStats()
                 DispatchQueue.main.async { completion(.success(())) }

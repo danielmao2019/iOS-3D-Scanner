@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.0.2") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.0.3") and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """
@@ -376,8 +376,12 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         measured = measured_frame_members(rec)
         checks = {
             "color_frames.bin, depth_frames.bin and the rear's depth_frames_confidence.bin each hold, by their size in the tar, frame_count frames, one per frames entry": frame_counts_match(rec, measured),
-            "each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records": measured == rec.frame_files,
         }
+        if all(sha256 is not None for _, sha256 in rec.frame_files.values()):
+            checks["each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records"] = measured == rec.frame_files
+        else:
+            # 5.0.3 records each frame member's size only; frames_decode_to_raw checks its every byte.
+            checks["each frame member's size, read from inside the tar, is the one its frames metadata records"] = {name: size for name, (size, _) in measured.items()} == {name: size for name, (size, _) in rec.frame_files.items()}
         if rec.encoded:
             print("stored smaller than raw by: " + stored_ratios(rec))
             checks["every frame decodes losslessly: each decoded color frame, depth map and confidence map has the SHA-256 the app took of its bytes before encoding them"] = frames_decode_to_raw(rec)

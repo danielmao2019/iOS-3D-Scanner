@@ -68,14 +68,21 @@ struct ContentView: View {
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 
-            HStack {
-                Text("Server").font(.caption)
-                TextField("http://host:port", text: $model.server)
-                    .textFieldStyle(.roundedBorder).font(.caption)
-                    .keyboardType(.URL).autocorrectionDisabled().textInputAutocapitalization(.never)
+            Toggle("Keep recordings on this phone", isOn: $model.keepsOnPhone).font(.caption)
+                .disabled(model.isRecording || model.isStarting)
+            if !model.keepsOnPhone {
+                HStack {
+                    Text("Server").font(.caption)
+                    TextField("http://host:port", text: $model.server)
+                        .textFieldStyle(.roundedBorder).font(.caption)
+                        .keyboardType(.URL).autocorrectionDisabled().textInputAutocapitalization(.never)
+                        .onSubmit { model.refreshServerRecordings() }
+                }
             }
 
-            List(model.files) { file in
+            List {
+                // The recordings kept on this phone, or those still uploading, then those the receiver holds.
+                ForEach(model.shownFiles) { file in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(file.info.name).font(.caption.bold())
                     Text([
@@ -86,20 +93,37 @@ struct ContentView: View {
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()
-                        // Every recording uploads once it is named; a failed upload can be retried.
+                        // A recording that uploads does so once it is named; a failed upload can be retried.
                         if case .failed = file.upload {
                             Button("Retry") { model.upload(file.id) }.font(.caption).buttonStyle(.bordered)
                         }
-                        Button { model.pendingDelete = file } label: { Image(systemName: "trash") }
-                            .buttonStyle(.borderless).foregroundStyle(.red)
-                            .disabled(!file.canDelete)
+                        if file.canDelete {
+                            Button { model.pendingDelete = file } label: { Image(systemName: "trash") }
+                                .buttonStyle(.borderless).foregroundStyle(.red)
+                        }
+                    }
+                }
+                }
+                ForEach(model.serverRecordings) { recording in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(recording.name ?? recording.scanId).font(.caption.bold())
+                        Text([
+                            recording.startTimeUtc?.formatted(date: .abbreviated, time: .standard),
+                            recording.durationS.map { Duration.seconds($0).formatted(.time(pattern: .minuteSecond)) },
+                            ByteCountFormatter.string(fromByteCount: recording.size, countStyle: .file),
+                        ].compactMap { $0 }.joined(separator: " · ")).font(.caption2.monospacedDigit())
+                        Text("on the server").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }
             .listStyle(.plain)
+            .refreshable { model.refreshServerRecordings() }
         }
         .padding(.horizontal)
-        .onAppear { model.startPreview() }
+        .onAppear {
+            model.startPreview()
+            model.refreshServerRecordings()
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.stopRecording(because: "the app went to the background") }
         }
@@ -117,7 +141,7 @@ struct ContentView: View {
             Button("Delete", role: .destructive) { model.delete(file) }
             Button("Cancel", role: .cancel) {}
         } message: { file in
-            Text("\(file.info.name) is deleted from this iPhone. The copy on the server is kept.")
+            Text("\(file.info.name) is deleted from this iPhone, the only place it is kept.")
         }
     }
 }
