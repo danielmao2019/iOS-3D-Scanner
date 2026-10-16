@@ -634,10 +634,11 @@ def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str
     assert np.array_equal(bgr[0:2, 0:2], first) and np.array_equal(bgr[0:2, 2:4], np.full((2, 2, 3), second)), bgr[0:2, 0:4].tolist()
 
 
-@pytest.mark.parametrize("version", ["5.0.2", "5.0.3"])
+# 5.1 keeps 5.0.3's format.
+@pytest.mark.parametrize("version", ["5.0.2", "5.0.3", "5.1"])
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_reader_5_0_2(tmp_path: Path, camera: str, version: str) -> None:
-    files = members_5_0_2(camera, "ITU_R_709_2") if version == "5.0.2" else members_5_0_3(camera, "ITU_R_709_2")
+    files = members_5_0_2(camera, "ITU_R_709_2") if version == "5.0.2" else with_json(members_5_0_3(camera, "ITU_R_709_2"), "scan_metadata.json", {"format_version": version})
     tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
     rec = Recording(str(tar_path))
 

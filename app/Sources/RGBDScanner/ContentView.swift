@@ -129,13 +129,15 @@ struct ContentView: View {
         }
         .alert("Name this recording", isPresented: $model.asksNameBeforeStart) {
             TextField("Name", text: $model.nameDraft)
+            // Start takes a name; Later records unnamed, to be named at Stop; Cancel goes back without recording.
+            Button("Start") { model.startRecording(named: true) }.disabled(model.enteredName == nil)
             Button("Later") { model.startRecording(named: false) }
-            Button("Start") { model.startRecording(named: true) }
+            Button("Cancel", role: .cancel) {}
         }
         .alert("Name this recording", isPresented: $model.asksNameAfterStop) {
             TextField("Name", text: $model.nameDraft)
+            Button("Save") { model.nameStopped(named: true) }.disabled(model.enteredName == nil)
             Button("Use date and time") { model.nameStopped(named: false) }
-            Button("Save") { model.nameStopped(named: true) }
         }
         .alert("Delete recording?", isPresented: Binding(get: { model.pendingDelete != nil }, set: { if !$0 { model.pendingDelete = nil } }), presenting: model.pendingDelete) { file in
             Button("Delete", role: .destructive) { model.delete(file) }

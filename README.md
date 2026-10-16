@@ -35,9 +35,12 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 
 ## App versions
 
-Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" to "5.0.3" for v5.0.0 to v5.0.3.
+Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" to "5.0.3" for v5.0.0 to v5.0.3 and "5.1" for v5.1.
 
-### v5.0.3 (2026-10-16)
+### v5.1 (2026-10-16)
+- Naming prompt: v5.0.3's prompt at Record offered Start and Later only, so the only way back without recording was closing the app, and Start with no name did what Later does, as did Save after Stop. v5.1 adds Cancel, which goes back without recording, and disables Start and Save while the name is blank.
+
+### v5.0.3 (2026-10-16, cf84618)
 - Upload: v5.0.2 uploaded a recording after Stop and kept every frame on the phone. v5.0.3 writes each frames file in segments of about 64 MB and uploads each segment as soon as it is full, while recording, deleting it from the phone once the receiver has checked its SHA-256 and stored it; after Stop the last segments, the JSON files and a manifest naming the recording follow, and the receiver joins each frames file's segments into the same tar as before. The frame members' entries no longer record a SHA-256 of the whole member, which the phone no longer holds; each frame's raw SHA-256 still checks every byte. The receiver must be this version's `server/receive.py`.
 - After upload: v5.0.2 kept every recording on the phone. v5.0.3 deletes an uploaded recording from the phone once the receiver answers `GET /stored/<scan_id>` that its tar is stored, lists in its place the recordings the receiver holds, from `GET /recordings`, and offers Keep recordings on this phone, which keeps a recording on the phone and uploads nowhere; only such recordings have a delete button.
 

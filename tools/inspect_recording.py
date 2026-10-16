@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.0.3") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.1") and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """

@@ -288,7 +288,7 @@ final class AppModel: ObservableObject {
     }
 
     // The name in the prompt's text field; nil when it is blank.
-    private var enteredName: String? {
+    var enteredName: String? {
         let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
     }
