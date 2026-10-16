@@ -21,7 +21,7 @@ Long scans may cause the device out of space (study the logs to see the details 
 Solutions (all items to be implemented):
 1. record both color and depth streams at 15fps, hard coded.
 2. implement lossless compression (encode on the app and decode in the data pipeline).
-3. implement immediate upload to server and delete after upload.
+3. implement immediate upload to server and delete a frame on phone after it arrives at server.
 
 ### 1.2. Problem 2: Recording Naming UI
 
