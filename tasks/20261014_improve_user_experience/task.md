@@ -22,6 +22,7 @@ Solutions (all items to be implemented):
 1. record both color and depth streams at 15fps, hard coded.
 2. implement lossless compression (encode on the app and decode in the data pipeline).
 3. implement immediate upload to server and delete a frame on phone after it arrives at server.
+4. lower front camera color frames resolution from 4032x3024 to 1920x1440.
 
 ### 1.2. Problem 2: Recording Naming UI
 
