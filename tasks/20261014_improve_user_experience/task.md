@@ -20,8 +20,8 @@ Long scans may cause the device out of space (study the logs to see the details 
 
 Solutions (all items to be implemented):
 1. record both color and depth streams at 15fps, hard coded.
-2. implement lossless compression (encode on the app and decode in the data pipeline).
-3. lower front camera color frames resolution from 4032x3024 to 1920x1440.
+2. lower front camera color frames resolution from 4032x3024 to 1920x1440.
+3. implement lossless compression (encode on the app and decode in the data pipeline).
 4. implement immediate upload to server and delete a frame on phone after it arrives at server.
    1. an option to have the data stay on phone should still be supported (see problem 3).
    2. the server:path configs should still show the list of scans (fetched from the server), rather than being empty.
