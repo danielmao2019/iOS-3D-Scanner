@@ -11,8 +11,8 @@ import simd
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal. Frame n of a .bin file is entry n of every frames list that describes it.
 // All pixels, the intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; each color frame records how the phone was held.
 //
-// The recording's files (format_version "5.1", the version of the app that wrote it, <major>.<minor>, the minor counting the task's solved problems, with a patch level within 5.0), as the receiver stores them under <id>/:
-//   scan_metadata.json             the scan as a whole: format_version, scan_id, name, start time, duration, phone model, id and iOS version, camera, frame rate, and whether it was recovered after the app stopped
+// The recording's files (format_version "5.2", the version of the app that wrote it, <major>.<minor>, the minor counting the task's solved problems, with a patch level within 5.0), as the receiver stores them under <id>/:
+//   scan_metadata.json             the scan as a whole: format_version, scan_id, name, start time, duration, phone model, id and iOS version, camera, frame rate, whether it was recovered after the app stopped, and its author, the app's user who recorded it
 //   color_frames.bin               every delivered color frame, encoded as FrameCodec.color ("row_delta_deflate"), concatenated with no header: frame n is the compressed_size bytes after frames 0 to n-1; decoded, each is exactly the frame the camera delivered, "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, h rows of w bytes (a Y byte per pixel), then its CbCr plane, h/2 rows of w bytes (a Cb, Cr byte pair per 2x2 pixels), rows tightly packed; its RGB is through ycbcr_matrix
 //   color_frames_metadata.json     color_frames.bin's size, encoding, format and frame count; each delivered frame's timestamp, upright rotation (the clockwise rotation that turns it upright), CoreMotion gravity in the phone's device frame with its sample's timestamp, exposure time, compressed size and the SHA-256 of its decoded bytes; the dropped frames, each with its timestamp and why it was dropped (e.g. late, out_of_buffers, writer_busy)
 //   depth_frames.bin               depth maps, each encoded as FrameCodec.map ("deflate"), concatenated with no header; decoded, each is exactly the map as delivered, rows tightly packed, little-endian, pixel_format "fdep" (Float32 metres) or "hdep" (Float16 metres); NaN or 0 marks a pixel without a reading
@@ -24,7 +24,7 @@ import simd
 //
 // A frame's line, with its compressed size and SHA-256, is written after its encoded bytes, and a segment is closed only after its frames' lines, so the segments hold at least the frames that have a line and a closed segment none without one; a color frame whose copy would push the raw bytes waiting to be encoded, written and hashed above maxQueuedBytes is dropped as writer_busy.
 // The work directory holds everything finishing needs, so a directory left by a closed app or a failed finish is finished at the next launch, the segments it left open closed, the last cut to the frames that have a line:
-//   start.json                                                    what is known when recording starts: camera, start time, phone, stream format, where it goes
+//   start.json                                                    what is known when recording starts: camera, start time, phone, stream format, the user and the config saying where it goes
 //   color_frames.jsonl, depth_frames.jsonl                        one line per delivered frame, in the frames files' order: its entries in the JSON files
 //   color_dropped.jsonl, depth_dropped.jsonl                      one line per dropped frame, in arrival order
 //   segments.jsonl                                                one line per closed segment, in each frames file's order: its frames file, name, size and SHA-256
@@ -117,7 +117,7 @@ final class Recording {
     private let segmentLines: FileHandle
     private var segmentLinesError: Error?
 
-    init(camera: DepthCamera, format: StreamFormat, target: RecordingTarget, onSegment: @escaping (Segment) -> Void) throws {
+    init(camera: DepthCamera, format: StreamFormat, user: String, target: RecordingTarget, onSegment: @escaping (Segment) -> Void) throws {
         precondition((format.confidencePixelFormat != nil) == (camera == .rear), "a \(camera.rawValue) recording of a stream \(format.confidencePixelFormat == nil ? "without" : "with") confidence")
         if let confidencePixelFormat = format.confidencePixelFormat {
             // depth_frames_confidence.bin holds one byte per depth pixel.
@@ -136,7 +136,7 @@ final class Recording {
         uname(&systemInfo)
         let start = Start(camera: camera, startTimeUtc: Date(),
                           phoneModel: withUnsafeBytes(of: &systemInfo.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) },
-                          phoneId: UIDevice.current.identifierForVendor?.uuidString, iosVersion: UIDevice.current.systemVersion, format: format, target: target)
+                          phoneId: UIDevice.current.identifierForVendor?.uuidString, iosVersion: UIDevice.current.systemVersion, format: format, user: user, target: target)
         try Self.lineEncoder.encode(start).write(to: directory.appendingPathComponent(Self.startName))
 
         colorFile = FramesFile(segmentsDirectory, Self.colorFramesName)
@@ -468,7 +468,7 @@ final class Recording {
             let read = try hash(directory.appendingPathComponent(name))
             return RecordingInfo.Member(name: name, size: read.size, sha256: read.sha256, uploaded: listed.uploaded)
         }
-        let info = RecordingInfo(id: listed.id, name: listed.name, namedByUser: listed.namedByUser, startTime: listed.startTime, durationSeconds: listed.durationSeconds, camera: listed.camera, uploadId: nil, target: nil, members: members, uploaded: listed.uploaded)
+        let info = RecordingInfo(id: listed.id, name: listed.name, namedByUser: listed.namedByUser, startTime: listed.startTime, durationSeconds: listed.durationSeconds, camera: listed.camera, uploadId: nil, user: nil, target: nil, members: members, uploaded: listed.uploaded)
         try info.write(to: infoFile)
         return info
     }
@@ -587,8 +587,8 @@ final class Recording {
         } } ?? color.map(\.intrinsics)
         let members = try [
             json("scan_metadata.json", ScanMetadata(
-                formatVersion: "5.1", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
-                phoneId: Nullable(start.phoneId), iosVersion: start.iosVersion, camera: start.camera, frameRate: format.frameRate, recovered: recovered)),
+                formatVersion: "5.2", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
+                phoneId: Nullable(start.phoneId), iosVersion: start.iosVersion, camera: start.camera, frameRate: format.frameRate, recovered: recovered, author: Nullable(start.user))),
         ] + members(colorSegments) + [
             json("color_frames_metadata.json", ColorFramesMetadata(
                 file: colorFramesName, size: joinedSize(colorSegments), encoding: FrameCodec.color(width: format.colorWidth, height: format.colorHeight).name, width: format.colorWidth, height: format.colorHeight,
@@ -611,7 +611,7 @@ final class Recording {
                 depthToColor: ranges(depthToColor).map { DepthToColor(matrix: $0.value, depthFrameRanges: $0.ranges) },
                 cameraPoses: front ? nil : poses)),
         ]
-        return RecordingInfo(id: id, name: name, namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: duration, camera: start.camera, uploadId: uploadId, target: start.target, members: members, uploaded: false)
+        return RecordingInfo(id: id, name: name, namedByUser: userName != nil, startTime: start.startTimeUtc, durationSeconds: duration, camera: start.camera, uploadId: uploadId, user: start.user, target: start.target, members: members, uploaded: false)
     }
 
     // A .jsonl file's lines, each decoded as a Line.
@@ -728,7 +728,8 @@ private struct Start: Codable {
     let phoneId: String?
     let iosVersion: String
     let format: StreamFormat
-    // Where the recording goes; nil in a work directory an app before 5.0.3 left.
+    // The user recording, nil in a work directory an app before 5.2 left, and the config saying where the recording goes, nil before 5.0.3.
+    let user: String?
     let target: RecordingTarget?
 }
 
@@ -780,6 +781,8 @@ private struct ScanMetadata: Encodable {
     let camera: DepthCamera
     let frameRate: Double
     let recovered: Bool
+    // The app's user who recorded it; null in a recording an app before 5.2 began.
+    let author: Nullable<String>
 }
 
 // color_frames_metadata.json.

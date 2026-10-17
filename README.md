@@ -11,7 +11,7 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 
 ### 2. Get the code
 - `git clone https://github.com/danielmao2019/iOS-3D-Scanner && cd iOS-3D-Scanner`
-- `echo http://<computer-ip>:8765 > server/url`, the address the app uploads to; it can be changed later in the app.
+- Write `server/users.json`, which git ignores, so no server address enters the repo or shows in the app: each receiver's server by name with its address, and the users the app offers at launch, each with its configs, a server by name and the data root on its machine that recordings are stored in: `{"servers": {"<name>": "http://<computer-ip>:8765"}, "users": [{"name": "<user>", "configs": [{"server": "<name>", "data_root": "/absolute/folder"}]}]}`.
 - Linux and WSL: `export USBMUXD_SOCKET_ADDRESS=UNIX:/var/run/usbmuxd` in every new terminal before building.
 - Mac: delete the line `. ~/.local/share/swiftly/env.sh` from `app/build.sh`, since Swift comes with Xcode there.
 
@@ -22,22 +22,25 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 - With a free Apple ID the app stops opening after 7 days; run `./build.sh run` again, and recordings already on the phone are kept.
 
 ### 4. Receive recordings
-- In the same clone, run `python3 server/receive.py --out <folder>`; it listens on port 8765 and checks the upload token the build wrote to `server/token`.
+- On each computer `server/users.json` names, run `python3 server/receive.py` with a copy of `server/token`, the upload token the build wrote; it listens on port 8765 and stores each recording in the data root of the config it was recorded with, which must already exist on that computer.
 - Put the phone and the computer on the same Wi-Fi and allow port 8765 through the firewall. Campus Wi-Fi often blocks traffic between devices.
-- Each recording arrives as `<folder>/<scan_id>.tar`. `tools/rgbd_recording.py` reads it and documents its format, and `python3 tools/inspect_recording.py <tar>` checks it.
+- Each recording arrives as `<data root>/<scan_id>.tar`. `tools/rgbd_recording.py` reads it and documents its format, and `python3 tools/inspect_recording.py <tar>` checks it.
 
 ### 5. Record
-- Open the app and allow the camera and local network access.
+- Open the app, choose a user's config, where the recordings go, and allow the camera and local network access; a user can add configs on the phone, on a server `server/users.json` names, and Configs on the scanner goes back.
 - Choose Front or Rear, tap Record, name the recording or tap Later, then tap Stop.
-- A recording's frames upload while it records, in segments of about 64 MB, each deleted from the phone once the computer has stored it; the rest uploads after Stop, and once the computer answers that the recording is stored, the recording leaves the phone, and the list shows the recordings the computer holds. With Keep recordings on this phone on, a recording stays on the phone and uploads nowhere, and only these recordings have a delete button. Uploads continue after the app leaves the screen, but stop if the app is closed from the app switcher.
+- With a server config, a recording's frames upload while it records, in segments of about 64 MB, each deleted from the phone once the computer has stored it; the rest uploads after Stop, and once the computer answers that the recording is stored in its data root, the recording leaves the phone, and the config's list shows the recordings the computer holds in that data root. With This phone, every user's first config, it stays on the phone and uploads nowhere, and only these recordings have a delete button. Uploads continue after the app leaves the screen, but stop if the app is closed from the app switcher.
 - Recordings are compressed losslessly, both cameras at 15 fps: about 1.6 GB per minute for the front and 1.3 GB per minute for the rear, depending on the scene.
 - The rear lens distortion and the front depth offset are not in the recordings; they are measured once per phone.
 
 ## App versions
 
-Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" to "5.0.3" for v5.0.0 to v5.0.3 and "5.1" for v5.1.
+Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" to "5.0.3" for v5.0.0 to v5.0.3, "5.1" for v5.1 and "5.2" for v5.2.
 
-### v5.1 (2026-10-16)
+### v5.2 (2026-10-17)
+- Users: v5.1 kept recordings on the phone or uploaded them to one server, set in the app, into the folder its receiver was started with, and listed them with no author. v5.2 opens on a page of users, each with its configs: This phone, which keeps recordings on the phone and uploads nowhere, then servers with the data root on each one's machine that recordings are stored in, from `server/users.json`, plus those added on the phone; a recording goes where the config chosen when it was made says, every list showing all users' recordings of its config, as configs such as This phone are shared, each with its author, which scan_metadata.json now records, and Configs on the scanner goes back to the page. The app shows and saves servers by name only, their addresses coming from `server/users.json`, which git ignores, and nothing is chosen by default. The receiver stores each recording in the data root its requests name, refuses a request naming none, and answers `GET /stored/<scan_id>` and `GET /recordings` for that data root, the listing with each recording's author. A recording with no config, from before v5.0.3, or that v5.0.3 or v5.1 uploaded to a server alone, which no receiver from v5.2 takes, stays on the phone under This phone.
+
+### v5.1 (2026-10-16, adbd090)
 - Naming prompt: v5.0.3's prompt at Record offered Start and Later only, so the only way back without recording was closing the app, and Start with no name did what Later does, as did Save after Stop. v5.1 adds Cancel, which goes back without recording, and disables Start and Save while the name is blank.
 
 ### v5.0.3 (2026-10-16, cf84618)

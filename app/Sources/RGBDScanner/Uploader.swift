@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-// Uploads recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Every file goes up from its file as PUT /upload/<key>/<file> under the recording's upload key (RecordingInfo.uploadKey), with its SHA-256 in X-Content-SHA256: from 5.0.3 each segment of a frames file as soon as the recording closes it, while it records, and once the recording is finished every member the receiver has not acknowledged; once every member is acknowledged, PUT /upload/<key>/manifest.json from the manifest written beside them, the members in recording.json's order with their sizes and SHA-256s, each frames file's segments grouped under it, and from 5.0.3 the recording's id, lets the receiver complete the recording. The receiver's 200 is the file's safe arrival: a segment's file is deleted then, so its frames leave the phone, and a finished recording's member is recorded as acknowledged in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
+// Uploads recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Every file goes up from its file as PUT /upload/<key>/<file> to the address server/users.json gives the server of the recording's destination, under its upload key (RecordingInfo.uploadKey), with its SHA-256 in X-Content-SHA256 and the destination's data root in X-Data-Root: from 5.0.3 each segment of a frames file as soon as the recording closes it, while it records, and once the recording is finished every member the receiver has not acknowledged; once every member is acknowledged, PUT /upload/<key>/manifest.json from the manifest written beside them, the members in recording.json's order with their sizes and SHA-256s, each frames file's segments grouped under it, and from 5.0.3 the recording's id, lets the receiver complete the recording. The receiver's 200 is the file's safe arrival: a segment's file is deleted then, so its frames leave the phone, and a finished recording's member is recorded as acknowledged in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
 final class Uploader: NSObject, URLSessionDataDelegate {
     // The one uploader; the app delegate makes it at every launch, so its background session reconnects to the tasks iOS carried on while the app was not running.
     static let shared = Uploader()
@@ -34,21 +34,18 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }
 
-    // Starts the PUTs of the finished recording's members the receiver has not acknowledged and that are not already on their way, or of its manifest once they are all acknowledged, to the receiver at server for a recording before 5.0.3, which names none; onProgress and completion are called on the main queue.
-    func upload(_ id: String, server: String, onProgress: @escaping (Double) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
+    // Starts the PUTs of the finished recording's members the receiver has not acknowledged and that are not already on their way, or of its manifest once they are all acknowledged; onProgress and completion are called on the main queue.
+    func upload(_ id: String, onProgress: @escaping (Double) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
         let info: RecordingInfo
         do {
             info = try load(id)
         } catch {
             return completion(.failure(error))
         }
-        if info.target == .phone { return completion(.failure(RecorderError("kept on this phone"))) }
-        // A recording before 5.0.3 stays on the phone once uploaded.
-        if info.uploaded && info.target == nil { return completion(.success(())) }
-        let server = { if case .upload(let server)? = info.target { return server } else { return server } }()
-        guard let root = Self.root(server, info.uploadKey) else { return completion(.failure(RecorderError("bad server URL"))) }
+        guard case .upload(let destination)? = info.target else { return completion(.failure(RecorderError(info.target == nil ? "recorded before 5.0.3, with no config to upload to" : "kept on this phone"))) }
+        guard let address = UsersFile.address(of: destination.server), let root = Self.root(address, info.uploadKey) else { return completion(.failure(RecorderError("this build gives no address for the server \(destination.server)"))) }
         observers[id] = (onProgress, completion)
-        if info.uploaded { return confirmStored(info, server: server) }
+        if info.uploaded { return confirmStored(info, destination: destination) }
         session.getAllTasks { tasks in
             let underway = Set(tasks.filter { $0.state == .running || $0.state == .suspended }.compactMap(\.taskDescription))
             DispatchQueue.main.async {
@@ -58,9 +55,9 @@ final class Uploader: NSObject, URLSessionDataDelegate {
                 do {
                     let current = try self.acknowledgingDeletedSegments(info)
                     for member in current.members where !member.uploaded && !underway.contains(Self.describe(key, member.name)) {
-                        self.start(current.url(of: member), to: root.appendingPathComponent(member.name), sha256: member.sha256, as: Self.describe(key, member.name))
+                        self.start(current.url(of: member), to: root.appendingPathComponent(member.name), sha256: member.sha256, dataRoot: destination.dataRoot, as: Self.describe(key, member.name))
                     }
-                    if current.members.allSatisfy(\.uploaded) && !underway.contains(Self.describe(key, Self.manifestName)) { try self.startManifest(current, root: root) }
+                    if current.members.allSatisfy(\.uploaded) && !underway.contains(Self.describe(key, Self.manifestName)) { try self.startManifest(current, root: root, dataRoot: destination.dataRoot) }
                 } catch {
                     self.fail(id, error)
                 }
@@ -69,19 +66,20 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         }
     }
 
-    // Asks the receiver until it answers that the recording's archive is stored, then deletes the recording from the phone and completes its upload; a refusal fails the upload, and no answer is asked again.
-    private func confirmStored(_ info: RecordingInfo, server: String) {
+    // Asks the receiver until it answers that the recording's archive is stored under its data root, then deletes the recording from the phone and completes its upload; a refusal fails the upload, and no answer is asked again.
+    private func confirmStored(_ info: RecordingInfo, destination: UploadDestination) {
         observers[info.id]?.onProgress(1)
-        guard let url = URL(string: "\(server.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/")))/stored/\(info.id)") else { return fail(info.id, RecorderError("bad server URL")) }
+        guard let address = UsersFile.address(of: destination.server), let url = URL(string: "\(address.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/stored/\(info.id)") else { return fail(info.id, RecorderError("this build gives no address for the server \(destination.server)")) }
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.setValue(Secrets.uploadToken, forHTTPHeaderField: "X-Upload-Token")
+        request.setValue(destination.dataRoot, forHTTPHeaderField: "X-Data-Root")
         URLSession.shared.dataTask(with: request) { data, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode
             let stored = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["stored"] as? Bool
             DispatchQueue.main.async { [self] in
                 if let status, status != 200 { return fail(info.id, RecorderError("server replied \(status) to the stored check: \(String(decoding: data ?? Data(), as: UTF8.self))")) }
                 guard stored == true else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.storedRetrySeconds) { self.confirmStored(info, server: server) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.storedRetrySeconds) { self.confirmStored(info, destination: destination) }
                     return
                 }
                 do {
@@ -96,11 +94,12 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         }.resume()
     }
 
-    // Asks the receiver at server for the recordings it holds; completion is called on the main queue.
-    func listRecordings(on server: String, completion: @escaping (Result<[ServerRecording], Error>) -> Void) {
-        guard let url = URL(string: "\(server.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/")))/recordings") else { return completion(.failure(RecorderError("bad server URL"))) }
+    // Asks the destination's receiver for the recordings its data root holds; completion is called on the main queue.
+    func listRecordings(on destination: UploadDestination, completion: @escaping (Result<[ServerRecording], Error>) -> Void) {
+        guard let address = UsersFile.address(of: destination.server), let url = URL(string: "\(address.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/recordings") else { return completion(.failure(RecorderError("this build gives no address for the server \(destination.server)"))) }
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.setValue(Secrets.uploadToken, forHTTPHeaderField: "X-Upload-Token")
+        request.setValue(destination.dataRoot, forHTTPHeaderField: "X-Data-Root")
         URLSession.shared.dataTask(with: request) { data, response, error in
             let result = Result<[ServerRecording], Error> {
                 if let error { throw error }
@@ -117,26 +116,28 @@ final class Uploader: NSObject, URLSessionDataDelegate {
     }
 
     // Starts the PUT of a segment its recording has just closed, while it records.
-    func uploadSegment(_ segment: Segment, server: String) {
-        guard let root = Self.root(server, segment.uploadId) else { return }
-        start(segment.file, to: root.appendingPathComponent(segment.name), sha256: segment.sha256, as: Self.describe(segment.uploadId, segment.name))
+    func uploadSegment(_ segment: Segment, to destination: UploadDestination) {
+        // A segment that cannot go up stays on the phone, and the recording's upload reports why once it is finished.
+        guard let address = UsersFile.address(of: destination.server), let root = Self.root(address, segment.uploadId) else { return }
+        start(segment.file, to: root.appendingPathComponent(segment.name), sha256: segment.sha256, dataRoot: destination.dataRoot, as: Self.describe(segment.uploadId, segment.name))
     }
 
-    // Where a recording's files go: <server>/upload/<key>/.
-    private static func root(_ server: String, _ key: String) -> URL? {
-        let base = server.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    // Where a recording's files go: <address>/upload/<key>/.
+    private static func root(_ address: String, _ key: String) -> URL? {
+        let base = address.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         return URL(string: "\(base)/upload/\(key)/")
     }
 
     // A task's description, which tells even a relaunched app which recording's key and file the task carries.
     private static func describe(_ key: String, _ name: String) -> String { "\(key)/\(name)" }
 
-    // Starts the PUT of a file with its SHA-256.
-    private func start(_ file: URL, to url: URL, sha256: String, as description: String) {
+    // Starts the PUT of a file with its SHA-256, into the data root.
+    private func start(_ file: URL, to url: URL, sha256: String, dataRoot: String, as description: String) {
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue(Secrets.uploadToken, forHTTPHeaderField: "X-Upload-Token")
         request.setValue(sha256, forHTTPHeaderField: "X-Content-SHA256")
+        request.setValue(dataRoot, forHTTPHeaderField: "X-Data-Root")
         let task = session.uploadTask(with: request, fromFile: file)
         task.taskDescription = description
         task.resume()
@@ -152,8 +153,8 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         return info
     }
 
-    // Writes the recording's manifest beside its members, the members in recording.json's order with their sizes and SHA-256s, each frames file's consecutive segments grouped under it, and starts its PUT to root/manifest.json.
-    private func startManifest(_ info: RecordingInfo, root: URL) throws {
+    // Writes the recording's manifest beside its members, the members in recording.json's order with their sizes and SHA-256s, each frames file's consecutive segments grouped under it, and starts its PUT to root/manifest.json, into the data root.
+    private func startManifest(_ info: RecordingInfo, root: URL, dataRoot: String) throws {
         var members: [[String: Any]] = []
         for member in info.members {
             let entry: [String: Any] = ["name": member.name, "size": member.size, "sha256": member.sha256]
@@ -175,7 +176,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         if info.uploadId != nil { manifest["scan_id"] = info.id }
         let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: info.manifest, options: .atomic)
-        start(info.manifest, to: root.appendingPathComponent(Self.manifestName), sha256: SHA256.hash(data: data).hex, as: Self.describe(info.uploadKey, Self.manifestName))
+        start(info.manifest, to: root.appendingPathComponent(Self.manifestName), sha256: SHA256.hash(data: data).hex, dataRoot: dataRoot, as: Self.describe(info.uploadKey, Self.manifestName))
     }
 
     // A recording's recording.json as last written, read from disk the first time.
@@ -231,7 +232,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         replies[dataTask.taskIdentifier, default: Data()].append(data)
     }
 
-    // On the receiver's acknowledgement of a segment, deletes its file; of a finished recording's member, records it in recording.json, starting the manifest once every member is acknowledged; of the manifest, confirms the recording is stored and deletes it from the phone, or, for a recording before 5.0.3, completes its upload, removing its segments directory. A failed segment of a recording still recording goes up again.
+    // On the receiver's acknowledgement of a segment, deletes its file; of a finished recording's member, records it in recording.json, starting the manifest once every member is acknowledged; of the manifest, confirms the recording is stored and deletes it from the phone. A failed segment of a recording still recording goes up again.
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let (key, name) = Self.parse(task)
         sent[task.taskIdentifier] = nil
@@ -247,11 +248,11 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         let info = finished(key)
         if let failure {
             if let info { return fail(info.id, failure) }
-            guard Recording.isSegment(name), let request = task.originalRequest, let url = request.url, let sha256 = request.value(forHTTPHeaderField: "X-Content-SHA256") else { return }
+            guard Recording.isSegment(name), let request = task.originalRequest, let url = request.url, let sha256 = request.value(forHTTPHeaderField: "X-Content-SHA256"), let dataRoot = request.value(forHTTPHeaderField: "X-Data-Root") else { return }
             let file = Recording.segmentsDirectory(key).appendingPathComponent(name)
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.segmentRetrySeconds) { [self] in
                 guard finished(key) == nil, FileManager.default.fileExists(atPath: file.path) else { return }
-                start(file, to: url, sha256: sha256, as: Self.describe(key, name))
+                start(file, to: url, sha256: sha256, dataRoot: dataRoot, as: Self.describe(key, name))
             }
             return
         }
@@ -265,11 +266,9 @@ final class Uploader: NSObject, URLSessionDataDelegate {
             if name == Self.manifestName {
                 info.uploaded = true
                 try save(info)
-                if case .upload(let server)? = info.target { return confirmStored(info, server: server) }
-                // A recording before 5.0.3 stays on the phone.
-                if let segments = info.segmentsDirectory { try? FileManager.default.removeItem(at: segments) }
-                observers.removeValue(forKey: info.id)?.completion(.success(()))
-                return
+                // A recording 5.0.3 or 5.1 sent to a server alone stays on this phone, as RecordingTarget reads it.
+                guard case .upload(let destination)? = info.target else { observers.removeValue(forKey: info.id)?.completion(.success(())); return }
+                return confirmStored(info, destination: destination)
             }
             guard let i = info.members.firstIndex(where: { $0.name == name }) else { preconditionFailure("a task for \(name), which \(info.id) has no member of") }
             // A member sent twice, which only its first acknowledgement records.
@@ -278,9 +277,9 @@ final class Uploader: NSObject, URLSessionDataDelegate {
             try save(info)
             reportProgress(info.id)
             guard info.members.allSatisfy(\.uploaded) else { return }
-            guard let url = task.originalRequest?.url else { preconditionFailure("a task without its request") }
+            guard let url = task.originalRequest?.url, let dataRoot = task.originalRequest?.value(forHTTPHeaderField: "X-Data-Root") else { preconditionFailure("a task without its request") }
             // The manifest goes where its members went.
-            try startManifest(info, root: url.deletingLastPathComponent())
+            try startManifest(info, root: url.deletingLastPathComponent(), dataRoot: dataRoot)
         } catch {
             fail(info.id, error)
         }
@@ -296,15 +295,4 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         guard let parts = task.taskDescription?.split(separator: "/"), parts.count == 2 else { preconditionFailure("a task described as \(task.taskDescription ?? "nothing"), not <key>/<file>") }
         return (String(parts[0]), String(parts[1]))
     }
-}
-
-// A recording a receiver holds, as GET /recordings lists it; the fields from its scan_metadata.json are nil for a tar without one.
-struct ServerRecording: Decodable, Identifiable {
-    let scanId: String
-    let size: Int64
-    let name: String?
-    let startTimeUtc: Date?
-    let durationS: Double?
-    let camera: String?
-    var id: String { scanId }
 }

@@ -7,7 +7,21 @@ struct RGBDScannerApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
+        }
+    }
+}
+
+// The config selection first, then the scanner, uploading to the config chosen, until it goes back.
+struct RootView: View {
+    @StateObject private var model = AppModel()
+    @StateObject private var store = UserStore()
+
+    var body: some View {
+        if model.selection == nil {
+            ConfigSelectionView(model: model, store: store)
+        } else {
+            ContentView(model: model)
         }
     }
 }
@@ -32,7 +46,7 @@ enum UploadState: Equatable {
     // The receiver has acknowledged every file; the recording leaves the phone once the receiver has stored it.
     case uploaded
     case failed(String)
-    // A recording kept on this phone, never uploaded.
+    // A recording of the This phone config, never uploaded.
     case keptOnPhone
 
     var canStart: Bool {
@@ -53,12 +67,6 @@ enum UploadState: Equatable {
     }
 }
 
-// Where a recording goes: kept on this phone, never uploaded, or uploaded to the receiver at server while it records and deleted from the phone once the receiver has stored it.
-enum RecordingTarget: Codable, Hashable {
-    case phone
-    case upload(server: String)
-}
-
 // A finished recording's Documents/<id>/recording.json, beside the recording's files, its members, in that directory, the segments of its frames files in its segments directory from 5.0.3; the uploader rewrites it as the receiver acknowledges each member.
 struct RecordingInfo: Codable {
     let id: String
@@ -69,7 +77,8 @@ struct RecordingInfo: Codable {
     let camera: DepthCamera
     // The key the recording's files upload under: from 5.0.3, which uploads its frames while recording, its work directory's name, fixed before its id; nil before, when they upload under the id.
     let uploadId: String?
-    // Where the recording goes; nil before 5.0.3, when every recording uploaded and stayed on the phone.
+    // The user who recorded it, nil before 5.2, and where it goes, the config chosen when it was recorded, nil before 5.0.3.
+    let user: String?
     let target: RecordingTarget?
     // The recording's files, in the order the manifest lists them, each frames file's segments in its place.
     var members: [Member]
@@ -90,7 +99,9 @@ struct RecordingInfo: Codable {
     var directory: URL { Self.directory(id) }
     var file: URL { directory.appendingPathComponent(Self.fileName) }
     var uploadKey: String { uploadId ?? id }
-    // Where a 5.0.3 recording's segments are kept until the receiver acknowledges them.
+    // Whether it stays on this phone: kept there by its config, or with none, as before 5.0.3.
+    var staysOnPhone: Bool { target == nil || target == .phone }
+    // Where a recording's segments are kept from 5.0.3 until the receiver acknowledges them.
     var segmentsDirectory: URL? { uploadId.map(Recording.segmentsDirectory) }
     // The file holding a member: a segment's in the segments directory, any other in the recording's directory.
     func url(of member: Member) -> URL {
@@ -120,8 +131,8 @@ struct RecordingFile: Identifiable {
     var upload: UploadState
     var id: String { info.id }
     var size: Int64 { info.members.reduce(0) { $0 + Int64($1.size) } }
-    // Only a recording kept on this phone is deleted by hand; an uploaded one leaves the phone once the receiver has stored it, and the list then shows it from the receiver.
-    var canDelete: Bool { info.target == .phone }
+    // Only a recording kept on this phone is deleted by hand; an uploaded one leaves the phone once the receiver has stored it, and its config lists it from the receiver.
+    var canDelete: Bool { info.staysOnPhone }
 }
 
 final class AppModel: ObservableObject {
@@ -134,21 +145,12 @@ final class AppModel: ObservableObject {
     @Published var recordingStart = Date()
     @Published var message = ""
     @Published var files: [RecordingFile] = []
-    @Published var server: String {
-        didSet { UserDefaults.standard.set(server, forKey: "server") }
-    }
-    // Whether new recordings stay on this phone instead of uploading; the list shows those, or else the receiver's.
-    @Published var keepsOnPhone: Bool {
-        didSet {
-            UserDefaults.standard.set(keepsOnPhone, forKey: "keepsOnPhone")
-            serverRecordings = []
-            refreshServerRecordings()
-        }
-    }
-    // The recordings the receiver holds, as it last listed them; none while recordings stay on this phone.
+    // The user and config chosen on the selection page, which new recordings upload to; nil while it shows.
+    @Published var selection: Selection?
+    // For a server config, the recordings its receiver holds in the data root, as it last listed them.
     @Published var serverRecordings: [ServerRecording] = []
-    // The recordings on this phone the list shows: those kept here, or, uploading, those still on their way, a recording before 5.0.3 only until its upload is acknowledged.
-    var shownFiles: [RecordingFile] { files.filter { keepsOnPhone ? $0.info.target == .phone : $0.info.target.map { $0 != .phone } ?? !$0.info.uploaded } }
+    // The recordings on this phone the scanner lists: those made with the chosen config, by any user, as configs such as This phone are shared, This phone's also those with no config.
+    var shownFiles: [RecordingFile] { files.filter { selection?.target == .phone ? $0.info.staysOnPhone : $0.info.target == selection?.target } }
     @Published var showsDepth = false {
         didSet {
             recorder.depthPreview.isEnabled = showsDepth
@@ -162,6 +164,11 @@ final class AppModel: ObservableObject {
     // The recording whose delete is awaiting confirmation.
     @Published var pendingDelete: RecordingFile?
 
+    struct Selection: Equatable {
+        let user: String
+        let target: RecordingTarget
+    }
+
     let availableCameras: [DepthCamera]
     let recorder: Recorder
     // The name given when the recording started; nil when naming was deferred.
@@ -170,8 +177,6 @@ final class AppModel: ObservableObject {
     private var unnamed: (recording: Recording, stopNote: String?)?
 
     init() {
-        server = UserDefaults.standard.string(forKey: "server") ?? Secrets.server
-        keepsOnPhone = UserDefaults.standard.bool(forKey: "keepsOnPhone")
         availableCameras = DepthCamera.allCases.filter(\.isAvailable)
         recorder = Recorder(cameras: availableCameras)
         if let first = availableCameras.first { camera = first }
@@ -182,8 +187,8 @@ final class AppModel: ObservableObject {
         }
         recorder.onInterruption = { [weak self] reason in self?.stopRecording(because: reason) }
         refreshFiles()
-        // A recording uploading resumes, the members the receiver acknowledged and those still on their way not sent again, and one uploaded leaves the phone once the receiver has stored it; one before 5.0.3 resumes only if not yet uploaded.
-        files.filter { $0.info.target.map { $0 != .phone } ?? !$0.info.uploaded }.forEach { upload($0.id) }
+        // A recording uploading resumes, the members the receiver acknowledged and those still on their way not sent again, and one uploaded leaves the phone once the receiver has stored it.
+        files.filter { if case .upload = $0.info.target { return true } else { return false } }.forEach { upload($0.id) }
         recoverLeftovers()
         addMissingMembers()
     }
@@ -218,6 +223,35 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // Opens the scanner, its recordings going where the user's config says.
+    func select(user: String, target: RecordingTarget) {
+        selection = Selection(user: user, target: target)
+        serverRecordings = []
+        refreshServerRecordings()
+    }
+
+    // Asks the chosen server config's receiver which recordings its data root holds; This phone has none.
+    func refreshServerRecordings() {
+        guard let selection, case .upload(let destination) = selection.target else { return }
+        Uploader.shared.listRecordings(on: destination) { result in
+            // The config may have changed while the receiver answered.
+            guard self.selection == selection else { return }
+            switch result {
+            case .success(let recordings): self.serverRecordings = recordings
+            case .failure(let error): self.message = "Cannot list \(destination.server) \(destination.dataRoot): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // Goes back to the selection page, closing the camera; not while recording.
+    func leaveScanner() {
+        guard !isRecording && !isStarting else { return }
+        recorder.stop()
+        formatSummary = ""
+        selection = nil
+        serverRecordings = []
+    }
+
     func startPreview() {
         AVCaptureDevice.requestAccess(for: .video) { granted in
             DispatchQueue.main.async {
@@ -242,13 +276,13 @@ final class AppModel: ObservableObject {
 
     // Starts recording once the start prompt is answered, by naming the recording or deferring its name.
     func startRecording(named: Bool) {
+        guard let selection else { preconditionFailure("recording with no config chosen") }
         userName = named ? enteredName : nil
         isStarting = true
-        // Uploading, each segment goes up as soon as the recording closes it, to the receiver set when it started; kept on the phone, it stays.
-        let target: RecordingTarget = keepsOnPhone ? .phone : .upload(server: server)
-        recorder.startRecording(target: target, onSegment: { segment in
-            guard case .upload(let server) = target else { return }
-            DispatchQueue.main.async { Uploader.shared.uploadSegment(segment, server: server) }
+        // Uploading, each segment goes up as soon as the recording closes it; kept on the phone, it stays.
+        recorder.startRecording(user: selection.user, target: selection.target, onSegment: { segment in
+            guard case .upload(let destination) = selection.target else { return }
+            DispatchQueue.main.async { Uploader.shared.uploadSegment(segment, to: destination) }
         }) { result in
             self.isStarting = false
             switch result {
@@ -307,7 +341,7 @@ final class AppModel: ObservableObject {
         case .success(let info?):
             outcome = "Saved \(info.name)"
             refreshFiles()
-            if info.target != .phone { upload(info.id) }
+            if case .upload = info.target { upload(info.id) }
         case .success(nil):
             outcome = "Nothing was recorded"
         case .failure(let error):
@@ -320,7 +354,7 @@ final class AppModel: ObservableObject {
     func upload(_ id: String) {
         guard let file = files.first(where: { $0.id == id }), file.upload.canStart else { return }
         setUpload(id, .inProgress("uploading 0%"))
-        Uploader.shared.upload(id, server: server, onProgress: { fraction in
+        Uploader.shared.upload(id, onProgress: { fraction in
             self.setUpload(id, .inProgress(String(format: "uploading %.0f%%", fraction * 100)))
         }, completion: { result in
             switch result {
@@ -331,20 +365,6 @@ final class AppModel: ObservableObject {
             case .failure(let error): self.setUpload(id, .failed(error.localizedDescription))
             }
         })
-    }
-
-    // Asks the receiver which recordings it holds; while recordings stay on this phone it is not asked.
-    func refreshServerRecordings() {
-        guard !keepsOnPhone else { return }
-        let server = self.server
-        Uploader.shared.listRecordings(on: server) { result in
-            // The list may have changed to the phone's, or the server, while the receiver answered.
-            guard !self.keepsOnPhone, self.server == server else { return }
-            switch result {
-            case .success(let recordings): self.serverRecordings = recordings
-            case .failure(let error): self.message = "Cannot list the server's recordings: \(error.localizedDescription)"
-            }
-        }
     }
 
     // Deletes a recording kept on this phone, with its segments.
@@ -371,7 +391,7 @@ final class AppModel: ObservableObject {
         for file in urls.map({ $0.appendingPathComponent(RecordingInfo.fileName) }) where FileManager.default.fileExists(atPath: file.path) && !Recording.listsNoMembers(file) {
             do {
                 let info = try RecordingInfo.load(file)
-                let state: UploadState = info.target == .phone ? .keptOnPhone : info.uploaded ? .uploaded : .notUploaded
+                let state: UploadState = info.staysOnPhone ? .keptOnPhone : info.uploaded ? .uploaded : .notUploaded
                 listed.append(RecordingFile(info: info, upload: inFlight[info.id] ?? state))
             } catch {
                 message = "Unreadable \(file.deletingLastPathComponent().lastPathComponent)/\(RecordingInfo.fileName): \(error.localizedDescription)"

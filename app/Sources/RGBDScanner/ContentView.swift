@@ -1,11 +1,23 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var model = AppModel()
+    @ObservedObject var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(spacing: 8) {
+            HStack(alignment: .top) {
+                Button { model.leaveScanner() } label: { Label("Configs", systemImage: "chevron.left") }
+                    .disabled(model.isRecording || model.isStarting)
+                Spacer()
+                if let selection = model.selection {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(selection.user).font(.caption.bold())
+                        Text("\(selection.target.title) · \(selection.target.detail)").font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+                    }
+                }
+            }
+
             if model.availableCameras.count > 1 {
                 Picker("Camera", selection: $model.camera) {
                     ForEach(model.availableCameras) { Text($0.label).tag($0) }
@@ -68,23 +80,12 @@ struct ContentView: View {
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 
-            Toggle("Keep recordings on this phone", isOn: $model.keepsOnPhone).font(.caption)
-                .disabled(model.isRecording || model.isStarting)
-            if !model.keepsOnPhone {
-                HStack {
-                    Text("Server").font(.caption)
-                    TextField("http://host:port", text: $model.server)
-                        .textFieldStyle(.roundedBorder).font(.caption)
-                        .keyboardType(.URL).autocorrectionDisabled().textInputAutocapitalization(.never)
-                        .onSubmit { model.refreshServerRecordings() }
-                }
-            }
-
             List {
-                // The recordings kept on this phone, or those still uploading, then those the receiver holds.
+                // The recordings on this phone, then, for a server config, those its receiver holds in the data root.
                 ForEach(model.shownFiles) { file in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(file.info.name).font(.caption.bold())
+                    Text("by \(file.info.user ?? "unknown")").font(.caption2)
                     Text([
                         file.info.startTime.formatted(date: .abbreviated, time: .standard),
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
@@ -93,7 +94,7 @@ struct ContentView: View {
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()
-                        // A recording that uploads does so once it is named; a failed upload can be retried.
+                        // A recording on a server config uploads once it is named; a failed upload can be retried.
                         if case .failed = file.upload {
                             Button("Retry") { model.upload(file.id) }.font(.caption).buttonStyle(.bordered)
                         }
@@ -107,6 +108,7 @@ struct ContentView: View {
                 ForEach(model.serverRecordings) { recording in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(recording.name ?? recording.scanId).font(.caption.bold())
+                        Text("by \(recording.author ?? "unknown")").font(.caption2)
                         Text([
                             recording.startTimeUtc?.formatted(date: .abbreviated, time: .standard),
                             recording.durationS.map { Duration.seconds($0).formatted(.time(pattern: .minuteSecond)) },
@@ -120,10 +122,7 @@ struct ContentView: View {
             .refreshable { model.refreshServerRecordings() }
         }
         .padding(.horizontal)
-        .onAppear {
-            model.startPreview()
-            model.refreshServerRecordings()
-        }
+        .onAppear { model.startPreview() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.stopRecording(because: "the app went to the background") }
         }

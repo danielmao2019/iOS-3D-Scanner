@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.1") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2") and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """
@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, SCAN_METADATA_KEYS, Recording, valid, ycbcr_planes
+from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, Recording, scan_metadata_keys, valid, ycbcr_planes
 
 TRACKING_STATES = {"normal", "not_available", "limited_initializing", "limited_excessive_motion", "limited_insufficient_features", "limited_relocalizing"}
 # How far a Float32 intrinsic recomputed here may differ from the app's: a few units in the last place, far below the 0.43 depth px that the wrong origin convention moves cx, cy.
@@ -430,7 +430,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     if rear and 4 <= rec.format_minor <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
     if format_4_8:
-        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == SCAN_METADATA_KEYS and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
+        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == scan_metadata_keys(rec.format_version) and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
     else:
         checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():
