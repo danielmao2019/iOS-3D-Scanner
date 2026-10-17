@@ -21,8 +21,8 @@ Long scans may cause the device out of space (study the logs to see the details 
 Solutions (all items to be implemented):
 1. record both color and depth streams at 15fps, hard coded.
 2. implement lossless compression (encode on the app and decode in the data pipeline).
-3. implement immediate upload to server and delete a frame on phone after it arrives at server.
-4. lower front camera color frames resolution from 4032x3024 to 1920x1440.
+3. lower front camera color frames resolution from 4032x3024 to 1920x1440.
+4. implement immediate upload to server and delete a frame on phone after it arrives at server. an option to have the data stay on phone should still be supported (see problem 3).
 
 ### 1.2. Problem 2: Recording Naming UI
 
@@ -36,12 +36,14 @@ Once the record button is clicked, it then prompts for a name before recording, 
 2. Each user should be able to save multiple configs, where each config is a (server, data root) pair.
 3. For now, no authentication is required. You can think of users simply as folders of config grouping.
 4. For now, i need two users, `daniel` and `dmytro.klepachevskyi`.
-   1. for `daniel`, make two configs:
-      1. citrus server and the `outputs` dir of this task. this config is used for any testing recording when working on this task.
+   1. for `daniel`, make three configs:
+      1. the data stays on the iphone.
+      2. citrus server and the `outputs` dir of this task. this config is used for any testing recording when working on this task.
+      3. aloe server and `/pub0/data/officehours-v2/` this data root dir path.
+   2. for `dmytro.klepachevskyi`, make three configs:
+      1. the data stays on the iphone.
       2. aloe server and `/pub0/data/officehours-v2/` this data root dir path.
-   2. for `dmytro.klepachevskyi`, make two configs:
-      1. aloe server and `/pub0/data/officehours-v2/` this data root dir path.
-      2. aloe server and `/pub0/dmytro.klepachevskyi/rgbd-scanner-test-recordings/` this data root dir path.
+      3. aloe server and `/pub0/dmytro.klepachevskyi/rgbd-scanner-test-recordings/` this data root dir path.
 5. when the app is opened, choose a user/config and then go to the scanner page. at the scanner page, there should be a button to go back to the user/config selection page.
 
 ## 2. Definition of Done
