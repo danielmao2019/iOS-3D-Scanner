@@ -187,6 +187,9 @@ final class AVFoundationSource: NSObject, CaptureSource, AVCaptureVideoDataOutpu
 private struct CaptureFormat {
     // Color and depth run at this one duration, so every depth map is captured at the instant of a color frame.
     static let frameDuration = CMTime(value: 1, timescale: CMTimeScale(StreamFormat.framesPerSecond))
+    // The color frame size, the camera's 4:3 view at 1920 wide: a frame of 4.1 MB, where a 4032 x 3024 frame took 18.3 MB.
+    static let colorWidth = 1920
+    static let colorHeight = 1440
 
     let color: AVCaptureDevice.Format
     let depth: AVCaptureDevice.Format
@@ -199,11 +202,11 @@ private struct CaptureFormat {
             depthWidth: Int(depthDims.width), depthHeight: Int(depthDims.height), depthPixelFormat: CMFormatDescriptionGetMediaSubType(depth.formatDescription),
             confidencePixelFormat: nil,
             frameRate: Double(StreamFormat.framesPerSecond),
-            // Apple measures the principal points of the frames' intrinsic matrices and of the depth calibration's from "the upper left of the frame".
+            // Apple measures the principal points of the frames' intrinsic matrices and of the depth calibration's from "the upper left of the frame"; Recording carries a color frame's to the frame's corner as the calibration's (Intrinsics.carriedAboutCorner).
             principalPointOrigin: .upperLeftPixelCorner)
     }
 
-    // The pair with the largest depth map, then the most precise depth type, then the largest color frame, among the pairs whose formats both run at frameDuration.
+    // The pair with the largest depth map, then the most precise depth type, among the pairs of a colorWidth x colorHeight color format and a depth format that both run at frameDuration.
     static func best(for device: AVCaptureDevice) -> CaptureFormat? {
         // Each depth type's precision rank.
         let depthRanks: [OSType: Int] = [
@@ -215,10 +218,12 @@ private struct CaptureFormat {
         var best: (CaptureFormat, [Int])?
         for color in device.formats where CMFormatDescriptionGetMediaSubType(color.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && supportsFrameDuration(color) {
             let colorDims = CMVideoFormatDescriptionGetDimensions(color.formatDescription)
+            guard colorDims.width == colorWidth && colorDims.height == colorHeight else { continue }
             for depth in color.supportedDepthDataFormats where supportsFrameDuration(depth) {
                 guard let depthRank = depthRanks[CMFormatDescriptionGetMediaSubType(depth.formatDescription)] else { continue }
                 let depthDims = CMVideoFormatDescriptionGetDimensions(depth.formatDescription)
-                let key = [Int(depthDims.width) * Int(depthDims.height), depthRank, Int(colorDims.width) * Int(colorDims.height)]
+                // Several formats of one size can offer depth, which this picks among.
+                let key = [Int(depthDims.width) * Int(depthDims.height), depthRank]
                 if best == nil || best!.1.lexicographicallyPrecedes(key) {
                     best = (CaptureFormat(color: color, depth: depth), key)
                 }

@@ -30,14 +30,17 @@ You need a computer (Mac, Linux, or Windows with WSL), an iPhone with a depth ca
 - Open the app and allow the camera and local network access.
 - Choose Front or Rear, tap Record, name the recording or tap Later, then tap Stop.
 - Uploads start by themselves and continue after the app leaves the screen, but stop if the app is closed from the app switcher.
-- Recordings are uncompressed, both cameras at 15 fps: about 18 GB per minute for the front and 4 GB per minute for the rear.
+- Recordings are uncompressed, both cameras at 15 fps: about 4.8 GB per minute for the front and 4 GB per minute for the rear.
 - The rear lens distortion and the front depth offset are not in the recordings; they are measured once per phone.
 
 ## App versions
 
-Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" from v5.0.0.
+Newest first. Each line is one change: what the previous version did, then what this version does. A recording's `format_version` is the version of the app that wrote it, without the "v": the integers 1, 3 and 5 for v1 to v3, and "4.0" to "4.8" from v4.0 on, then "5.0.0" and "5.0.1" for v5.0.0 and v5.0.1.
 
-### v5.0.0 (2026-10-15)
+### v5.0.1 (2026-10-16)
+- Front color: v5.0.0 recorded the front's color at 4032x3024, 18.3 MB a frame, so a front recording wrote about 293 MB/s. v5.0.1 records it at 1920x1440, the camera's 4:3 view at 1920 wide, 4.1 MB a frame, with the same 640x480 depth, the largest and most precise depth that size offers, so a front recording writes about 81 MB/s, 4.8 GB per minute. Apple carries each color frame's intrinsic matrix from the calibration's 4032x3024 about pixel centers, which a frame of that size did not show; v5.0.1 carries its principal point about the frame's corner, as the depth intrinsics and the distortion centers are carried, 0.26 px further right and down, so the color and depth intrinsics agree.
+
+### v5.0.0 (2026-10-15, 9845ed4)
 - Frame rate: v4.8 recorded the rear at ARKit's 60 fps and the front at the highest rate within a 300 MB/s storage write budget, 15 fps. v5.0.0 records both cameras at a fixed 15 fps, the rear as every fourth of ARKit's 60 fps frames, so a rear recording writes about 4 GB per minute instead of 16 GB.
 
 ### v4.8 (2026-10-08, 0fb92cb; fixed 2026-10-09 in 7404d9f)
