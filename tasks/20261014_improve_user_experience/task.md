@@ -12,7 +12,7 @@ goal: improve user experience
 
 ## 1. Guidelines
 
-The builds this task produces are enumerated from 5.0. Every solved problem is a subversion (doesn't have to happen in order). e.g., once you solve problem 2, then that's 5.0, and once you solve problem 1 afterwards, that's 5.1.
+The builds this task produces are enumerated from 5.0. Every solved problem is a subversion (must enumerate and order the same way as this doc, if i reorder or reenumerate items, your commits must follow).
 
 ### 1.1. Problem 1: Arbitrarily Long Recordings
 
