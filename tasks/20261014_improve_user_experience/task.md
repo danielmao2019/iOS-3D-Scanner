@@ -48,6 +48,7 @@ Once the record button is clicked, it then prompts for a name before recording, 
       2. aloe server and `/pub0/data/officehours-v2/` this data root dir path.
       3. aloe server and `/pub0/dmytro.klepachevskyi/rgbd-scanner-test-recordings/` this data root dir path.
 5. when the app is opened, choose a user/config and then go to the scanner page. at the scanner page, there should be a button to go back to the user/config selection page.
+6. each recording should have an author field and the lists of recordings should show the author field.
 
 ## 2. Definition of Done
 
