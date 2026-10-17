@@ -1,11 +1,23 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var model = AppModel()
+    @ObservedObject var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(spacing: 8) {
+            HStack(alignment: .top) {
+                Button { model.leaveScanner() } label: { Label("Configs", systemImage: "chevron.left") }
+                    .disabled(model.isRecording || model.isStarting)
+                Spacer()
+                if let selection = model.selection {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(selection.user).font(.caption.bold())
+                        Text("\(selection.target.title) · \(selection.target.detail)").font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+                    }
+                }
+            }
+
             if model.availableCameras.count > 1 {
                 Picker("Camera", selection: $model.camera) {
                     ForEach(model.availableCameras) { Text($0.label).tag($0) }
@@ -68,16 +80,12 @@ struct ContentView: View {
 
             if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary) }
 
-            HStack {
-                Text("Server").font(.caption)
-                TextField("http://host:port", text: $model.server)
-                    .textFieldStyle(.roundedBorder).font(.caption)
-                    .keyboardType(.URL).autocorrectionDisabled().textInputAutocapitalization(.never)
-            }
-
-            List(model.files) { file in
+            List {
+                // The recordings on this phone, then, for a server config, those its receiver holds in the data root.
+                ForEach(model.shownFiles) { file in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(file.info.name).font(.caption.bold())
+                    Text("by \(file.info.user ?? "unknown")").font(.caption2)
                     Text([
                         file.info.startTime.formatted(date: .abbreviated, time: .standard),
                         Duration.seconds(file.info.durationSeconds).formatted(.time(pattern: .minuteSecond)),
@@ -86,17 +94,32 @@ struct ContentView: View {
                     HStack {
                         Text(file.upload.label).font(.caption2).foregroundStyle(.secondary)
                         Spacer()
-                        // Every recording uploads once it is named; a failed upload can be retried.
+                        // A recording on a server config uploads once it is named; a failed upload can be retried.
                         if case .failed = file.upload {
                             Button("Retry") { model.upload(file.id) }.font(.caption).buttonStyle(.bordered)
                         }
-                        Button { model.pendingDelete = file } label: { Image(systemName: "trash") }
-                            .buttonStyle(.borderless).foregroundStyle(.red)
-                            .disabled(!file.canDelete)
+                        if file.canDelete {
+                            Button { model.pendingDelete = file } label: { Image(systemName: "trash") }
+                                .buttonStyle(.borderless).foregroundStyle(.red)
+                        }
+                    }
+                }
+                }
+                ForEach(model.serverRecordings) { recording in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(recording.name ?? recording.scanId).font(.caption.bold())
+                        Text("by \(recording.author ?? "unknown")").font(.caption2)
+                        Text([
+                            recording.startTimeUtc?.formatted(date: .abbreviated, time: .standard),
+                            recording.durationS.map { Duration.seconds($0).formatted(.time(pattern: .minuteSecond)) },
+                            ByteCountFormatter.string(fromByteCount: recording.size, countStyle: .file),
+                        ].compactMap { $0 }.joined(separator: " · ")).font(.caption2.monospacedDigit())
+                        Text("on the server").font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }
             .listStyle(.plain)
+            .refreshable { model.refreshServerRecordings() }
         }
         .padding(.horizontal)
         .onAppear { model.startPreview() }
@@ -105,19 +128,21 @@ struct ContentView: View {
         }
         .alert("Name this recording", isPresented: $model.asksNameBeforeStart) {
             TextField("Name", text: $model.nameDraft)
+            // Start takes a name; Later records unnamed, to be named at Stop; Cancel goes back without recording.
+            Button("Start") { model.startRecording(named: true) }.disabled(model.enteredName == nil)
             Button("Later") { model.startRecording(named: false) }
-            Button("Start") { model.startRecording(named: true) }
+            Button("Cancel", role: .cancel) {}
         }
         .alert("Name this recording", isPresented: $model.asksNameAfterStop) {
             TextField("Name", text: $model.nameDraft)
+            Button("Save") { model.nameStopped(named: true) }.disabled(model.enteredName == nil)
             Button("Use date and time") { model.nameStopped(named: false) }
-            Button("Save") { model.nameStopped(named: true) }
         }
         .alert("Delete recording?", isPresented: Binding(get: { model.pendingDelete != nil }, set: { if !$0 { model.pendingDelete = nil } }), presenting: model.pendingDelete) { file in
             Button("Delete", role: .destructive) { model.delete(file) }
             Button("Cancel", role: .cancel) {}
         } message: { file in
-            Text("\(file.info.name) is deleted from this iPhone. The copy on the server is kept.")
+            Text("\(file.info.name) is deleted from this iPhone, the only place it is kept.")
         }
     }
 }

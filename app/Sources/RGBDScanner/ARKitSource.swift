@@ -2,7 +2,7 @@ import ARKit
 import AVFoundation
 import UIKit
 
-// The rear LiDAR camera through an ARSession running world tracking with scene depth and autofocus: each ARFrame carries the color image, the camera's pose, the LiDAR depth registered to the image, unsmoothed (sceneDepth), and the depth's confidence, all at the frame's timestamp.
+// The rear LiDAR camera through an ARSession running world tracking with scene depth and autofocus: each ARFrame carries the color image, the camera's pose, the LiDAR depth registered to the image, unsmoothed (sceneDepth), and the depth's confidence, all at the frame's timestamp. ARKit runs at its video format's rate, which tracking relies on; the screen shows every frame, and the sink gets the frames StreamFormat.framesPerSecond apart.
 final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
     let device: AVCaptureDevice
     var preview: UIView { display }
@@ -14,6 +14,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
 
     // Owned by queue: the start's ready, until the first frame with scene depth gives the stream format.
     private var pendingReady: ((Result<StreamFormat, Error>) -> Void)?
+    // Owned by queue: the timestamp of the last frame handed to the sink.
+    private var lastHandedOver: TimeInterval?
 
     // The session delivers its frames on queue.
     init(sink: CaptureSink, queue: DispatchQueue) {
@@ -22,6 +24,8 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         guard let videoFormat = formats.max(by: { a, b in
             (a.imageResolution.width * a.imageResolution.height, a.framesPerSecond) < (b.imageResolution.width * b.imageResolution.height, b.framesPerSecond)
         }) else { preconditionFailure("world tracking has no 4:3 video format") }
+        // Handing over every n-th frame keeps the handed-over frames evenly spaced.
+        precondition(videoFormat.framesPerSecond % StreamFormat.framesPerSecond == 0, "ARKit's \(videoFormat.framesPerSecond) fps is not a multiple of \(StreamFormat.framesPerSecond) fps")
         // The camera ARKit captures through, whose rotation gives each color frame's upright rotation.
         guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { preconditionFailure("world tracking names no primary camera") }
         precondition(device.deviceType == videoFormat.captureDeviceType && device.position == videoFormat.captureDevicePosition,
@@ -41,7 +45,10 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
         // Unsmoothed depth: .smoothedSceneDepth would average it over time.
         configuration.frameSemantics = [.sceneDepth]
         configuration.isAutoFocusEnabled = true
-        queue.sync { pendingReady = ready }
+        queue.sync {
+            pendingReady = ready
+            lastHandedOver = nil
+        }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -60,6 +67,9 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             ready(streamFormat(image: image, depth: depth))
         }
         display.show(image, at: time)
+        // Half of ARKit's frame interval of slack hands over the frame that is due even when its timestamp comes slightly early.
+        if let lastHandedOver, frame.timestamp - lastHandedOver < 1 / Double(StreamFormat.framesPerSecond) - 0.5 / Double(videoFormat.framesPerSecond) { return }
+        lastHandedOver = frame.timestamp
         let camera = frame.camera
         sink?.captured(color: ColorSample(
             time: time,
@@ -123,7 +133,7 @@ final class ARKitSource: NSObject, CaptureSource, ARSessionDelegate {
             colorWidth: colorWidth, colorHeight: colorHeight, colorYCbCrMatrix: ycbcrMatrix(image),
             depthWidth: depthWidth, depthHeight: depthHeight, depthPixelFormat: CVPixelBufferGetPixelFormatType(map),
             confidencePixelFormat: CVPixelBufferGetPixelFormatType(confidence),
-            frameRate: Double(videoFormat.framesPerSecond),
+            frameRate: Double(StreamFormat.framesPerSecond),
             // ARCamera.intrinsics measure the principal point from the center of the upper-left pixel, as ARCamera.h says.
             principalPointOrigin: .upperLeftPixelCenter))
     }

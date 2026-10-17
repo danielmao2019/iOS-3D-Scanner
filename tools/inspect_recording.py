@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2") and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """
@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, SCAN_METADATA_KEYS, Recording, valid, ycbcr_planes
+from rgbd_recording import HIGH_CONFIDENCE, INTRINSICS, ORIENTATION, POSE, SAME_INSTANT_S, Recording, scan_metadata_keys, valid, ycbcr_planes
 
 TRACKING_STATES = {"normal", "not_available", "limited_initializing", "limited_excessive_motion", "limited_insufficient_features", "limited_relocalizing"}
 # How far a Float32 intrinsic recomputed here may differ from the app's: a few units in the last place, far below the 0.43 depth px that the wrong origin convention moves cx, cy.
@@ -270,10 +270,25 @@ def measured_frame_members(rec: Recording) -> Dict[str, Tuple[int, str]]:
 
 
 def frame_counts_match(rec: Recording, measured: Dict[str, Tuple[int, str]]) -> bool:
-    """Whether a format 4.8 recording's color_frames.bin, depth_frames.bin and rear depth_frames_confidence.bin each hold, by their measured size in the tar, their frames metadata's frame_count frames, one per frames entry."""
+    """Whether a format 4.8 recording's color_frames.bin, depth_frames.bin and rear depth_frames_confidence.bin each hold, by their measured size in the tar, their frames metadata's frame_count frames, one per frames entry: frame_count frames' bytes, or for an encoded recording (from 5.0.2) the frames' compressed sizes summed."""
     color, depth = rec.color_frames_metadata, rec.depth_frames_metadata
-    files = [(color["file"], rec.color, color), (depth["file"], rec.depth, depth)] + ([(depth["confidence"]["file"], rec.confidence, depth)] if rec.confidence is not None else [])
-    return all(measured[name][0] == frames.nbytes and frames.shape[0] == metadata["frame_count"] == len(metadata["frames"]) for name, frames, metadata in files)
+    files = [(color["file"], rec.color, color, "compressed_size"), (depth["file"], rec.depth, depth, "compressed_size")] + ([(depth["confidence"]["file"], rec.confidence, depth, "confidence_compressed_size")] if rec.confidence is not None else [])
+    return all(measured[name][0] == (sum(f[size_key] for f in metadata["frames"]) if rec.encoded else frames.nbytes) and frames.shape[0] == metadata["frame_count"] == len(metadata["frames"]) for name, frames, metadata, size_key in files)
+
+
+def frames_decode_to_raw(rec: Recording) -> bool:
+    """Whether every color frame, depth map and rear confidence map of a recording with encoded frames (from 5.0.2) decodes to the bytes the app hashed before encoding it: each decoded frame's SHA-256 is its frames entry's raw_sha256."""
+    color, depth = rec.color_frames_metadata["frames"], rec.depth_frames_metadata["frames"]
+    streams = [(rec.color, color, "raw_sha256"), (rec.depth, depth, "raw_sha256")] + ([(rec.confidence, depth, "confidence_raw_sha256")] if rec.confidence is not None else [])
+    return all(hashlib.sha256(np.ascontiguousarray(frames[n]).tobytes()).hexdigest() == entry[key] for frames, entries, key in streams for n, entry in enumerate(entries))
+
+
+def stored_ratios(rec: Recording) -> str:
+    """How many times smaller than its frames' raw bytes each frame member of a recording with encoded frames (from 5.0.2) is stored."""
+    color, depth = rec.color_frames_metadata, rec.depth_frames_metadata
+    members = [(color["file"], len(rec.color) * rec.color.shape[1] * rec.color.shape[2]), (depth["file"], rec.depth.nbytes)] + ([(depth["confidence"]["file"], rec.confidence.nbytes)] if rec.confidence is not None else [])
+    raw, stored = sum(r for _, r in members), sum(rec.frame_files[name][0] for name, _ in members)
+    return ", ".join(f"{name} {r / rec.frame_files[name][0]:.2f}x" for name, r in members) + f"; all frames {raw / stored:.2f}x ({stored / 1e9:.2f} GB for {raw / 1e9:.2f} GB raw)"
 
 
 def depth_range(depth: np.ndarray) -> str:
@@ -361,8 +376,15 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         measured = measured_frame_members(rec)
         checks = {
             "color_frames.bin, depth_frames.bin and the rear's depth_frames_confidence.bin each hold, by their size in the tar, frame_count frames, one per frames entry": frame_counts_match(rec, measured),
-            "each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records": measured == rec.frame_files,
         }
+        if all(sha256 is not None for _, sha256 in rec.frame_files.values()):
+            checks["each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records"] = measured == rec.frame_files
+        else:
+            # 5.0.3 records each frame member's size only; frames_decode_to_raw checks its every byte.
+            checks["each frame member's size, read from inside the tar, is the one its frames metadata records"] = {name: size for name, (size, _) in measured.items()} == {name: size for name, (size, _) in rec.frame_files.items()}
+        if rec.encoded:
+            print("stored smaller than raw by: " + stored_ratios(rec))
+            checks["every frame decodes losslessly: each decoded color frame, depth map and confidence map has the SHA-256 the app took of its bytes before encoding them"] = frames_decode_to_raw(rec)
     else:
         checks = {
             "color.bin holds color_frames frames, one per color.csv row with an index": rec.color.shape[0] == len(rec.colors) == meta["color_frames"],
@@ -408,7 +430,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     if rear and 4 <= rec.format_minor <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
     if format_4_8:
-        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == SCAN_METADATA_KEYS and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
+        checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == scan_metadata_keys(rec.format_version) and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
     else:
         checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0
     for name, ok in checks.items():

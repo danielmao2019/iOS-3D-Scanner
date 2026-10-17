@@ -1,4 +1,4 @@
-"""Tests the tools on tiny synthetic front and rear recordings laid out exactly as their format says, format_version "4.8" and "4.7" tars: the reader's rows, its frames memory-mapped in place inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, a 4.8 recording's intrinsics, distortions, depth-to-color transforms, recorded checksums and Float16 depth, that it still reads a "4.0" tar, whose color.csv lacks the three columns 4.3 added, and that it rejects a tar that is not laid out as its format says; decode_recording's output files; that inspect_recording runs on both formats with every check passing but the two edge alignments, which need real images, and fails a 4.8 recording whose checksum or distortion runs are wrong; inspect_recording's spatial alignment on a larger synthetic rear tar whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened; and server/receive.py storing an uploaded 4.8 recording as one tar.
+"""Tests the tools on tiny synthetic front and rear recordings laid out exactly as their format says, format_version "4.8" and "4.7" tars and 5.0.2 and 5.0.3 tars encoded as the app encodes them: the reader's rows, its frames memory-mapped in place inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, a 4.8 recording's intrinsics, distortions, depth-to-color transforms, recorded checksums and Float16 depth, that it still reads a "4.0" tar, whose color.csv lacks the three columns 4.3 added, and that it rejects a tar that is not laid out as its format says; decode_recording's output files; that inspect_recording runs on both formats with every check passing but the two edge alignments, which need real images, and fails a 4.8 recording whose checksum or distortion runs are wrong; inspect_recording's spatial alignment on a larger synthetic rear tar whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened; a 5.0.2 recording's frames decoded to exactly the frames the app encoded, inspect_recording's lossless check passing on it and failing on a wrong raw SHA-256, and the reader rejecting compressed sizes that do not sum to their member; a 5.0.3 recording, its frame members' SHA-256s not recorded, read and inspected as 5.0.2; and server/receive.py storing a recording uploaded in segments under the phone's key into the data root each request names, as one tar named by its manifest's scan_id, its segments joined, and refusing a missing or bad data root, and answering whether a recording is stored and which recordings the data root holds.
 
 Usage, from the repository's root: python -m pytest tools/test_rgbd_recording.py
 """
@@ -10,9 +10,11 @@ import io
 import json
 import tarfile
 import threading
+import time
+import zlib
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -37,7 +39,9 @@ MINOR = 7
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 SHA256_CHECK = "each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records"
+SIZE_CHECK = "each frame member's size, read from inside the tar, is the one its frames metadata records"
 DISTORTION_CHECK = "every color and depth frame has a distortion and every depth frame a depth_to_color, the runs covering each frame exactly once"
+LOSSLESS_CHECK = "every frame decodes losslessly: each decoded color frame, depth map and confidence map has the SHA-256 the app took of its bytes before encoding them"
 # The synthetic format 4.8 front recordings' two calibrations, both centered at REFERENCE_CENTER at the reference dimensions, each lookup table with its inverse: the first applies to the frames before instant 2, the second to the rest, so each stream's runs are frames [0, 1] and [2, 3].
 REFERENCE_CENTER = np.array([7.7, 5.6], np.float32)
 DISTORTION_TABLES = [([0, 0.001, 0.002], [0, -0.001, -0.002]), ([0, 0.0011, 0.0021], [0, -0.0011, -0.0021])]
@@ -279,9 +283,9 @@ def write_tar(path: Path, rec_id: str, files: Dict[str, bytes]) -> Path:
 
 
 def synthetic_tar(folder: Path, camera: str, matrix: str, version: str) -> Path:
-    """The synthetic recording of the camera as a format_version "4.7" or "4.8" tar."""
-    assert version in ("4.7", "4.8"), version
-    files = members(camera, matrix, MINOR) if version == "4.7" else members_4_8(camera, matrix)
+    """The synthetic recording of the camera as a format_version "4.7", "4.8", "5.0.2", "5.0.3" or "5.2" tar."""
+    assert version in ("4.7", "4.8", "5.0.2", "5.0.3", "5.2"), version
+    files = {"4.7": lambda: members(camera, matrix, MINOR), "4.8": lambda: members_4_8(camera, matrix), "5.0.2": lambda: members_5_0_2(camera, matrix), "5.0.3": lambda: members_5_0_3(camera, matrix), "5.2": lambda: members_5_2(camera, matrix)}[version]()
     return write_tar(folder / f"{recording_id(camera)}.tar", recording_id(camera), files)
 
 
@@ -358,6 +362,62 @@ def float16_depth(files: Dict[str, bytes]) -> Dict[str, bytes]:
     data = maps.astype("<f2").tobytes()
     files = files | {"depth_frames.bin": data}
     return with_json(files, "depth_frames_metadata.json", {"pixel_format": "hdep", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+
+
+def deflated(data: bytes, strategy: int) -> bytes:
+    """The bytes as one raw DEFLATE stream at level 1, as the app's FrameCodec deflates them."""
+    compressor = zlib.compressobj(1, zlib.DEFLATED, -15, 9, strategy)
+    return compressor.compress(data) + compressor.flush()
+
+
+def row_delta(frame: np.ndarray) -> np.ndarray:
+    """A COLOR_WIDTH x COLOR_HEIGHT 420f frame filtered as the app's FrameCodec.color filters it: every row after its plane's first minus the row above, mod 256."""
+    out = frame.copy()
+    for start, rows in ((0, COLOR_HEIGHT), (COLOR_HEIGHT, COLOR_HEIGHT // 2)):
+        plane = frame[start:start + rows]
+        out[start + 1:start + rows] = plane[1:] - plane[:-1]
+    return out
+
+
+def members_5_0_2(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 5.0.2 recording's tar: members_4_8's frames encoded as the app encodes them, the color frames' rows delta-coded then deflated with the run-length strategy and the maps deflated, each frames entry with its compressed size and the SHA-256 of its raw bytes."""
+    files = members_4_8(camera, matrix)
+    frames = {
+        "color_frames.bin": [(f.tobytes(), deflated(row_delta(f).tobytes(), zlib.Z_RLE)) for f in color_frames()],
+        "depth_frames.bin": [(m.tobytes(), deflated(m.tobytes(), zlib.Z_DEFAULT_STRATEGY)) for m in depth_maps()],
+    } | ({} if camera == "front" else {"depth_frames_confidence.bin": [(m.tobytes(), deflated(m.tobytes(), zlib.Z_DEFAULT_STRATEGY)) for m in confidence_maps()]})
+    files = files | {name: b"".join(stream for _, stream in encoded) for name, encoded in frames.items()}
+
+    def described(name: str, encoding: str) -> Dict:
+        return {"file": name, "size": len(files[name]), "sha256": hashlib.sha256(files[name]).hexdigest(), "encoding": encoding}
+
+    def stored(raw: bytes, stream: bytes, prefix: str = "") -> Dict:
+        return {f"{prefix}compressed_size": len(stream), f"{prefix}raw_sha256": hashlib.sha256(raw).hexdigest()}
+
+    color, depth = json.loads(files["color_frames_metadata.json"]), json.loads(files["depth_frames_metadata.json"])
+    color |= described("color_frames.bin", "row_delta_deflate")
+    color["frames"] = [f | stored(*e) for f, e in zip(color["frames"], frames["color_frames.bin"], strict=True)]
+    depth |= described("depth_frames.bin", "deflate")
+    depth["frames"] = [f | stored(*e) for f, e in zip(depth["frames"], frames["depth_frames.bin"], strict=True)]
+    if camera == "rear":
+        depth["confidence"] |= described("depth_frames_confidence.bin", "deflate")
+        depth["frames"] = [f | stored(*e, prefix="confidence_") for f, e in zip(depth["frames"], frames["depth_frames_confidence.bin"], strict=True)]
+    files = files | {"color_frames_metadata.json": json.dumps(color, indent=2).encode(), "depth_frames_metadata.json": json.dumps(depth, indent=2).encode()}
+    return with_json(files, "scan_metadata.json", {"format_version": "5.0.2"})
+
+
+def members_5_0_3(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 5.0.3 recording's tar: members_5_0_2's, its frame members' entries without their SHA-256."""
+    files = with_json(members_5_0_2(camera, matrix), "scan_metadata.json", {"format_version": "5.0.3"})
+    color, depth = json.loads(files["color_frames_metadata.json"]), json.loads(files["depth_frames_metadata.json"])
+    for entry in [color, depth] + ([depth["confidence"]] if camera == "rear" else []):
+        del entry["sha256"]
+    return files | {"color_frames_metadata.json": json.dumps(color, indent=2).encode(), "depth_frames_metadata.json": json.dumps(depth, indent=2).encode()}
+
+
+def members_5_2(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 5.2 recording's tar: members_5_0_3's, its scan_metadata.json naming its author."""
+    return with_json(members_5_0_3(camera, matrix), "scan_metadata.json", {"format_version": "5.2", "author": "daniel"})
 
 
 def with_json(files: Dict[str, bytes], name: str, update: Dict) -> Dict[str, bytes]:
@@ -515,13 +575,16 @@ def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
 
 
 # The rear's depth is always Float32: ARKit delivers scene depth in no other type.
+# 5.0.0 and 5.0.1 keep 4.8's format.
+@pytest.mark.parametrize("version", ["4.8", "5.0.0", "5.0.1"])
 @pytest.mark.parametrize("camera, depth_format", [("front", "fdep"), ("front", "hdep"), ("rear", "fdep")])
-def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str) -> None:
+def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str) -> None:
     files = members_4_8(camera, "ITU_R_709_2") if depth_format == "fdep" else float16_depth(members_4_8(camera, "ITU_R_709_2"))
+    files = with_json(files, "scan_metadata.json", {"format_version": version})
     tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
     rec = Recording(str(tar_path))
 
-    assert (rec.path, rec.format_version, rec.format_minor, rec.camera, rec.scan_id) == (tar_path, "4.8", 8, camera, recording_id(camera))
+    assert (rec.path, rec.format_version, rec.format_minor, rec.camera, rec.scan_id) == (tar_path, version, 8, camera, recording_id(camera))
     assert (rec.color_width, rec.color_height, rec.depth_width, rec.depth_height, rec.ycbcr_matrix, rec.frame_rate) == (COLOR_WIDTH, COLOR_HEIGHT, DEPTH_WIDTH, DEPTH_HEIGHT, "ITU_R_709_2", 30)
     origin = "upper_left_pixel_corner" if camera == "front" else "upper_left_pixel_center"
     assert rec.color_principal_point_origin == rec.depth_principal_point_origin == origin
@@ -576,6 +639,49 @@ def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str) -> None:
     assert np.array_equal(bgr[0:2, 0:2], first) and np.array_equal(bgr[0:2, 2:4], np.full((2, 2, 3), second)), bgr[0:2, 0:4].tolist()
 
 
+# 5.1 and 5.2 keep 5.0.3's format, 5.2 adding the author.
+@pytest.mark.parametrize("version", ["5.0.2", "5.0.3", "5.1", "5.2"])
+@pytest.mark.parametrize("camera", ["front", "rear"])
+def test_reader_5_0_2(tmp_path: Path, camera: str, version: str) -> None:
+    files = members_5_0_2(camera, "ITU_R_709_2") if version == "5.0.2" else members_5_2(camera, "ITU_R_709_2") if version == "5.2" else with_json(members_5_0_3(camera, "ITU_R_709_2"), "scan_metadata.json", {"format_version": version})
+    tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
+    rec = Recording(str(tar_path))
+
+    assert (rec.format_version, rec.format_minor, rec.encoded, rec.camera) == (version, 8, True, camera)
+    bins = ["color_frames.bin", "depth_frames.bin"] + (["depth_frames_confidence.bin"] if camera == "rear" else [])
+    assert rec.frame_files == {name: (len(files[name]), hashlib.sha256(files[name]).hexdigest() if version == "5.0.2" else None) for name in bins}
+    # Every frame decodes to exactly the frame the app encoded.
+    assert len(rec.color) == rec.color.shape[0] == FRAMES and rec.color.shape[1:] == (COLOR_HEIGHT * 3 // 2, COLOR_WIDTH) and rec.color.dtype == np.uint8
+    assert all(rec.color[i].dtype == np.uint8 and np.array_equal(rec.color[i], frame) for i, frame in enumerate(color_frames()))
+    assert rec.depth.dtype == np.float32 and np.array_equal(rec.depth, depth_maps(), equal_nan=True)
+    assert rec.confidence is None if camera == "front" else (rec.confidence.dtype == np.uint8 and np.array_equal(rec.confidence, confidence_maps()))
+    first, second = EXPECTED_BGR["ITU_R_709_2"]
+    bgr = rec.color_bgr(0)
+    assert np.array_equal(bgr[0:2, 0:2], first) and np.array_equal(bgr[0:2, 2:4], np.full((2, 2, 3), second)), bgr[0:2, 0:4].tolist()
+    assert [r["index"] for r in rec.color_rows] == ["0", "1", "-1", "2", "3"] and all(list(r) == COLOR_KEYS[camera] for r in rec.color_rows)
+
+
+@pytest.mark.parametrize("change", ["compressed_size", "encoding", "truncated_stream"])
+def test_reader_rejects_other_5_0_2_tars(tmp_path: Path, change: str) -> None:
+    files = members_5_0_2("rear", "ITU_R_709_2")
+    depth = json.loads(files["depth_frames_metadata.json"])
+    if change == "compressed_size":
+        # Sizes that no longer sum to the member's.
+        depth["frames"][0]["compressed_size"] += 1
+        files = with_json(files, "depth_frames_metadata.json", {"frames": depth["frames"]})
+    elif change == "encoding":
+        files = with_json(files, "depth_frames_metadata.json", {"encoding": "lz4"})
+    else:
+        # Depth map 0's stream one byte short and map 1's one byte long, so the sizes still sum to the member.
+        depth["frames"][0]["compressed_size"] -= 1
+        depth["frames"][1]["compressed_size"] += 1
+        files = with_json(files, "depth_frames_metadata.json", {"frames": depth["frames"]})
+    tar_path = write_tar(tmp_path / "recording.tar", recording_id("rear"), files)
+
+    with pytest.raises((AssertionError, zlib.error)):
+        Recording(tar_path)
+
+
 @pytest.mark.parametrize("change", ["missing_member", "extra_member", "format_version", "sha256", "size", "overlapping_run"])
 def test_reader_rejects_other_4_8_tars(tmp_path: Path, change: str) -> None:
     files = members_4_8("front", "ITU_R_709_2")
@@ -601,11 +707,11 @@ def test_reader_rejects_other_4_8_tars(tmp_path: Path, change: str) -> None:
         Recording(tar_path)
 
 
-@pytest.mark.parametrize("version", ["4.7", "4.8"])
+@pytest.mark.parametrize("version", ["4.7", "4.8", "5.0.2", "5.0.3"])
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_decode(tmp_path: Path, camera: str, version: str) -> None:
     tar_path = synthetic_tar(tmp_path, camera, "ITU_R_709_2", version)
-    files = members(camera, "ITU_R_709_2", MINOR) if version == "4.7" else members_4_8(camera, "ITU_R_709_2")
+    files = {"4.7": lambda: members(camera, "ITU_R_709_2", MINOR), "4.8": lambda: members_4_8(camera, "ITU_R_709_2"), "5.0.2": lambda: members_5_0_2(camera, "ITU_R_709_2"), "5.0.3": lambda: members_5_0_3(camera, "ITU_R_709_2")}[version]()
     out = tmp_path / "decoded"
 
     summary = decode(tar_path, out)
@@ -628,7 +734,7 @@ def test_decode(tmp_path: Path, camera: str, version: str) -> None:
     assert summary["format_version"] == version and summary["source"] == tar_path.name
 
 
-@pytest.mark.parametrize("camera, version, depth_format", [("front", "4.7", "fdep"), ("rear", "4.7", "fdep"), ("front", "4.8", "fdep"), ("front", "4.8", "hdep"), ("rear", "4.8", "fdep")])
+@pytest.mark.parametrize("camera, version, depth_format", [("front", "4.7", "fdep"), ("rear", "4.7", "fdep"), ("front", "4.8", "fdep"), ("front", "4.8", "hdep"), ("rear", "4.8", "fdep"), ("front", "5.0.2", "fdep"), ("rear", "5.0.2", "fdep"), ("front", "5.0.3", "fdep"), ("rear", "5.0.3", "fdep"), ("front", "5.2", "fdep"), ("rear", "5.2", "fdep")])
 def test_inspect(tmp_path: Path, camera: str, version: str, depth_format: str) -> None:
     if depth_format == "fdep":
         tar_path = synthetic_tar(tmp_path, camera, "ITU_R_601_4", version)
@@ -639,9 +745,22 @@ def test_inspect(tmp_path: Path, camera: str, version: str, depth_format: str) -
 
     # The synthetic frames are too few and too small for the two edge alignments, which may fail; every other check holds on a recording laid out as the format says.
     assert {name for name, ok in checks.items() if not ok} <= {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK}, checks
-    # 4.8 records each frame member's size and SHA-256, and no longer the row strides or calibration.jsonl.
-    assert (SHA256_CHECK in checks) == (version == "4.8") and (DISTORTION_CHECK in checks) == (version == "4.8" and camera == "front"), checks
-    assert not any("bytes per row" in name or "calibration.jsonl" in name for name in checks) if version == "4.8" else any("bytes per row" in name for name in checks), checks
+    # 4.8 records each frame member's size and SHA-256, and no longer the row strides or calibration.jsonl; 5.0.2 also each frame's raw SHA-256.
+    assert (SHA256_CHECK in checks) == (version in ("4.8", "5.0.2")) and (SIZE_CHECK in checks) == (version in ("5.0.3", "5.2")) and (DISTORTION_CHECK in checks) == (version != "4.7" and camera == "front") and (LOSSLESS_CHECK in checks) == (version in ("5.0.2", "5.0.3", "5.2")), checks
+    assert not any("bytes per row" in name or "calibration.jsonl" in name for name in checks) if version != "4.7" else any("bytes per row" in name for name in checks), checks
+
+
+@pytest.mark.parametrize("camera", ["front", "rear"])
+def test_inspect_fails_5_0_2_wrong_raw_sha256(tmp_path: Path, camera: str) -> None:
+    files = members_5_0_2(camera, "ITU_R_601_4")
+    color = json.loads(files["color_frames_metadata.json"])
+    # Well formed, but another frame's: as if frame 2 had decoded to other bytes than the app encoded.
+    color["frames"][2]["raw_sha256"] = color["frames"][1]["raw_sha256"]
+    files = with_json(files, "color_frames_metadata.json", {"frames": color["frames"]})
+
+    checks = inspect(write_tar(tmp_path / "recording.tar", recording_id(camera), files))
+
+    assert {name for name, ok in checks.items() if not ok} - {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK} == {LOSSLESS_CHECK}, checks
 
 
 @pytest.mark.parametrize("change", ["sha256", "distortion_run"])
@@ -697,9 +816,9 @@ def test_spatial_alignment(tmp_path: Path) -> None:
 
 
 @contextlib.contextmanager
-def receiver(out: Path) -> Iterator[int]:
-    """Runs server/receive.py's handler into `out` on a free local port, yielding the port; on leaving, stops it once every request's thread is done."""
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(out, TOKEN))
+def receiver() -> Iterator[int]:
+    """Runs server/receive.py's handler on a free local port, yielding the port; on leaving, stops it once every request's thread is done."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(TOKEN))
     # Request threads that are not daemons are joined by server_close, so a request's work after its reply is done on leaving.
     server.daemon_threads = False
     thread = threading.Thread(target=server.serve_forever)
@@ -712,51 +831,94 @@ def receiver(out: Path) -> Iterator[int]:
         thread.join()
 
 
-def put(port: int, path: str, body: bytes, sha256: str) -> int:
-    """PUTs body to the receiver's path with TOKEN and the given X-Content-SHA256, and returns the reply's status."""
+def put(port: int, path: str, body: bytes, sha256: str, data_root: Optional[str]) -> int:
+    """PUTs body to the receiver's path with TOKEN, the given X-Content-SHA256 and, when given, X-Data-Root, and returns the reply's status."""
     connection = http.client.HTTPConnection("127.0.0.1", port)
-    connection.request("PUT", path, body, {"X-Upload-Token": TOKEN, "X-Content-SHA256": sha256})
+    connection.request("PUT", path, body, {"X-Upload-Token": TOKEN, "X-Content-SHA256": sha256} | ({} if data_root is None else {"X-Data-Root": data_root}))
     status = connection.getresponse().status
     connection.close()
     return status
 
 
-def upload(port: int, rec_id: str, files: Dict[str, bytes]) -> List[int]:
-    """PUTs each file with its SHA-256, as the app uploads a recording, then its manifest, and returns the replies' statuses."""
-    manifest = json.dumps({"members": [{"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()]}).encode()
-    return [put(port, f"/upload/{rec_id}/{name}", data, hashlib.sha256(data).hexdigest()) for name, data in (files | {"manifest.json": manifest}).items()]
+def stored(port: int, scan_id: str, data_root: Optional[str], token: str = TOKEN) -> Tuple[int, Dict]:
+    """GETs the receiver's /stored/<scan_id> with the token and, when given, X-Data-Root, and returns the reply's status and body."""
+    return get(port, f"/stored/{scan_id}", data_root, token)
+
+
+def get(port: int, path: str, data_root: Optional[str], token: str = TOKEN) -> Tuple[int, Dict]:
+    """GETs the receiver's path with the token and, when given, X-Data-Root, and returns the reply's status and body."""
+    connection = http.client.HTTPConnection("127.0.0.1", port)
+    connection.request("GET", path, headers={"X-Upload-Token": token} | ({} if data_root is None else {"X-Data-Root": data_root}))
+    response = connection.getresponse()
+    reply = (response.status, json.loads(response.read()))
+    connection.close()
+    return reply
+
+
+def upload(port: int, key: str, rec_id: str, files: Dict[str, bytes], data_root: str) -> List[int]:
+    """PUTs a recording as the app uploads it, under the phone's key into data_root: each frames file in segments of at most 37 bytes and each JSON file whole, each with its SHA-256, then its manifest naming rec_id, and returns the replies' statuses."""
+    segments = {name: [data[i:i + 37] for i in range(0, len(data), 37)] for name, data in files.items() if name.endswith(".bin")}
+    uploads = {f"{name}.{i:06d}": part for name, parts in segments.items() for i, part in enumerate(parts)} | {name: data for name, data in files.items() if not name.endswith(".bin")}
+
+    def described(name: str, data: bytes) -> Dict:
+        return {"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    members = [{"name": name, "segments": [described(f"{name}.{i:06d}", part) for i, part in enumerate(segments[name])]} if name in segments else described(name, data) for name, data in files.items()]
+    manifest = json.dumps({"scan_id": rec_id, "members": members}).encode()
+    return [put(port, f"/upload/{key}/{name}", data, hashlib.sha256(data).hexdigest(), data_root) for name, data in (uploads | {"manifest.json": manifest}).items()]
 
 
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_receiver(tmp_path: Path, camera: str) -> None:
-    files = members_4_8(camera, "ITU_R_601_4")
+    files = members_5_0_3(camera, "ITU_R_601_4")
     rec_id = recording_id(camera)
-    out = tmp_path / "out"
-    out.mkdir()
+    # The phone's key for the recording, fixed before its name is.
+    key = "6F1C2D3E-4A5B-4C6D-8E7F-901A2B3C4D5E"
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "file").write_text("not a directory")
+    segment, segment_sha256 = files["color_frames.bin"][:37], hashlib.sha256(files["color_frames.bin"][:37]).hexdigest()
 
-    with receiver(out) as port:
-        wrong_hash = put(port, f"/upload/{rec_id}/color_frames.bin", files["color_frames.bin"], hashlib.sha256(b"other bytes").hexdigest())
-        # 4.7's name for the color frames, which 4.8 does not have.
-        unknown_name = put(port, f"/upload/{rec_id}/color.bin", files["color_frames.bin"], hashlib.sha256(files["color_frames.bin"]).hexdigest())
-        stored = upload(port, rec_id, files)
+    with receiver() as port:
+        wrong_hash = put(port, f"/upload/{key}/color_frames.bin.000000", segment, hashlib.sha256(b"other bytes").hexdigest(), str(root))
+        # A frames file whole, and a name no file has.
+        unknown_names = [put(port, f"/upload/{key}/{name}", segment, segment_sha256, str(root)) for name in ("color_frames.bin", "color.bin.000000")]
+        # No data root, a relative one, one with "..", one that does not exist, and a file.
+        bad_roots = [put(port, f"/upload/{key}/color_frames.bin.000000", segment, segment_sha256, data_root) for data_root in (None, "root", f"{root}/../root", str(tmp_path / "missing"), str(tmp_path / "file"))]
+        before = stored(port, rec_id, str(root))
+        statuses = upload(port, key, rec_id, files, str(root))
+        # The receiver writes the recording's archive after replying to its manifest, so the phone asks until it is there.
+        for _ in range(100):
+            after = stored(port, rec_id, str(root))
+            if after[1]["stored"]:
+                break
+            time.sleep(0.05)
+        refused = [stored(port, rec_id, None)[0], stored(port, rec_id, "root")[0], stored(port, rec_id, str(root), token="other")[0]]
+        listed = get(port, "/recordings", str(root))
+        listing_refused = [get(port, "/recordings", None)[0], get(port, "/recordings", str(root), token="other")[0]]
 
-    archive = out / f"{rec_id}.tar"
-    assert (wrong_hash, unknown_name) == (400, 404) and stored == [200] * (len(files) + 1)
-    # A GNU tar, holding exactly the uploaded files under <id>/ in the manifest's order, byte for byte.
+    archive = root / f"{rec_id}.tar"
+    assert wrong_hash == 400 and unknown_names == [404, 404] and bad_roots == [400] * 5 and set(statuses) == {200}
+    assert before == (200, {"stored": False}) and after == (200, {"stored": True}) and refused == [400, 400, 403]
+    # The data root's one recording, with what its scan_metadata.json says of it.
+    scan = json.loads(files["scan_metadata.json"])
+    assert listed == (200, {"recordings": [{"scan_id": rec_id, "size": (root / f"{rec_id}.tar").stat().st_size} | {key: scan.get(key) for key in ("name", "start_time_utc", "duration_s", "camera", "author")}]}) and listing_refused == [400, 403]
+    # A GNU tar named by the manifest's scan_id, holding exactly the recording's files under it in order, each frames file its segments joined, byte for byte.
     assert archive.read_bytes()[257:265] == b"ustar  \x00"
     with tarfile.open(archive) as tar:
         assert [m.name for m in tar.getmembers()] == [f"{rec_id}/{name}" for name in files]
         assert all(tar.extractfile(f"{rec_id}/{name}").read() == data for name, data in files.items())
-    # The recording's staging directory is gone, and nothing else is left in out.
-    assert sorted(p.name for p in out.iterdir()) == [".staging", archive.name] and not any((out / ".staging").iterdir())
-    assert Recording(archive).scan_id == rec_id
+    # The recording's staging directory is gone, nothing else is left in the data root, and no request wrote outside it.
+    assert sorted(p.name for p in root.iterdir()) == [".staging", archive.name] and not any((root / ".staging").iterdir())
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["file", "root"]
+    rec = Recording(archive)
+    assert (rec.scan_id, rec.format_version) == (rec_id, "5.0.3") and all(np.array_equal(rec.color[i], frame) for i, frame in enumerate(color_frames()))
     stored_bytes, stored_stat = archive.read_bytes(), archive.stat()
 
-    with receiver(out) as port:
-        again = upload(port, rec_id, files)
+    with receiver() as port:
+        again = upload(port, key, rec_id, files, str(root))
 
     # Uploaded again, the recording is not stored over the one there; its upload stays staged.
-    assert again == [200] * (len(files) + 1)
+    assert set(again) == {200}
     assert archive.read_bytes() == stored_bytes and (archive.stat().st_ino, archive.stat().st_mtime_ns) == (stored_stat.st_ino, stored_stat.st_mtime_ns)
-    assert sorted(p.name for p in out.iterdir()) == [".staging", archive.name]
-    assert sorted(p.name for p in (out / ".staging" / rec_id).iterdir()) == sorted(n for name in [*files, "manifest.json"] for n in (name, f"{name}.sha256"))
+    assert sorted(p.name for p in root.iterdir()) == [".staging", archive.name] and (root / ".staging" / key / "manifest.json").is_file()

@@ -5,5 +5,5 @@ __pycache__
 /app/Sources/RGBDScanner/Secrets.swift
 /app/*.log
 /server/token
-/server/url
+/server/users.json
 /server/*.log
