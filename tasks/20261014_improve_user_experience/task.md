@@ -22,7 +22,10 @@ Solutions (all items to be implemented):
 1. record both color and depth streams at 15fps, hard coded.
 2. implement lossless compression (encode on the app and decode in the data pipeline).
 3. lower front camera color frames resolution from 4032x3024 to 1920x1440.
-4. implement immediate upload to server and delete a frame on phone after it arrives at server. an option to have the data stay on phone should still be supported (see problem 3).
+4. implement immediate upload to server and delete a frame on phone after it arrives at server.
+   1. an option to have the data stay on phone should still be supported (see problem 3).
+   2. the server:path configs should still show the list of scans (fetched from the server), rather than being empty.
+   3. the delete icon (button) should only exist for those items under the "this phone" config, not the server:path configs.
 
 ### 1.2. Problem 2: Recording Naming UI
 
