@@ -235,18 +235,33 @@
 
     Write-Host 'Taking Wired transfer recordings from the iPhone; keep RGBD Scanner open on it. Ctrl+C stops.'
     $deviceId = $null
-    $waiting = $null
+    # The last message printed for the phone (key '') and for each recording, so a wait is printed once.
+    $waiting = @{}
     $taken = @{}
     while ($true) {
         try {
             if ($null -eq $deviceId) { $deviceId = Get-PhoneDeviceId }
-            foreach ($recording in (Invoke-PhoneJson $deviceId 'GET' '/recordings' $null).recordings) { Receive-Recording $deviceId $recording $taken }
-            $waiting = $null
+            $recordings = (Invoke-PhoneJson $deviceId 'GET' '/recordings' $null).recordings
+            $waiting.Remove('')
         } catch {
             $deviceId = $null
-            if ($_.Exception.Message -ne $waiting) {
-                $waiting = $_.Exception.Message
-                Write-Host "`nWaiting: $waiting"
+            if ($_.Exception.Message -ne $waiting['']) {
+                $waiting[''] = $_.Exception.Message
+                Write-Host "`nWaiting: $($waiting[''])"
+            }
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+        # A recording that cannot be taken yet waits without holding up the others.
+        foreach ($recording in $recordings) {
+            try {
+                Receive-Recording $deviceId $recording $taken
+                $waiting.Remove($recording.key)
+            } catch {
+                if ($_.Exception.Message -ne $waiting[$recording.key]) {
+                    $waiting[$recording.key] = $_.Exception.Message
+                    Write-Host "`nWaiting: $($waiting[$recording.key])"
+                }
             }
         }
         Start-Sleep -Seconds $PollSeconds
