@@ -12,17 +12,21 @@ struct RGBDScannerApp: App {
     }
 }
 
-// The config selection first, then the scanner, uploading to the config chosen, until it goes back.
+// The config selection first, then the scanner, uploading to the config chosen, until it goes back; a computer can take the wired transfer recordings over the cable while the app is on screen.
 struct RootView: View {
     @StateObject private var model = AppModel()
     @StateObject private var store = UserStore()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        if model.selection == nil {
-            ConfigSelectionView(model: model, store: store)
-        } else {
-            ContentView(model: model)
+        Group {
+            if model.selection == nil {
+                ConfigSelectionView(model: model, store: store)
+            } else {
+                ContentView(model: model)
+            }
         }
+        .onChange(of: scenePhase, initial: true) { _, phase in model.serveCable(phase == .active) }
     }
 }
 
@@ -48,11 +52,13 @@ enum UploadState: Equatable {
     case failed(String)
     // A recording of the This phone config, never uploaded.
     case keptOnPhone
+    // A recording of the Wired transfer config, which leaves the phone once a computer has taken it over the cable and stored it.
+    case waitingForCable
 
     var canStart: Bool {
         switch self {
         case .notUploaded, .uploaded, .failed: return true
-        case .inProgress, .keptOnPhone: return false
+        case .inProgress, .keptOnPhone, .waitingForCable: return false
         }
     }
 
@@ -63,11 +69,12 @@ enum UploadState: Equatable {
         case .uploaded: return "uploaded, checking the server stored it"
         case .failed(let message): return "upload failed: \(message)"
         case .keptOnPhone: return "kept on this phone"
+        case .waitingForCable: return "waiting for a computer to take it over the cable"
         }
     }
 }
 
-// A finished recording's Documents/<id>/recording.json, beside the recording's files, its members, in that directory, the segments of its frames files in its segments directory from 5.0.3; the uploader rewrites it as the receiver acknowledges each member.
+// A finished recording's Documents/<id>/recording.json, beside the recording's files, its members, in that directory, the segments of its frames files in its segments directory from 1.5.0.3; the uploader rewrites it as the receiver acknowledges each member.
 struct RecordingInfo: Codable {
     let id: String
     let name: String
@@ -75,9 +82,9 @@ struct RecordingInfo: Codable {
     let startTime: Date
     let durationSeconds: Double
     let camera: DepthCamera
-    // The key the recording's files upload under: from 5.0.3, which uploads its frames while recording, its work directory's name, fixed before its id; nil before, when they upload under the id.
+    // The key the recording's files upload under: from 1.5.0.3, which uploads its frames while recording, its work directory's name, fixed before its id; nil before, when they upload under the id.
     let uploadId: String?
-    // The user who recorded it, nil before 5.2, and where it goes, the config chosen when it was recorded, nil before 5.0.3.
+    // The user who recorded it, nil before 1.5.2, and where it goes, the config chosen when it was recorded, nil before 1.5.0.3.
     let user: String?
     let target: RecordingTarget?
     // The recording's files, in the order the manifest lists them, each frames file's segments in its place.
@@ -99,9 +106,11 @@ struct RecordingInfo: Codable {
     var directory: URL { Self.directory(id) }
     var file: URL { directory.appendingPathComponent(Self.fileName) }
     var uploadKey: String { uploadId ?? id }
-    // Whether it stays on this phone: kept there by its config, or with none, as before 5.0.3.
+    // Whether it stays on this phone: kept there by its config, or with none, as before 1.5.0.3.
     var staysOnPhone: Bool { target == nil || target == .phone }
-    // Where a recording's segments are kept from 5.0.3 until the receiver acknowledges them.
+    // Whether it goes by wired transfer.
+    var isWired: Bool { if case .wired? = target { return true } else { return false } }
+    // Where a recording's segments are kept from 1.5.0.3 until the receiver acknowledges them.
     var segmentsDirectory: URL? { uploadId.map(Recording.segmentsDirectory) }
     // The file holding a member: a segment's in the segments directory, any other in the recording's directory.
     func url(of member: Member) -> URL {
@@ -110,6 +119,33 @@ struct RecordingInfo: Codable {
     }
     // The manifest the uploader writes for the receiver once every member is acknowledged; never one of the recording's files.
     var manifest: URL { directory.appendingPathComponent("manifest.json") }
+
+    // The members as the manifest lists them, in recording.json's order with their sizes and SHA-256s, each frames file's consecutive segments grouped under it as {"name", "segments"}.
+    var manifestMembers: [[String: Any]] {
+        var listed: [[String: Any]] = []
+        for member in members {
+            let entry: [String: Any] = ["name": member.name, "size": member.size, "sha256": member.sha256]
+            guard Recording.isSegment(member.name) else {
+                listed.append(entry)
+                continue
+            }
+            // <frames file>.<index, 6 digits>
+            let file = String(member.name.dropLast(7))
+            if listed.last?["name"] as? String == file, var segments = listed.last?["segments"] as? [[String: Any]] {
+                segments.append(entry)
+                listed[listed.count - 1]["segments"] = segments
+            } else {
+                listed.append(["name": file, "segments": [entry]])
+            }
+        }
+        return listed
+    }
+
+    // Deletes the recording from the phone, with its segments.
+    func removeFromPhone() throws {
+        try FileManager.default.removeItem(at: directory)
+        if let segmentsDirectory, FileManager.default.fileExists(atPath: segmentsDirectory.path) { try FileManager.default.removeItem(at: segmentsDirectory) }
+    }
 
     func write(to url: URL) throws {
         let encoder = JSONEncoder()
@@ -131,7 +167,7 @@ struct RecordingFile: Identifiable {
     var upload: UploadState
     var id: String { info.id }
     var size: Int64 { info.members.reduce(0) { $0 + Int64($1.size) } }
-    // Only a recording kept on this phone is deleted by hand; an uploaded one leaves the phone once the receiver has stored it, and its config lists it from the receiver.
+    // Only a recording kept on this phone is deleted by hand; an uploaded one leaves the phone once the receiver has stored it, and its config lists it from the receiver, and a wired transfer one once a computer has stored it.
     var canDelete: Bool { info.staysOnPhone }
 }
 
@@ -149,8 +185,16 @@ final class AppModel: ObservableObject {
     @Published var selection: Selection?
     // For a server config, the recordings its receiver holds in the data root, as it last listed them.
     @Published var serverRecordings: [ServerRecording] = []
-    // The recordings on this phone the scanner lists: those made with the chosen config, by any user, as configs such as This phone are shared, This phone's also those with no config.
-    var shownFiles: [RecordingFile] { files.filter { selection?.target == .phone ? $0.info.staysOnPhone : $0.info.target == selection?.target } }
+    // The recordings on this phone the scanner lists: those made with the chosen config, by any user, as configs such as This phone are shared, This phone's also those with no config, and Wired transfer's those made with any folder.
+    var shownFiles: [RecordingFile] {
+        files.filter {
+            switch selection?.target {
+            case .phone?: return $0.info.staysOnPhone
+            case .wired?: return $0.info.isWired
+            default: return $0.info.target == selection?.target
+            }
+        }
+    }
     @Published var showsDepth = false {
         didSet {
             recorder.depthPreview.isEnabled = showsDepth
@@ -171,6 +215,11 @@ final class AppModel: ObservableObject {
 
     let availableCameras: [DepthCamera]
     let recorder: Recorder
+    private let cable = WiredServer()
+    // The cable's requests open, and when the last one ended: a computer is taking recordings while one is open or one ended within cableQuietSeconds, and the screen stays awake meanwhile.
+    private var cableRequests = 0
+    private var cableLastRequest = Date.distantPast
+    private static let cableQuietSeconds = 10.0
     // The name given when the recording started; nil when naming was deferred.
     private var userName: String?
     // A stopped recording waiting for its name, with why it stopped when it was not the Stop button.
@@ -186,6 +235,11 @@ final class AppModel: ObservableObject {
             self.depthFrame = frame
         }
         recorder.onInterruption = { [weak self] reason in self?.stopRecording(because: reason) }
+        cable.onRequest = { [weak self] id, began in self?.cableRequest(for: id, began: began) }
+        cable.onStored = { [weak self] info in
+            self?.message = "\(info.name) is stored on the computer and has left this phone"
+            self?.refreshFiles()
+        }
         refreshFiles()
         // A recording uploading resumes, the members the receiver acknowledged and those still on their way not sent again, and one uploaded leaves the phone once the receiver has stored it.
         files.filter { if case .upload = $0.info.target { return true } else { return false } }.forEach { upload($0.id) }
@@ -193,7 +247,7 @@ final class AppModel: ObservableObject {
         addMissingMembers()
     }
 
-    // Lists the members of the recordings apps 4.1 to 4.5 finished, which the gallery shows once they have them; one not yet uploaded then uploads.
+    // Lists the members of the recordings apps 1.4.1 to 1.4.5 finished, which the gallery shows once they have them; one not yet uploaded then uploads.
     private func addMissingMembers() {
         let directories = Recording.withoutMembers()
         DispatchQueue.global(qos: .utility).async {
@@ -221,6 +275,31 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async { self.finished(result, note: "Recovered an unfinished recording") }
             }
         }
+    }
+
+    // Lets a computer take the wired transfer recordings over the cable while the app is on screen, iOS suspending the app, and with it the cable, when it leaves the screen.
+    func serveCable(_ serving: Bool) {
+        guard serving else { return cable.stop() }
+        do {
+            try cable.start()
+        } catch {
+            message = "Wired transfer unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    // Shows a wired transfer recording as being taken while a request for it is open, and keeps the screen awake while a computer is taking recordings.
+    private func cableRequest(for id: String?, began: Bool) {
+        cableRequests += began ? 1 : -1
+        cableLastRequest = Date()
+        if let id, files.first(where: { $0.id == id })?.info.isWired == true { setUpload(id, began ? .inProgress("being taken over the cable") : .waitingForCable) }
+        updateIdleTimer()
+        if !began { DispatchQueue.main.asyncAfter(deadline: .now() + Self.cableQuietSeconds) { self.updateIdleTimer() } }
+    }
+
+    // The screen stays awake while recording and while a computer is taking recordings over the cable, which would stop if the screen locked.
+    private func updateIdleTimer() {
+        let cableActive = cableRequests > 0 || Date().timeIntervalSince(cableLastRequest) < Self.cableQuietSeconds
+        UIApplication.shared.isIdleTimerDisabled = isRecording || cableActive
     }
 
     // Opens the scanner, its recordings going where the user's config says.
@@ -289,7 +368,7 @@ final class AppModel: ObservableObject {
             case .success:
                 self.isRecording = true
                 self.recordingStart = Date()
-                UIApplication.shared.isIdleTimerDisabled = true
+                self.updateIdleTimer()
                 self.message = "Recording"
             case .failure(let error):
                 self.message = "Cannot record: \(error.localizedDescription)"
@@ -301,7 +380,7 @@ final class AppModel: ObservableObject {
     func stopRecording(because reason: String?) {
         guard isRecording else { return }
         isRecording = false
-        UIApplication.shared.isIdleTimerDisabled = false
+        updateIdleTimer()
         let stopNote = reason.map { "Stopped: \($0)" }
         if let stopNote { message = stopNote }
         // Taken now: the next recording can start, with a name of its own, before this one is handed over.
@@ -371,8 +450,7 @@ final class AppModel: ObservableObject {
     func delete(_ file: RecordingFile) {
         guard file.canDelete else { return }
         do {
-            try FileManager.default.removeItem(at: file.info.directory)
-            if let segments = file.info.segmentsDirectory, FileManager.default.fileExists(atPath: segments.path) { try FileManager.default.removeItem(at: segments) }
+            try file.info.removeFromPhone()
         } catch {
             message = "Delete failed: \(error.localizedDescription)"
         }
@@ -383,7 +461,7 @@ final class AppModel: ObservableObject {
         if let i = files.firstIndex(where: { $0.id == id }) { files[i].upload = state }
     }
 
-    // Lists the recordings, the directories in Documents that hold a recording.json listing their members, newest first, keeping the state of uploads in flight; one from apps 4.1 to 4.5 joins once addMissingMembers has listed its members.
+    // Lists the recordings, the directories in Documents that hold a recording.json listing their members, newest first, keeping the state of uploads in flight; one from apps 1.4.1 to 1.4.5 joins once addMissingMembers has listed its members.
     func refreshFiles() {
         let inFlight = Dictionary(uniqueKeysWithValues: files.map { ($0.id, $0.upload) })
         let urls = (try? FileManager.default.contentsOfDirectory(at: Recording.documents, includingPropertiesForKeys: nil)) ?? []
@@ -391,7 +469,7 @@ final class AppModel: ObservableObject {
         for file in urls.map({ $0.appendingPathComponent(RecordingInfo.fileName) }) where FileManager.default.fileExists(atPath: file.path) && !Recording.listsNoMembers(file) {
             do {
                 let info = try RecordingInfo.load(file)
-                let state: UploadState = info.staysOnPhone ? .keptOnPhone : info.uploaded ? .uploaded : .notUploaded
+                let state: UploadState = info.staysOnPhone ? .keptOnPhone : info.isWired ? .waitingForCable : info.uploaded ? .uploaded : .notUploaded
                 listed.append(RecordingFile(info: info, upload: inFlight[info.id] ?? state))
             } catch {
                 message = "Unreadable \(file.deletingLastPathComponent().lastPathComponent)/\(RecordingInfo.fileName): \(error.localizedDescription)"

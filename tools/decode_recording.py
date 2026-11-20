@@ -1,6 +1,6 @@
-"""Decodes RGBD Scanner recordings (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2") into per-frame files in a directory next to each tar, named like the tar without .tar.
+"""Decodes RGBD Scanner recordings (.tar, format 1.4.0 to 1.4.8, 1.5.0.0 to 1.5.2 or 1.6.0) into per-frame files in a directory next to each tar, named like the tar without .tar.
 
-Each output directory holds color/<index:06d>.png (every color frame converted from full-range YCbCr 4:2:0 to BGR through the recording's ycbcr_matrix, 8-bit lossless PNG, sensor orientation), depth/<index:06d>.npy (metres, sensor orientation, the map as stored, Float32 or a 4.8 "hdep" recording's Float16, NaN and 0 kept), confidence/<index:06d>.npy (uint8 ARConfidenceLevel, rear recordings), the recording's every other member copied verbatim (4.8's six JSON files; 4.0 to 4.7's tables, metadata.json and, for a front recording, calibration.jsonl), and decoded.json, a machine summary. A directory is decoded under <name>.partial and renamed when complete, so an existing output directory is complete and is skipped unless --force.
+Each output directory holds color/<index:06d>.png (every color frame converted from full-range YCbCr 4:2:0 to BGR through the recording's ycbcr_matrix, 8-bit lossless PNG, sensor orientation), depth/<index:06d>.npy (metres, sensor orientation, the map as stored, Float32 or a 1.4.8 "hdep" recording's Float16, NaN and 0 kept), confidence/<index:06d>.npy (uint8 ARConfidenceLevel, rear recordings), the recording's every other member copied verbatim (1.4.8's six JSON files; 1.4.0 to 1.4.7's tables, metadata.json and, for a front recording, calibration.jsonl), and decoded.json, a machine summary. A directory is decoded under <name>.partial and renamed when complete, so an existing output directory is complete and is skipped unless --force.
 
 Usage: python tools/decode_recording.py <recording.tar or directory of recordings...> [--force]
 """
@@ -53,8 +53,8 @@ def size(folder: Path) -> int:
 def decode(tar_path: Path, out: Path) -> Dict:
     """Decodes one recording into out and returns its decoded.json summary."""
     rec = Recording(tar_path)
-    # The frame members' names, format 4.8's or 4.0 to 4.7's.
-    color_bin, depth_bin, confidence_bin = ("color_frames.bin", "depth_frames.bin", "depth_frames_confidence.bin") if rec.format_minor >= 8 else ("color.bin", "depth.bin", "confidence.bin")
+    # The frame members' names, format 1.4.8's or 1.4.0 to 1.4.7's.
+    color_bin, depth_bin, confidence_bin = ("color_frames.bin", "depth_frames.bin", "depth_frames_confidence.bin") if rec.format_patch >= 8 else ("color.bin", "depth.bin", "confidence.bin")
     print(f"  {rec.camera}, {len(rec.colors)} color rows with an index, {len(rec.depths)} depth rows with an index", flush=True)
     out.mkdir()
 

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-// Uploads recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Every file goes up from its file as PUT /upload/<key>/<file> to the address server/users.json gives the server of the recording's destination, under its upload key (RecordingInfo.uploadKey), with its SHA-256 in X-Content-SHA256 and the destination's data root in X-Data-Root: from 5.0.3 each segment of a frames file as soon as the recording closes it, while it records, and once the recording is finished every member the receiver has not acknowledged; once every member is acknowledged, PUT /upload/<key>/manifest.json from the manifest written beside them, the members in recording.json's order with their sizes and SHA-256s, each frames file's segments grouped under it, and from 5.0.3 the recording's id, lets the receiver complete the recording. The receiver's 200 is the file's safe arrival: a segment's file is deleted then, so its frames leave the phone, and a finished recording's member is recorded as acknowledged in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
+// Uploads recordings to the receiver (server/receive.py) through one background URLSession, which iOS carries on while the app is suspended, relaunching it in the background to report the tasks that ended; a force quit from the app switcher cancels them, as iOS does for every app. Every file goes up from its file as PUT /upload/<key>/<file> to the address server/users.json gives the server of the recording's destination, under its upload key (RecordingInfo.uploadKey), with its SHA-256 in X-Content-SHA256 and the destination's data root in X-Data-Root: from 1.5.0.3 each segment of a frames file as soon as the recording closes it, while it records, and once the recording is finished every member the receiver has not acknowledged; once every member is acknowledged, PUT /upload/<key>/manifest.json from the manifest written beside them, the members in recording.json's order with their sizes and SHA-256s, each frames file's segments grouped under it, and from 1.5.0.3 the recording's id, lets the receiver complete the recording. The receiver's 200 is the file's safe arrival: a segment's file is deleted then, so its frames leave the phone, and a finished recording's member is recorded as acknowledged in recording.json at once, so an upload cut short resumes where it stopped and never resends an acknowledged member.
 final class Uploader: NSObject, URLSessionDataDelegate {
     // The one uploader; the app delegate makes it at every launch, so its background session reconnects to the tasks iOS carried on while the app was not running.
     static let shared = Uploader()
@@ -42,7 +42,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         } catch {
             return completion(.failure(error))
         }
-        guard case .upload(let destination)? = info.target else { return completion(.failure(RecorderError(info.target == nil ? "recorded before 5.0.3, with no config to upload to" : "kept on this phone"))) }
+        guard case .upload(let destination)? = info.target else { return completion(.failure(RecorderError(info.target == nil ? "recorded before 1.5.0.3, with no config to upload to" : info.isWired ? "goes by wired transfer" : "kept on this phone"))) }
         guard let address = UsersFile.address(of: destination.server), let root = Self.root(address, info.uploadKey) else { return completion(.failure(RecorderError("this build gives no address for the server \(destination.server)"))) }
         observers[id] = (onProgress, completion)
         if info.uploaded { return confirmStored(info, destination: destination) }
@@ -83,8 +83,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
                     return
                 }
                 do {
-                    try FileManager.default.removeItem(at: info.directory)
-                    if let segments = info.segmentsDirectory, FileManager.default.fileExists(atPath: segments.path) { try FileManager.default.removeItem(at: segments) }
+                    try info.removeFromPhone()
                     infos[info.id] = nil
                     observers.removeValue(forKey: info.id)?.completion(.success(()))
                 } catch {
@@ -155,24 +154,8 @@ final class Uploader: NSObject, URLSessionDataDelegate {
 
     // Writes the recording's manifest beside its members, the members in recording.json's order with their sizes and SHA-256s, each frames file's consecutive segments grouped under it, and starts its PUT to root/manifest.json, into the data root.
     private func startManifest(_ info: RecordingInfo, root: URL, dataRoot: String) throws {
-        var members: [[String: Any]] = []
-        for member in info.members {
-            let entry: [String: Any] = ["name": member.name, "size": member.size, "sha256": member.sha256]
-            guard Recording.isSegment(member.name) else {
-                members.append(entry)
-                continue
-            }
-            // <frames file>.<index, 6 digits>
-            let file = String(member.name.dropLast(7))
-            if members.last?["name"] as? String == file, var segments = members.last?["segments"] as? [[String: Any]] {
-                segments.append(entry)
-                members[members.count - 1]["segments"] = segments
-            } else {
-                members.append(["name": file, "segments": [entry]])
-            }
-        }
-        var manifest: [String: Any] = ["members": members]
-        // The receiver names the recording by its id, which from 5.0.3 is not the key its files went under.
+        var manifest: [String: Any] = ["members": info.manifestMembers]
+        // The receiver names the recording by its id, which from 1.5.0.3 is not the key its files went under.
         if info.uploadId != nil { manifest["scan_id"] = info.id }
         let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: info.manifest, options: .atomic)
@@ -193,7 +176,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
         guard !FileManager.default.fileExists(atPath: Recording.documents.appendingPathComponent("work").appendingPathComponent(key).path) else { return nil }
         let directories = (try? FileManager.default.contentsOfDirectory(at: Recording.documents, includingPropertiesForKeys: nil)) ?? []
         for directory in directories {
-            // A recording apps 4.1 to 4.5 finished, its recording.json listing no members, does not decode until the app lists them.
+            // A recording apps 1.4.1 to 1.4.5 finished, its recording.json listing no members, does not decode until the app lists them.
             guard let info = try? RecordingInfo.load(directory.appendingPathComponent(RecordingInfo.fileName)), info.uploadKey == key else { continue }
             infos[info.id] = info
             return info
@@ -266,7 +249,7 @@ final class Uploader: NSObject, URLSessionDataDelegate {
             if name == Self.manifestName {
                 info.uploaded = true
                 try save(info)
-                // A recording 5.0.3 or 5.1 sent to a server alone stays on this phone, as RecordingTarget reads it.
+                // A recording 1.5.0.3 or 1.5.1 sent to a server alone stays on this phone, as RecordingTarget reads it.
                 guard case .upload(let destination)? = info.target else { observers.removeValue(forKey: info.id)?.completion(.success(())); return }
                 return confirmStored(info, destination: destination)
             }

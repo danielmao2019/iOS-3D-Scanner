@@ -1,4 +1,4 @@
-"""Tests the tools on tiny synthetic front and rear recordings laid out exactly as their format says, format_version "4.8" and "4.7" tars and 5.0.2 and 5.0.3 tars encoded as the app encodes them: the reader's rows, its frames memory-mapped in place inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, a 4.8 recording's intrinsics, distortions, depth-to-color transforms, recorded checksums and Float16 depth, that it still reads a "4.0" tar, whose color.csv lacks the three columns 4.3 added, and that it rejects a tar that is not laid out as its format says; decode_recording's output files; that inspect_recording runs on both formats with every check passing but the two edge alignments, which need real images, and fails a 4.8 recording whose checksum or distortion runs are wrong; inspect_recording's spatial alignment on a larger synthetic rear tar whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened; a 5.0.2 recording's frames decoded to exactly the frames the app encoded, inspect_recording's lossless check passing on it and failing on a wrong raw SHA-256, and the reader rejecting compressed sizes that do not sum to their member; a 5.0.3 recording, its frame members' SHA-256s not recorded, read and inspected as 5.0.2; and server/receive.py storing a recording uploaded in segments under the phone's key into the data root each request names, as one tar named by its manifest's scan_id, its segments joined, and refusing a missing or bad data root, and answering whether a recording is stored and which recordings the data root holds.
+"""Tests the tools on tiny synthetic front and rear recordings laid out exactly as their format says, format 1.4.8 and 1.4.7 tars and 1.5.0.2 and 1.5.0.3 tars encoded as the app encodes them: the reader's rows, its frames memory-mapped in place inside the tar, the rear poses and the YCbCr to BGR conversion against values worked out by hand, a 1.4.8 recording's intrinsics, distortions, depth-to-color transforms, recorded checksums and Float16 depth, that it still reads a "1.4.0" tar, whose color.csv lacks the three columns 1.4.3 added, and that it rejects a tar that is not laid out as its format says; decode_recording's output files; that inspect_recording runs on both formats with every check passing but the two edge alignments, which need real images, and fails a 1.4.8 recording whose checksum or distortion runs are wrong; inspect_recording's spatial alignment on a larger synthetic rear tar whose color and depth show the same rectangles, through the recorded intrinsics, through deliberately wrong ones, and with its depth's near rectangles fattened; a 1.5.0.2 recording's frames decoded to exactly the frames the app encoded, inspect_recording's lossless check passing on it and failing on a wrong raw SHA-256, and the reader rejecting compressed sizes that do not sum to their member; a 1.5.0.3 recording, its frame members' SHA-256s not recorded, read and inspected as 1.5.0.2; and server/receive.py storing a recording uploaded in segments under the phone's key into the data root each request names, as one tar named by its manifest's scan_id, its segments joined, and refusing a missing or bad data root, and answering whether a recording is stored and which recordings the data root holds.
 
 Usage, from the repository's root: python -m pytest tools/test_rgbd_recording.py
 """
@@ -22,7 +22,7 @@ import pytest
 
 from decode_recording import decode
 from inspect_recording import inspect, spatial_alignment
-from rgbd_recording import COLOR_KEYS, DEPTH_HEADERS, DEPTH_KEYS, INTRINSICS, YCBCR_MATRICES, Recording, color_header
+from rgbd_recording import COLOR_KEYS, DEPTH_HEADERS, DEPTH_KEYS, INTRINSICS, YCBCR_MATRICES, Recording, app_version, color_header
 from server.receive import make_handler
 
 COLOR_WIDTH, COLOR_HEIGHT = 8, 6
@@ -34,15 +34,15 @@ TIMES = [f"{100 + i / 30:.9f}" for i in range(5)]
 COLOR_DROPPED = {2: "writer_busy"}
 DEPTH_DROPPED = {"front": {3: "late_data"}, "rear": {3: "no_scene_depth"}}
 FRAMES = 4
-# The synthetic tars are app 4.7's, format_version "4.7".
-MINOR = 7
+# The synthetic tars are app v1.4.7's, which stores format_version "4.7".
+PATCH = 7
 ALIGNMENT_CHECK = "depth aligns best with its same-instant color frame"
 SPATIAL_ALIGNMENT_CHECK = "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames"
 SHA256_CHECK = "each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records"
 SIZE_CHECK = "each frame member's size, read from inside the tar, is the one its frames metadata records"
 DISTORTION_CHECK = "every color and depth frame has a distortion and every depth frame a depth_to_color, the runs covering each frame exactly once"
 LOSSLESS_CHECK = "every frame decodes losslessly: each decoded color frame, depth map and confidence map has the SHA-256 the app took of its bytes before encoding them"
-# The synthetic format 4.8 front recordings' two calibrations, both centered at REFERENCE_CENTER at the reference dimensions, each lookup table with its inverse: the first applies to the frames before instant 2, the second to the rest, so each stream's runs are frames [0, 1] and [2, 3].
+# The synthetic format 1.4.8 front recordings' two calibrations, both centered at REFERENCE_CENTER at the reference dimensions, each lookup table with its inverse: the first applies to the frames before instant 2, the second to the rest, so each stream's runs are frames [0, 1] and [2, 3].
 REFERENCE_CENTER = np.array([7.7, 5.6], np.float32)
 DISTORTION_TABLES = [([0, 0.001, 0.002], [0, -0.001, -0.002]), ([0, 0.0011, 0.0021], [0, -0.0011, -0.0021])]
 DISTORTION_RUNS = [[[0, 1]], [[2, 3]]]
@@ -148,14 +148,14 @@ def table(header: List[str], dropped: Dict[int, str], cells: Dict[int, List[str]
     return ("\n".join(lines) + "\n").encode()
 
 
-def color_csv(camera: str, minor: int) -> bytes:
-    """A format_version "4.<minor>" color.csv, with exposure_duration_s, lens_position and received_ts from minor 3 on."""
+def color_csv(camera: str, patch: int) -> bytes:
+    """A format 1.4.<patch> color.csv, with exposure_duration_s, lens_position and received_ts from patch 3 on."""
     cells = {}
     for instant in delivered(COLOR_DROPPED):
-        cells[instant] = [f32(v) for v in color_intrinsics(instant)] + orientation(instant) + (exposure_lens_arrival(TIMES[instant]) if minor >= 3 else [])
+        cells[instant] = [f32(v) for v in color_intrinsics(instant)] + orientation(instant) + (exposure_lens_arrival(TIMES[instant]) if patch >= 3 else [])
         if camera == "rear":
             cells[instant] += ["limited_initializing" if instant == 0 else "normal"] + [f32(v) for v in pose(instant).ravel()]
-    return table(color_header(camera, minor), COLOR_DROPPED, cells)
+    return table(color_header(camera, patch), COLOR_DROPPED, cells)
 
 
 def depth_csv(camera: str) -> bytes:
@@ -205,9 +205,9 @@ def rear_calibration() -> Dict:
     }
 
 
-def metadata(camera: str, matrix: str, minor: int) -> Dict:
+def metadata(camera: str, matrix: str, patch: int) -> Dict:
     meta = {
-        "format_version": f"4.{minor}",
+        "format_version": f"4.{patch}",
         "id": recording_id(camera),
         "name": f"2026-10-02 12:00:00 {camera.capitalize()}",
         "named_by_user": False,
@@ -248,19 +248,19 @@ def metadata(camera: str, matrix: str, minor: int) -> Dict:
             "arkit_video_format": "1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera",
             "arkit_video_formats": ["1920x1440 60 fps AVCaptureDeviceTypeBuiltInWideAngleCamera"],
         })
-        if 4 <= minor <= 6:
+        if 4 <= patch <= 6:
             meta.update({"avfoundation_calibration": rear_calibration(), "avfoundation_calibration_description": "synthetic"})
     else:
         meta.update({"calibration_description": "synthetic", "available_depth_formats": ["640x480 fdep"]})
     return meta
 
 
-def members(camera: str, matrix: str, minor: int) -> Dict[str, bytes]:
-    """Each archive member's name under <id>/ with its bytes, in format_version "4.<minor>"."""
+def members(camera: str, matrix: str, patch: int) -> Dict[str, bytes]:
+    """Each archive member's name under <id>/ with its bytes, in format 1.4.<patch>."""
     files = {
-        "metadata.json": json.dumps(metadata(camera, matrix, minor), indent=2, sort_keys=True).encode(),
+        "metadata.json": json.dumps(metadata(camera, matrix, patch), indent=2, sort_keys=True).encode(),
         "color.bin": color_frames().tobytes(),
-        "color.csv": color_csv(camera, minor),
+        "color.csv": color_csv(camera, patch),
         "depth.bin": depth_maps().tobytes(),
         "depth.csv": depth_csv(camera),
     }
@@ -283,9 +283,9 @@ def write_tar(path: Path, rec_id: str, files: Dict[str, bytes]) -> Path:
 
 
 def synthetic_tar(folder: Path, camera: str, matrix: str, version: str) -> Path:
-    """The synthetic recording of the camera as a format_version "4.7", "4.8", "5.0.2", "5.0.3" or "5.2" tar."""
-    assert version in ("4.7", "4.8", "5.0.2", "5.0.3", "5.2"), version
-    files = {"4.7": lambda: members(camera, matrix, MINOR), "4.8": lambda: members_4_8(camera, matrix), "5.0.2": lambda: members_5_0_2(camera, matrix), "5.0.3": lambda: members_5_0_3(camera, matrix), "5.2": lambda: members_5_2(camera, matrix)}[version]()
+    """The synthetic recording of the camera as a format 1.4.7, 1.4.8, 1.5.0.2, 1.5.0.3, 1.5.2 or 1.6.0 tar."""
+    assert version in ("1.4.7", "1.4.8", "1.5.0.2", "1.5.0.3", "1.5.2", "1.6.0"), version
+    files = {"1.4.7": lambda: members(camera, matrix, PATCH), "1.4.8": lambda: members_1_4_8(camera, matrix), "1.5.0.2": lambda: members_1_5_0_2(camera, matrix), "1.5.0.3": lambda: members_1_5_0_3(camera, matrix), "1.5.2": lambda: members_1_5_2(camera, matrix), "1.6.0": lambda: members_1_6_0(camera, matrix)}[version]()
     return write_tar(folder / f"{recording_id(camera)}.tar", recording_id(camera), files)
 
 
@@ -296,7 +296,7 @@ def json_float32(values: np.ndarray) -> List[float]:
 
 
 def front_depth_intrinsics(instant: int) -> np.ndarray:
-    """fx, fy, cx, cy of the format 4.8 front depth map at `instant`, in Float32 as the app computes them: the color intrinsics at that instant scaled plainly to the depth map, the two being one calibration measured from the frame's corner."""
+    """fx, fy, cx, cy of the format 1.4.8 front depth map at `instant`, in Float32 as the app computes them: the color intrinsics at that instant scaled plainly to the depth map, the two being one calibration measured from the frame's corner."""
     s = np.array([DEPTH_WIDTH, DEPTH_HEIGHT], np.float32) / np.array([COLOR_WIDTH, COLOR_HEIGHT], np.float32)
     return color_intrinsics(instant) * np.concatenate([s, s])
 
@@ -307,8 +307,8 @@ def distortions(width: int, height: int) -> List[Dict]:
     return [{"center": json_float32(center), "lookup_table": table, "inverse_lookup_table": inverse, "frame_ranges": runs} for (table, inverse), runs in zip(DISTORTION_TABLES, DISTORTION_RUNS, strict=True)]
 
 
-def members_4_8(camera: str, matrix: str) -> Dict[str, bytes]:
-    """Each member of a format 4.8 recording's tar, by its name under <id>/, with its bytes: the 4.7 tars' instants, frames and drops, laid out as the format says."""
+def members_1_4_8(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 1.4.8 recording's tar, by its name under <id>/, with its bytes: the 1.4.7 tars' instants, frames and drops, laid out as the format says."""
     front = camera == "front"
     color_instants, depth_instants = list(delivered(COLOR_DROPPED)), list(delivered(DEPTH_DROPPED[camera]))
     files = {"color_frames.bin": color_frames().tobytes(), "depth_frames.bin": depth_maps().tobytes()} | ({} if front else {"depth_frames_confidence.bin": confidence_maps().tobytes()})
@@ -356,7 +356,7 @@ def members_4_8(camera: str, matrix: str) -> Dict[str, bytes]:
 
 
 def float16_depth(files: Dict[str, bytes]) -> Dict[str, bytes]:
-    """A format 4.8 recording's members with its depth maps recorded as Float16 metres ("hdep"), as a capture format offering no Float32 depth delivers them."""
+    """A format 1.4.8 recording's members with its depth maps recorded as Float16 metres ("hdep"), as a capture format offering no Float32 depth delivers them."""
     maps = depth_maps()
     assert maps.dtype == np.float32, maps.dtype
     data = maps.astype("<f2").tobytes()
@@ -379,9 +379,9 @@ def row_delta(frame: np.ndarray) -> np.ndarray:
     return out
 
 
-def members_5_0_2(camera: str, matrix: str) -> Dict[str, bytes]:
-    """Each member of a format 5.0.2 recording's tar: members_4_8's frames encoded as the app encodes them, the color frames' rows delta-coded then deflated with the run-length strategy and the maps deflated, each frames entry with its compressed size and the SHA-256 of its raw bytes."""
-    files = members_4_8(camera, matrix)
+def members_1_5_0_2(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 1.5.0.2 recording's tar: members_1_4_8's frames encoded as the app encodes them, the color frames' rows delta-coded then deflated with the run-length strategy and the maps deflated, each frames entry with its compressed size and the SHA-256 of its raw bytes."""
+    files = members_1_4_8(camera, matrix)
     frames = {
         "color_frames.bin": [(f.tobytes(), deflated(row_delta(f).tobytes(), zlib.Z_RLE)) for f in color_frames()],
         "depth_frames.bin": [(m.tobytes(), deflated(m.tobytes(), zlib.Z_DEFAULT_STRATEGY)) for m in depth_maps()],
@@ -406,18 +406,23 @@ def members_5_0_2(camera: str, matrix: str) -> Dict[str, bytes]:
     return with_json(files, "scan_metadata.json", {"format_version": "5.0.2"})
 
 
-def members_5_0_3(camera: str, matrix: str) -> Dict[str, bytes]:
-    """Each member of a format 5.0.3 recording's tar: members_5_0_2's, its frame members' entries without their SHA-256."""
-    files = with_json(members_5_0_2(camera, matrix), "scan_metadata.json", {"format_version": "5.0.3"})
+def members_1_5_0_3(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 1.5.0.3 recording's tar: members_1_5_0_2's, its frame members' entries without their SHA-256."""
+    files = with_json(members_1_5_0_2(camera, matrix), "scan_metadata.json", {"format_version": "5.0.3"})
     color, depth = json.loads(files["color_frames_metadata.json"]), json.loads(files["depth_frames_metadata.json"])
     for entry in [color, depth] + ([depth["confidence"]] if camera == "rear" else []):
         del entry["sha256"]
     return files | {"color_frames_metadata.json": json.dumps(color, indent=2).encode(), "depth_frames_metadata.json": json.dumps(depth, indent=2).encode()}
 
 
-def members_5_2(camera: str, matrix: str) -> Dict[str, bytes]:
-    """Each member of a format 5.2 recording's tar: members_5_0_3's, its scan_metadata.json naming its author."""
-    return with_json(members_5_0_3(camera, matrix), "scan_metadata.json", {"format_version": "5.2", "author": "daniel"})
+def members_1_5_2(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 1.5.2 recording's tar: members_1_5_0_3's, its scan_metadata.json naming its author."""
+    return with_json(members_1_5_0_3(camera, matrix), "scan_metadata.json", {"format_version": "5.2", "author": "daniel"})
+
+
+def members_1_6_0(camera: str, matrix: str) -> Dict[str, bytes]:
+    """Each member of a format 1.6.0 recording's tar: members_1_5_2's, under its own format_version."""
+    return with_json(members_1_5_2(camera, matrix), "scan_metadata.json", {"format_version": "1.6.0"})
 
 
 def with_json(files: Dict[str, bytes], name: str, update: Dict) -> Dict[str, bytes]:
@@ -456,7 +461,7 @@ def rectangle_cover(instant: int, width: int, height: int, k: np.ndarray) -> np.
 
 def aligned_members(fattening: int) -> Dict[str, bytes]:
     """The spatial alignment recording's members under <id>/: ALIGNED_PAIRS instants at 30 fps, each with a delivered color frame, its luma bright where the rectangles are, and a delivered depth map, near where they are grown by `fattening` depth px, each rasterized through its own recorded intrinsics."""
-    color_lines, depth_lines = [",".join(color_header("rear", MINOR))], [",".join(DEPTH_HEADERS["rear"])]
+    color_lines, depth_lines = [",".join(color_header("rear", PATCH))], [",".join(DEPTH_HEADERS["rear"])]
     frames, maps = [], []
     for instant in range(ALIGNED_PAIRS):
         time = f"{200 + instant / 30:.9f}"
@@ -474,7 +479,7 @@ def aligned_members(fattening: int) -> Dict[str, bytes]:
         inverse = cv2.dilate(inverse, np.ones((2 * fattening + 1, 2 * fattening + 1), np.uint8))
         assert inverse.dtype == np.float64, inverse.dtype
         maps.append((1 / inverse).astype(np.float32))
-    meta = metadata("rear", "ITU_R_709_2", MINOR) | {
+    meta = metadata("rear", "ITU_R_709_2", PATCH) | {
         "duration_s": (ALIGNED_PAIRS - 1) / 30,
         "color_width": ALIGNED_COLOR_WIDTH,
         "color_height": ALIGNED_COLOR_HEIGHT,
@@ -509,12 +514,12 @@ def plain_intrinsics(depth_row: Dict[str, str]) -> List[float]:
 @pytest.mark.parametrize("matrix", sorted(YCBCR_MATRICES))
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
-    tar_path = synthetic_tar(tmp_path, camera, matrix, "4.7")
+    tar_path = synthetic_tar(tmp_path, camera, matrix, "1.4.7")
     rec = Recording(tar_path)
 
     assert len(rec.color_rows) == len(rec.depth_rows) == len(TIMES)
     assert [r["index"] for r in rec.colors] == [r["index"] for r in rec.depths] == ["0", "1", "2", "3"]
-    assert rec.format_minor == MINOR and [r["received_ts"] for r in rec.colors] == [exposure_lens_arrival(TIMES[i])[2] for i in delivered(COLOR_DROPPED)]
+    assert rec.format_patch == PATCH and [r["received_ts"] for r in rec.colors] == [exposure_lens_arrival(TIMES[i])[2] for i in delivered(COLOR_DROPPED)]
     with tarfile.open(tar_path) as tar:
         offsets = {Path(m.name).name: m.offset_data for m in tar.getmembers()}
     # Each .bin member is mapped in place inside the tar, never extracted.
@@ -550,20 +555,20 @@ def test_reader(tmp_path: Path, camera: str, matrix: str) -> None:
 
 
 @pytest.mark.parametrize("camera", ["front", "rear"])
-def test_reader_reads_4_0(tmp_path: Path, camera: str) -> None:
+def test_reader_reads_1_4_0(tmp_path: Path, camera: str) -> None:
     rec = Recording(write_tar(tmp_path / "recording.tar", recording_id(camera), members(camera, "ITU_R_709_2", 0)))
 
-    # App 4.0 wrote color.csv without the three columns 4.3 added, and everything else as 4.3 does.
-    assert rec.meta["format_version"] == "4.0" and rec.format_minor == 0 and "received_ts" not in rec.color_rows[0]
+    # App 1.4.0 wrote color.csv without the three columns 1.4.3 added, and everything else as 1.4.3 does.
+    assert rec.meta["format_version"] == "4.0" and rec.format_version == "1.4.0" and rec.format_patch == 0 and "received_ts" not in rec.color_rows[0]
     assert len(rec.color_rows) == len(rec.depth_rows) == len(TIMES)
     assert np.array_equal(rec.color, color_frames()) and np.array_equal(rec.depth, depth_maps(), equal_nan=True)
 
 
 @pytest.mark.parametrize("change", ["format_version", "extra_member", "missing_member"])
 def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
-    files = members("rear", "ITU_R_709_2", MINOR)
+    files = members("rear", "ITU_R_709_2", PATCH)
     if change == "format_version":
-        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2", MINOR) | {"format_version": "3.0"}).encode()
+        files["metadata.json"] = json.dumps(metadata("rear", "ITU_R_709_2", PATCH) | {"format_version": "3.0"}).encode()
     elif change == "extra_member":
         files["calibration.jsonl"] = calibration_jsonl()
     else:
@@ -575,16 +580,23 @@ def test_reader_rejects_other_formats(tmp_path: Path, change: str) -> None:
 
 
 # The rear's depth is always Float32: ARKit delivers scene depth in no other type.
-# 5.0.0 and 5.0.1 keep 4.8's format.
-@pytest.mark.parametrize("version", ["4.8", "5.0.0", "5.0.1"])
+# Apps before v1.6.0 stored their version without the leading "1.".
+@pytest.mark.parametrize("stored, version", [("4.0", "1.4.0"), ("4.8", "1.4.8"), ("5.0.3", "1.5.0.3"), ("5.2", "1.5.2"), ("1.6.0", "1.6.0")])
+def test_app_version(stored: str, version: str) -> None:
+    assert app_version(stored) == version
+
+
+# 1.5.0.0 and 1.5.0.1 keep 1.4.8's format.
+@pytest.mark.parametrize("version", ["1.4.8", "1.5.0.0", "1.5.0.1"])
 @pytest.mark.parametrize("camera, depth_format", [("front", "fdep"), ("front", "hdep"), ("rear", "fdep")])
-def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str) -> None:
-    files = members_4_8(camera, "ITU_R_709_2") if depth_format == "fdep" else float16_depth(members_4_8(camera, "ITU_R_709_2"))
-    files = with_json(files, "scan_metadata.json", {"format_version": version})
+def test_reader_1_4_8(tmp_path: Path, camera: str, depth_format: str, version: str) -> None:
+    files = members_1_4_8(camera, "ITU_R_709_2") if depth_format == "fdep" else float16_depth(members_1_4_8(camera, "ITU_R_709_2"))
+    # Apps before v1.6.0 stored their version without the leading "1.".
+    files = with_json(files, "scan_metadata.json", {"format_version": version.removeprefix("1.")})
     tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
     rec = Recording(str(tar_path))
 
-    assert (rec.path, rec.format_version, rec.format_minor, rec.camera, rec.scan_id) == (tar_path, version, 8, camera, recording_id(camera))
+    assert (rec.path, rec.format_version, rec.format_patch, rec.camera, rec.scan_id) == (tar_path, version, 8, camera, recording_id(camera))
     assert (rec.color_width, rec.color_height, rec.depth_width, rec.depth_height, rec.ycbcr_matrix, rec.frame_rate) == (COLOR_WIDTH, COLOR_HEIGHT, DEPTH_WIDTH, DEPTH_HEIGHT, "ITU_R_709_2", 30)
     origin = "upper_left_pixel_corner" if camera == "front" else "upper_left_pixel_center"
     assert rec.color_principal_point_origin == rec.depth_principal_point_origin == origin
@@ -604,7 +616,7 @@ def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str
     expected_maps = maps if depth_format == "fdep" else maps.astype(np.float16)
     assert rec.depth.dtype == expected_maps.dtype and np.array_equal(rec.depth, expected_maps, equal_nan=True)
 
-    # The rows are the tars' rows, less what 4.8 no longer records: a dropped row in time order, keyed as the tars key it, with only its reason.
+    # The rows are the tars' rows, less what 1.4.8 no longer records: a dropped row in time order, keyed as the tars key it, with only its reason.
     assert [r["index"] for r in rec.color_rows] == ["0", "1", "-1", "2", "3"] and [r["index"] for r in rec.depth_rows] == ["0", "1", "2", "-1", "3"]
     assert all(list(r) == COLOR_KEYS[camera] for r in rec.color_rows) and all(list(r) == DEPTH_KEYS[camera] for r in rec.depth_rows)
     for rows, dropped in ((rec.color_rows, COLOR_DROPPED), (rec.depth_rows, DEPTH_DROPPED[camera])):
@@ -639,17 +651,17 @@ def test_reader_4_8(tmp_path: Path, camera: str, depth_format: str, version: str
     assert np.array_equal(bgr[0:2, 0:2], first) and np.array_equal(bgr[0:2, 2:4], np.full((2, 2, 3), second)), bgr[0:2, 0:4].tolist()
 
 
-# 5.1 and 5.2 keep 5.0.3's format, 5.2 adding the author.
-@pytest.mark.parametrize("version", ["5.0.2", "5.0.3", "5.1", "5.2"])
+# 1.5.1, 1.5.2 and 1.6.0 keep 1.5.0.3's format, 1.5.2 adding the author.
+@pytest.mark.parametrize("version", ["1.5.0.2", "1.5.0.3", "1.5.1", "1.5.2", "1.6.0"])
 @pytest.mark.parametrize("camera", ["front", "rear"])
-def test_reader_5_0_2(tmp_path: Path, camera: str, version: str) -> None:
-    files = members_5_0_2(camera, "ITU_R_709_2") if version == "5.0.2" else members_5_2(camera, "ITU_R_709_2") if version == "5.2" else with_json(members_5_0_3(camera, "ITU_R_709_2"), "scan_metadata.json", {"format_version": version})
+def test_reader_1_5_0_2(tmp_path: Path, camera: str, version: str) -> None:
+    files = members_1_5_0_2(camera, "ITU_R_709_2") if version == "1.5.0.2" else members_1_5_2(camera, "ITU_R_709_2") if version == "1.5.2" else members_1_6_0(camera, "ITU_R_709_2") if version == "1.6.0" else with_json(members_1_5_0_3(camera, "ITU_R_709_2"), "scan_metadata.json", {"format_version": version.removeprefix("1.")})
     tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), files)
     rec = Recording(str(tar_path))
 
-    assert (rec.format_version, rec.format_minor, rec.encoded, rec.camera) == (version, 8, True, camera)
+    assert (rec.format_version, rec.format_patch, rec.encoded, rec.camera) == (version, 8, True, camera)
     bins = ["color_frames.bin", "depth_frames.bin"] + (["depth_frames_confidence.bin"] if camera == "rear" else [])
-    assert rec.frame_files == {name: (len(files[name]), hashlib.sha256(files[name]).hexdigest() if version == "5.0.2" else None) for name in bins}
+    assert rec.frame_files == {name: (len(files[name]), hashlib.sha256(files[name]).hexdigest() if version == "1.5.0.2" else None) for name in bins}
     # Every frame decodes to exactly the frame the app encoded.
     assert len(rec.color) == rec.color.shape[0] == FRAMES and rec.color.shape[1:] == (COLOR_HEIGHT * 3 // 2, COLOR_WIDTH) and rec.color.dtype == np.uint8
     assert all(rec.color[i].dtype == np.uint8 and np.array_equal(rec.color[i], frame) for i, frame in enumerate(color_frames()))
@@ -662,8 +674,8 @@ def test_reader_5_0_2(tmp_path: Path, camera: str, version: str) -> None:
 
 
 @pytest.mark.parametrize("change", ["compressed_size", "encoding", "truncated_stream"])
-def test_reader_rejects_other_5_0_2_tars(tmp_path: Path, change: str) -> None:
-    files = members_5_0_2("rear", "ITU_R_709_2")
+def test_reader_rejects_other_1_5_0_2_tars(tmp_path: Path, change: str) -> None:
+    files = members_1_5_0_2("rear", "ITU_R_709_2")
     depth = json.loads(files["depth_frames_metadata.json"])
     if change == "compressed_size":
         # Sizes that no longer sum to the member's.
@@ -683,8 +695,8 @@ def test_reader_rejects_other_5_0_2_tars(tmp_path: Path, change: str) -> None:
 
 
 @pytest.mark.parametrize("change", ["missing_member", "extra_member", "format_version", "sha256", "size", "overlapping_run"])
-def test_reader_rejects_other_4_8_tars(tmp_path: Path, change: str) -> None:
-    files = members_4_8("front", "ITU_R_709_2")
+def test_reader_rejects_other_1_4_8_tars(tmp_path: Path, change: str) -> None:
+    files = members_1_4_8("front", "ITU_R_709_2")
     color = json.loads(files["color_frames_metadata.json"])
     if change == "missing_member":
         del files["extrinsics.json"]
@@ -707,17 +719,17 @@ def test_reader_rejects_other_4_8_tars(tmp_path: Path, change: str) -> None:
         Recording(tar_path)
 
 
-@pytest.mark.parametrize("version", ["4.7", "4.8", "5.0.2", "5.0.3"])
+@pytest.mark.parametrize("version", ["1.4.7", "1.4.8", "1.5.0.2", "1.5.0.3"])
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_decode(tmp_path: Path, camera: str, version: str) -> None:
     tar_path = synthetic_tar(tmp_path, camera, "ITU_R_709_2", version)
-    files = {"4.7": lambda: members(camera, "ITU_R_709_2", MINOR), "4.8": lambda: members_4_8(camera, "ITU_R_709_2"), "5.0.2": lambda: members_5_0_2(camera, "ITU_R_709_2"), "5.0.3": lambda: members_5_0_3(camera, "ITU_R_709_2")}[version]()
+    files = {"1.4.7": lambda: members(camera, "ITU_R_709_2", PATCH), "1.4.8": lambda: members_1_4_8(camera, "ITU_R_709_2"), "1.5.0.2": lambda: members_1_5_0_2(camera, "ITU_R_709_2"), "1.5.0.3": lambda: members_1_5_0_3(camera, "ITU_R_709_2")}[version]()
     out = tmp_path / "decoded"
 
     summary = decode(tar_path, out)
 
     rec = Recording(tar_path)
-    # 4.7's tables, metadata.json and front calibration.jsonl, 4.8's six JSON files.
+    # 1.4.7's tables, metadata.json and front calibration.jsonl, 1.4.8's six JSON files.
     texts = sorted(name for name in files if not name.endswith(".bin"))
     maps = ["depth"] + (["confidence"] if camera == "rear" else [])
     expected = {"decoded.json", *texts, *(f"color/{i:06d}.png" for i in range(FRAMES)), *(f"{m}/{i:06d}.npy" for m in maps for i in range(FRAMES))}
@@ -734,25 +746,25 @@ def test_decode(tmp_path: Path, camera: str, version: str) -> None:
     assert summary["format_version"] == version and summary["source"] == tar_path.name
 
 
-@pytest.mark.parametrize("camera, version, depth_format", [("front", "4.7", "fdep"), ("rear", "4.7", "fdep"), ("front", "4.8", "fdep"), ("front", "4.8", "hdep"), ("rear", "4.8", "fdep"), ("front", "5.0.2", "fdep"), ("rear", "5.0.2", "fdep"), ("front", "5.0.3", "fdep"), ("rear", "5.0.3", "fdep"), ("front", "5.2", "fdep"), ("rear", "5.2", "fdep")])
+@pytest.mark.parametrize("camera, version, depth_format", [("front", "1.4.7", "fdep"), ("rear", "1.4.7", "fdep"), ("front", "1.4.8", "fdep"), ("front", "1.4.8", "hdep"), ("rear", "1.4.8", "fdep"), ("front", "1.5.0.2", "fdep"), ("rear", "1.5.0.2", "fdep"), ("front", "1.5.0.3", "fdep"), ("rear", "1.5.0.3", "fdep"), ("front", "1.5.2", "fdep"), ("rear", "1.5.2", "fdep"), ("front", "1.6.0", "fdep"), ("rear", "1.6.0", "fdep")])
 def test_inspect(tmp_path: Path, camera: str, version: str, depth_format: str) -> None:
     if depth_format == "fdep":
         tar_path = synthetic_tar(tmp_path, camera, "ITU_R_601_4", version)
     else:
-        tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), float16_depth(members_4_8(camera, "ITU_R_601_4")))
+        tar_path = write_tar(tmp_path / f"{recording_id(camera)}.tar", recording_id(camera), float16_depth(members_1_4_8(camera, "ITU_R_601_4")))
 
     checks = inspect(tar_path)
 
     # The synthetic frames are too few and too small for the two edge alignments, which may fail; every other check holds on a recording laid out as the format says.
     assert {name for name, ok in checks.items() if not ok} <= {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK}, checks
-    # 4.8 records each frame member's size and SHA-256, and no longer the row strides or calibration.jsonl; 5.0.2 also each frame's raw SHA-256.
-    assert (SHA256_CHECK in checks) == (version in ("4.8", "5.0.2")) and (SIZE_CHECK in checks) == (version in ("5.0.3", "5.2")) and (DISTORTION_CHECK in checks) == (version != "4.7" and camera == "front") and (LOSSLESS_CHECK in checks) == (version in ("5.0.2", "5.0.3", "5.2")), checks
-    assert not any("bytes per row" in name or "calibration.jsonl" in name for name in checks) if version != "4.7" else any("bytes per row" in name for name in checks), checks
+    # 1.4.8 records each frame member's size and SHA-256, and no longer the row strides or calibration.jsonl; 1.5.0.2 also each frame's raw SHA-256.
+    assert (SHA256_CHECK in checks) == (version in ("1.4.8", "1.5.0.2")) and (SIZE_CHECK in checks) == (version in ("1.5.0.3", "1.5.2", "1.6.0")) and (DISTORTION_CHECK in checks) == (version != "1.4.7" and camera == "front") and (LOSSLESS_CHECK in checks) == (version in ("1.5.0.2", "1.5.0.3", "1.5.2", "1.6.0")), checks
+    assert not any("bytes per row" in name or "calibration.jsonl" in name for name in checks) if version != "1.4.7" else any("bytes per row" in name for name in checks), checks
 
 
 @pytest.mark.parametrize("camera", ["front", "rear"])
-def test_inspect_fails_5_0_2_wrong_raw_sha256(tmp_path: Path, camera: str) -> None:
-    files = members_5_0_2(camera, "ITU_R_601_4")
+def test_inspect_fails_1_5_0_2_wrong_raw_sha256(tmp_path: Path, camera: str) -> None:
+    files = members_1_5_0_2(camera, "ITU_R_601_4")
     color = json.loads(files["color_frames_metadata.json"])
     # Well formed, but another frame's: as if frame 2 had decoded to other bytes than the app encoded.
     color["frames"][2]["raw_sha256"] = color["frames"][1]["raw_sha256"]
@@ -764,8 +776,8 @@ def test_inspect_fails_5_0_2_wrong_raw_sha256(tmp_path: Path, camera: str) -> No
 
 
 @pytest.mark.parametrize("change", ["sha256", "distortion_run"])
-def test_inspect_fails_4_8(tmp_path: Path, change: str) -> None:
-    files = members_4_8("front", "ITU_R_601_4")
+def test_inspect_fails_1_4_8(tmp_path: Path, change: str) -> None:
+    files = members_1_4_8("front", "ITU_R_601_4")
     if change == "sha256":
         # Well formed, so the reader opens the recording, but another file's.
         files = with_json(files, "depth_frames_metadata.json", {"sha256": hashlib.sha256(b"other bytes").hexdigest()})
@@ -782,13 +794,13 @@ def test_inspect_fails_4_8(tmp_path: Path, change: str) -> None:
     assert {name for name, ok in checks.items() if not ok} - {ALIGNMENT_CHECK, SPATIAL_ALIGNMENT_CHECK} == {failing}, checks
 
 
-@pytest.mark.parametrize("minor", [6, MINOR])
-def test_inspect_rear_calibration(tmp_path: Path, minor: int) -> None:
-    checks = inspect(write_tar(tmp_path / "recording.tar", recording_id("rear"), members("rear", "ITU_R_601_4", minor)))
+@pytest.mark.parametrize("patch", [6, PATCH])
+def test_inspect_rear_calibration(tmp_path: Path, patch: int) -> None:
+    checks = inspect(write_tar(tmp_path / "recording.tar", recording_id("rear"), members("rear", "ITU_R_601_4", patch)))
 
-    # Apps 4.4 to 4.6 recorded the rear's avfoundation_calibration, which is checked there and nowhere else.
+    # Apps 1.4.4 to 1.4.6 recorded the rear's avfoundation_calibration, which is checked there and nowhere else.
     calibration = [name for name in checks if "avfoundation_calibration" in name]
-    assert (len(calibration) == 1 and checks[calibration[0]]) if minor <= 6 else not calibration, checks
+    assert (len(calibration) == 1 and checks[calibration[0]]) if patch <= 6 else not calibration, checks
 
 
 def test_spatial_alignment(tmp_path: Path) -> None:
@@ -870,7 +882,7 @@ def upload(port: int, key: str, rec_id: str, files: Dict[str, bytes], data_root:
 
 @pytest.mark.parametrize("camera", ["front", "rear"])
 def test_receiver(tmp_path: Path, camera: str) -> None:
-    files = members_5_0_3(camera, "ITU_R_601_4")
+    files = members_1_5_0_3(camera, "ITU_R_601_4")
     rec_id = recording_id(camera)
     # The phone's key for the recording, fixed before its name is.
     key = "6F1C2D3E-4A5B-4C6D-8E7F-901A2B3C4D5E"
@@ -912,7 +924,7 @@ def test_receiver(tmp_path: Path, camera: str) -> None:
     assert sorted(p.name for p in root.iterdir()) == [".staging", archive.name] and not any((root / ".staging").iterdir())
     assert sorted(p.name for p in tmp_path.iterdir()) == ["file", "root"]
     rec = Recording(archive)
-    assert (rec.scan_id, rec.format_version) == (rec_id, "5.0.3") and all(np.array_equal(rec.color[i], frame) for i, frame in enumerate(color_frames()))
+    assert (rec.scan_id, rec.format_version) == (rec_id, "1.5.0.3") and all(np.array_equal(rec.color[i], frame) for i, frame in enumerate(color_frames()))
     stored_bytes, stored_stat = archive.read_bytes(), archive.stat()
 
     with receiver() as port:

@@ -11,7 +11,7 @@ import simd
 // The two streams are recorded independently, each frame with its own capture timestamp (seconds, host clock); a color frame and a depth frame were captured together when their timestamps are equal. Frame n of a .bin file is entry n of every frames list that describes it.
 // All pixels, the intrinsics and the poses' camera frame are in the sensor's native orientation, unrotated and unmirrored; each color frame records how the phone was held.
 //
-// The recording's files (format_version "5.2", the version of the app that wrote it, <major>.<minor>, the minor counting the task's solved problems, with a patch level within 5.0), as the receiver stores them under <id>/:
+// The recording's files (format_version "1.6.0", the version of the app that wrote it), as the receiver stores them under <id>/:
 //   scan_metadata.json             the scan as a whole: format_version, scan_id, name, start time, duration, phone model, id and iOS version, camera, frame rate, whether it was recovered after the app stopped, and its author, the app's user who recorded it
 //   color_frames.bin               every delivered color frame, encoded as FrameCodec.color ("row_delta_deflate"), concatenated with no header: frame n is the compressed_size bytes after frames 0 to n-1; decoded, each is exactly the frame the camera delivered, "420f", 8-bit full-range YCbCr 4:2:0, stored as its luma plane, h rows of w bytes (a Y byte per pixel), then its CbCr plane, h/2 rows of w bytes (a Cb, Cr byte pair per 2x2 pixels), rows tightly packed; its RGB is through ycbcr_matrix
 //   color_frames_metadata.json     color_frames.bin's size, encoding, format and frame count; each delivered frame's timestamp, upright rotation (the clockwise rotation that turns it upright), CoreMotion gravity in the phone's device frame with its sample's timestamp, exposure time, compressed size and the SHA-256 of its decoded bytes; the dropped frames, each with its timestamp and why it was dropped (e.g. late, out_of_buffers, writer_busy)
@@ -31,7 +31,7 @@ import simd
 //   the JSON files                                                written when finishing begins, from start.json and the lines
 //   recording.json                                                the recording's RecordingInfo with every JSON file's and segment's size and SHA-256, written once the JSON files are; a finish that finds it only removes start.json and the lines and renames the directory
 // and Documents/segments/<uuid>/ holds each frames file's segments, <frames file>.<index, 6 digits>, written as the frames arrive, each deleted once the receiver acknowledges it.
-// A recording recovered at the next launch hashes the segments a closed app left open by reading them; so are the files of a recording apps 4.1 to 4.5 finished, whose recording.json lists no members, when this app first finds it: the only times a recording's files are read back.
+// A recording recovered at the next launch hashes the segments a closed app left open by reading them; so are the files of a recording apps 1.4.1 to 1.4.5 finished, whose recording.json lists no members, when this app first finds it: the only times a recording's files are read back.
 final class Recording {
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private static var workRoot: URL { documents.appendingPathComponent("work", isDirectory: true) }
@@ -434,21 +434,21 @@ final class Recording {
         try finish(directory, userName: nil, recovered: true)
     }
 
-    // The recordings apps 4.1 to 4.5 finished: their recording.json lists no members.
+    // The recordings apps 1.4.1 to 1.4.5 finished: their recording.json lists no members.
     static func withoutMembers() -> [URL] {
         let directories = (try? FileManager.default.contentsOfDirectory(at: documents, includingPropertiesForKeys: nil)) ?? []
         return directories.filter { listsNoMembers($0.appendingPathComponent(RecordingInfo.fileName)) }
     }
 
-    // Whether recording.json exists and lists no members, as apps 4.1 to 4.5 wrote it.
+    // Whether recording.json exists and lists no members, as apps 1.4.1 to 1.4.5 wrote it.
     static func listsNoMembers(_ infoFile: URL) -> Bool {
         guard let data = try? Data(contentsOf: infoFile), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         return object["members"] == nil
     }
 
-    // Gives a recording apps 4.1 to 4.5 finished its members, each hashed by reading it and acknowledged when the recording was uploaded, rewriting its recording.json; it is otherwise as those apps wrote it.
+    // Gives a recording apps 1.4.1 to 1.4.5 finished its members, each hashed by reading it and acknowledged when the recording was uploaded, rewriting its recording.json; it is otherwise as those apps wrote it.
     static func addMembers(_ directory: URL) throws -> RecordingInfo {
-        // recording.json as apps 4.1 to 4.5 wrote it.
+        // recording.json as apps 1.4.1 to 1.4.5 wrote it.
         struct Listed: Decodable {
             let id: String
             let name: String
@@ -462,7 +462,7 @@ final class Recording {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let listed = try decoder.decode(Listed.self, from: Data(contentsOf: infoFile))
-        // The files apps 4.1 to 4.5 wrote, in the order their archive held them.
+        // The files apps 1.4.1 to 1.4.5 wrote, in the order their archive held them.
         let names = ["color.bin", "depth.bin", "color.csv", "depth.csv", "metadata.json"] + (listed.camera == .rear ? ["confidence.bin"] : ["calibration.jsonl"])
         let members = try names.map { name -> RecordingInfo.Member in
             let read = try hash(directory.appendingPathComponent(name))
@@ -587,7 +587,7 @@ final class Recording {
         } } ?? color.map(\.intrinsics)
         let members = try [
             json("scan_metadata.json", ScanMetadata(
-                formatVersion: "5.2", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
+                formatVersion: "1.6.0", scanId: id, name: name, startTimeUtc: start.startTimeUtc, durationS: duration, phoneModel: start.phoneModel,
                 phoneId: Nullable(start.phoneId), iosVersion: start.iosVersion, camera: start.camera, frameRate: format.frameRate, recovered: recovered, author: Nullable(start.user))),
         ] + members(colorSegments) + [
             json("color_frames_metadata.json", ColorFramesMetadata(
@@ -728,7 +728,7 @@ private struct Start: Codable {
     let phoneId: String?
     let iosVersion: String
     let format: StreamFormat
-    // The user recording, nil in a work directory an app before 5.2 left, and the config saying where the recording goes, nil before 5.0.3.
+    // The user recording, nil in a work directory an app before 1.5.2 left, and the config saying where the recording goes, nil before 1.5.0.3.
     let user: String?
     let target: RecordingTarget?
 }
@@ -781,7 +781,7 @@ private struct ScanMetadata: Encodable {
     let camera: DepthCamera
     let frameRate: Double
     let recovered: Bool
-    // The app's user who recorded it; null in a recording an app before 5.2 began.
+    // The app's user who recorded it; null in a recording an app before 1.5.2 began.
     let author: Nullable<String>
 }
 
@@ -906,7 +906,7 @@ private struct Distortion: Codable, Hashable {
     let center: [Float]
     let lookupTable: [Float]
     let inverseLookupTable: [Float]
-    // The image's scale from the calibration's reference dimensions, x then y; nil in a line an app before 5.0.1 wrote.
+    // The image's scale from the calibration's reference dimensions, x then y; nil in a line an app before 1.5.0.1 wrote.
     let scale: [Float]?
 
     init?(_ calibration: Calibration, width: Int, height: Int) {
