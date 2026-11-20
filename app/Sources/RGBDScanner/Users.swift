@@ -6,7 +6,7 @@ struct UploadDestination: Codable, Hashable {
     var dataRoot: String
 }
 
-// Where a recording goes: kept on this phone, never uploaded; kept on this phone until a computer it is plugged into by cable takes it (server/pull.py) into the folder path on that computer, nil for that computer's Downloads folder, and deleted from the phone once that computer has stored it; or uploaded to a destination while it records and deleted from the phone once the receiver has stored it.
+// Where a recording goes: kept on this phone, never uploaded; taken by a computer it is plugged into by cable (server/pull.ps1), its segments while it records and the rest once it is finished, into the folder path on that computer, nil for that computer's Downloads folder, and deleted from the phone once that computer has stored it; or uploaded to a destination while it records and deleted from the phone once the receiver has stored it.
 enum RecordingTarget: Codable, Hashable {
     case phone
     case wired(path: String?)

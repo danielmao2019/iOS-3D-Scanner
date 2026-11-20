@@ -358,10 +358,14 @@ final class AppModel: ObservableObject {
         guard let selection else { preconditionFailure("recording with no config chosen") }
         userName = named ? enteredName : nil
         isStarting = true
-        // Uploading, each segment goes up as soon as the recording closes it; kept on the phone, it stays.
+        // Uploading, each segment goes up as soon as the recording closes it; by wired transfer, a computer can take it over the cable as soon as it is closed; kept on the phone, it stays.
+        let cable = self.cable
         recorder.startRecording(user: selection.user, target: selection.target, onSegment: { segment in
-            guard case .upload(let destination) = selection.target else { return }
-            DispatchQueue.main.async { Uploader.shared.uploadSegment(segment, to: destination) }
+            switch selection.target {
+            case .upload(let destination): DispatchQueue.main.async { Uploader.shared.uploadSegment(segment, to: destination) }
+            case .wired(let path): cable.add(segment, path: path)
+            case .phone: break
+            }
         }) { result in
             self.isStarting = false
             switch result {
