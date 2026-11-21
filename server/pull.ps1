@@ -1,22 +1,38 @@
-# Takes the RGBD Scanner app's Wired transfer recordings from the iPhone plugged into this computer by USB cable, while they record and once they are finished, and stores each as <folder>\<scan_id>.tar, the file server/receive.py writes, <folder> being the folder the recording's config names on this computer or, when it names none, this computer's Downloads folder. It needs nothing installed beyond Apple Devices; paste into PowerShell:
+# Takes the RGBD Scanner app's Wired transfer recordings from the iPhone plugged into this computer by USB cable, while they record and once they are finished, and stores each as <folder>\<scan_id>.tar, the file server/receive.py writes, <folder> being the folder the recording's config names on this computer or, when it names none, this computer's Downloads folder, and needing free space for the recording plus one segment, about 64 MB. It needs nothing installed beyond Apple Devices; paste into PowerShell:
 #   irm https://raw.githubusercontent.com/danielmao2019/iOS-3D-Scanner/main/server/pull.ps1 | iex
-# It runs until Ctrl+C, waiting while the phone is unplugged or the app is off screen.
+# It runs until Ctrl+C, waiting while the phone is unplugged or the app is off screen, and keeps the phone and the computer awake while it has work.
 #
-# The app (from v1.6.0) serves its Wired transfer recordings while it is on screen, on port 8765 of the phone's loopback, which this computer reaches only through usbmux, Apple's USB multiplexer: on Windows the Apple Mobile Device Service, which Apple Devices installs, at 127.0.0.1:27015; the environment variable USBMUXD_SOCKET_ADDRESS, <host>:<port>, names another. app/Sources/RGBDScanner/WiredServer.swift documents the requests. Every two seconds this script lists the recordings and fetches each file the phone holds that it does not, into <folder>\.<key>.staging\, keeping it beside <name>.sha256 only when its size and SHA-256 are those the phone recorded; a segment it keeps is acknowledged, and the phone deletes it, as the receiver acknowledges segments uploaded over Wi-Fi. Once a recording is finished and every file of it is kept, its members are written as <folder>\<scan_id>.tar, an uncompressed GNU tar holding them under <scan_id>\ in the phone's order, a frames file its segments joined, through a temporary file renamed into place; only then is the phone told the recording is stored, and it deletes it, and the staging folder is removed.
+# The app (from v1.6.0) serves its Wired transfer recordings while it is on screen, on port 8765 of the phone's loopback, which this computer reaches only through usbmux, Apple's USB multiplexer: on Windows the Apple Mobile Device Service, which Apple Devices installs, at 127.0.0.1:27015, elsewhere usbmuxd at the unix socket /var/run/usbmuxd; the environment variable USBMUXD_SOCKET_ADDRESS names another, as <host>:<port> or as UNIX:<path> for a unix socket. app/Sources/RGBDScanner/WiredServer.swift documents the requests. Every two seconds this script lists the recordings and fetches each file the phone holds that it does not, into <folder>\.<key>.staging\, keeping it beside <name>.sha256 only when its size and SHA-256 are those the phone recorded; a segment it keeps is acknowledged, and the phone deletes it, as the receiver acknowledges segments uploaded over Wi-Fi.
+#
+# Once a recording is finished and every file of it is kept, its members are written into the staging folder as <scan_id>.tar.part, an uncompressed GNU tar holding them under <scan_id>\ in the phone's order, a frames file its segments joined, and each file is deleted once its bytes are on disk in the tar, so the folder never holds more than the recording plus one file. From then on nothing more of the recording is fetched: a tar cut short resumes at the first file still staged. The complete tar is renamed <folder>\<scan_id>.tar; only then is the phone told the recording is stored, and it deletes it, and the staging folder is removed. A recording whose tar is stored but which the phone still lists, not having heard, is only told again.
+#
+# The phone locks its screen, and the app stops answering, 10 s after its last request, so while a tar is written this script lists the recordings whenever 5 s have passed without a request. On Windows, each file fetched or written into a tar resets the computer's idle-sleep timer, so the computer stays awake while there is work and may sleep while the script waits.
 & {
     $ErrorActionPreference = 'Stop'
     $PhonePort = 8765
     $ChunkBytes = 4MB
     $PollSeconds = 2
+    # How long a tar being written goes without a request to the phone, which locks its screen after 10 s.
+    $KeepAwakeSeconds = 5
     # usbmux's plist messages: a 16-byte little-endian header (total length, version 1, type 8 for a plist, tag), then an XML plist.
     $UsbmuxPlist = 8
     # Connect's result when nothing listens on the phone's port.
     $UsbmuxRefused = 3
+    # The time since this script's last request to the phone.
+    $sinceRequest = [Diagnostics.Stopwatch]::StartNew()
+    # Windows' SetThreadExecutionState, from kernel32.
+    if ($env:OS -eq 'Windows_NT') { Add-Type -Namespace PullPs1 -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);' }
 
-    function Get-UsbmuxClient {
-        $address = if ($env:USBMUXD_SOCKET_ADDRESS) { $env:USBMUXD_SOCKET_ADDRESS } else { '127.0.0.1:27015' }
+    # A stream to usbmux that owns its socket, at USBMUXD_SOCKET_ADDRESS, UNIX:<path> or <host>:<port>, by default 127.0.0.1:27015 on Windows and UNIX:/var/run/usbmuxd elsewhere.
+    function Get-UsbmuxStream {
+        $address = if ($env:USBMUXD_SOCKET_ADDRESS) { $env:USBMUXD_SOCKET_ADDRESS } elseif ($env:OS -eq 'Windows_NT') { '127.0.0.1:27015' } else { 'UNIX:/var/run/usbmuxd' }
+        if ($address.StartsWith('UNIX:')) {
+            $socket = [Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+            $socket.Connect([Net.Sockets.UnixDomainSocketEndPoint]::new($address.Substring(5)))
+            return [Net.Sockets.NetworkStream]::new($socket, $true)
+        }
         $hostName, $port = $address -split ':'
-        return New-Object System.Net.Sockets.TcpClient($hostName, [int]$port)
+        return (New-Object System.Net.Sockets.TcpClient($hostName, [int]$port)).GetStream()
     }
 
     function Read-Exactly($stream, [long]$count) {
@@ -75,21 +91,21 @@
 
     # usbmux's DeviceID of the one iPhone plugged in by USB.
     function Get-PhoneDeviceId {
-        $client = Get-UsbmuxClient
-        try { $reply = Invoke-Usbmux $client.GetStream() @{ MessageType = 'ListDevices' } } finally { $client.Close() }
+        $stream = Get-UsbmuxStream
+        try { $reply = Invoke-Usbmux $stream @{ MessageType = 'ListDevices' } } finally { $stream.Close() }
         $phones = @($reply['DeviceList'] | Where-Object { $_['Properties']['ConnectionType'] -eq 'USB' })
         if ($phones.Count -ne 1) { throw "$($phones.Count) iPhones are plugged in by USB: plug in one, unlock it and tap Trust" }
         return $phones[0]['DeviceID']
     }
 
-    # Sends one HTTP request to the app over a new usbmux connection and returns its client, stream, status and Content-Length, the body unread.
+    # Sends one HTTP request to the app over a new usbmux connection and returns its stream, status and Content-Length, the body unread.
     function Invoke-Phone($deviceId, [string]$method, [string]$path, [string]$sha256) {
-        $client = Get-UsbmuxClient
-        $stream = $client.GetStream()
+        $sinceRequest.Restart()
+        $stream = Get-UsbmuxStream
         $port = (($PhonePort -band 0xFF) -shl 8) -bor ($PhonePort -shr 8)
         $result = Invoke-Usbmux $stream @{ MessageType = 'Connect'; DeviceID = [int]$deviceId; PortNumber = [int]$port }
         if ($result['Number'] -ne 0) {
-            $client.Close()
+            $stream.Close()
             if ($result['Number'] -eq $UsbmuxRefused) { throw 'RGBD Scanner does not answer: open it on the phone, from version 1.6.0, and keep it on screen' }
             throw "usbmux cannot reach the phone: result $($result['Number'])"
         }
@@ -100,18 +116,23 @@
         $head = New-Object System.Collections.Generic.List[byte]
         while ($head.Count -lt 4 -or $head[$head.Count - 4] -ne 13 -or $head[$head.Count - 3] -ne 10 -or $head[$head.Count - 2] -ne 13 -or $head[$head.Count - 1] -ne 10) {
             $byte = $stream.ReadByte()
-            if ($byte -lt 0) { $client.Close(); throw "$method $path`: the phone closed the connection without an answer" }
+            if ($byte -lt 0) { $stream.Close(); throw "$method $path`: the phone closed the connection without an answer" }
             $head.Add([byte]$byte)
         }
         $text = [Text.Encoding]::ASCII.GetString($head.ToArray())
-        return @{ Client = $client; Stream = $stream; Status = [int]($text -split ' ')[1]; Length = [long][regex]::Match($text, '(?im)^Content-Length:\s*(\d+)').Groups[1].Value }
+        return @{ Stream = $stream; Status = [int]($text -split ' ')[1]; Length = [long][regex]::Match($text, '(?im)^Content-Length:\s*(\d+)').Groups[1].Value }
     }
 
     function Invoke-PhoneJson($deviceId, [string]$method, [string]$path, [string]$sha256) {
         $reply = Invoke-Phone $deviceId $method $path $sha256
-        try { $body = [Text.Encoding]::UTF8.GetString((Read-Exactly $reply.Stream $reply.Length)) } finally { $reply.Client.Close() }
+        try { $body = [Text.Encoding]::UTF8.GetString((Read-Exactly $reply.Stream $reply.Length)) } finally { $reply.Stream.Close() }
         if ($reply.Status -ne 200) { throw "$method $path`: the phone replied $($reply.Status): $body" }
         return $body | ConvertFrom-Json
+    }
+
+    # Resets Windows' idle-sleep timer once, with ES_SYSTEM_REQUIRED and without ES_CONTINUOUS, for each file fetched or written into a tar.
+    function Reset-IdleSleep {
+        if ($env:OS -eq 'Windows_NT') { $null = [PullPs1.Power]::SetThreadExecutionState(0x00000001) }
     }
 
     # This computer's Downloads folder, wherever the user keeps it.
@@ -148,7 +169,7 @@
             $null = $sha.TransformFinalBlock($buffer, 0, 0)
         } finally {
             $out.Close()
-            $reply.Client.Close()
+            $reply.Stream.Close()
         }
         $hex = -join ($sha.Hash | ForEach-Object { $_.ToString('x2') })
         if ($reply.Length -ne $file.size -or $hex -ne $file.sha256) {
@@ -157,7 +178,18 @@
         }
         Set-Content -LiteralPath "$kept.sha256" -Value $file.sha256 -NoNewline
         Move-Item -LiteralPath $part -Destination $kept -Force
+        Reset-IdleSleep
         return $file.size
+    }
+
+    # Fetches each file the phone holds of a recording into its staging folder, acknowledging each segment once kept, so the phone deletes it.
+    function Save-RecordingFiles($deviceId, $recording, [string]$staging, [string]$label, [hashtable]$taken) {
+        $null = New-Item -ItemType Directory -Force -Path $staging
+        foreach ($file in $recording.files) {
+            $taken[$recording.key] += Save-PhoneFile $deviceId $recording.key $file $staging
+            Write-Host -NoNewline "`r$label`: $('{0:N2}' -f ($taken[$recording.key] / 1GB)) GB taken "
+            if ($file.name -match '\.[0-9]{6}$') { $null = Invoke-PhoneJson $deviceId 'POST' "/acknowledged/$($recording.key)/$($file.name)" $file.sha256 }
+        }
     }
 
     # A GNU tar member header: the name, mode 664, the size in octal or, from 8 GiB, in base-256, the time, and the checksum.
@@ -178,30 +210,61 @@
         return ,$header
     }
 
-    # Writes a finished recording's kept files as <folder>\<scan_id>.tar, through a temporary file renamed into place.
-    function Write-RecordingTar($recording, [string]$staging, [string]$archive) {
-        $part = Join-Path (Split-Path -Parent $archive) ".$($recording.scan_id).tar.part"
-        $time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $out = [IO.File]::Create($part)
-        try {
-            foreach ($member in $recording.members) {
-                $files = if ($null -ne $member.segments) { @($member.segments) } else { @($member) }
-                $size = 0L
-                foreach ($file in $files) { $size += $file.size }
-                $out.Write((New-TarHeader "$($recording.scan_id)/$($member.name)" $size $time), 0, 512)
-                foreach ($file in $files) {
-                    $in = [IO.File]::OpenRead((Join-Path $staging $file.name))
-                    try { $in.CopyTo($out, $ChunkBytes) } finally { $in.Close() }
-                }
-                $out.Write((New-Object byte[] 512), 0, (512 - $size % 512) % 512)
+    # Writes a finished recording's staged files as <staging>\<scan_id>.tar.part, deleting each file, with its SHA-256, once its bytes are on disk in the tar, and keeping the phone awake meanwhile. A tar cut short resumes at the first file still staged: every file before it is on disk in the tar, which is cut back to their end, past whatever was written after them.
+    function Write-RecordingTar($deviceId, $recording, [string]$staging, [string]$part) {
+        # Each file in the tar's order with where its bytes end in the tar and, for the first file of a member, the member and its size.
+        $pieces = @()
+        $end = 0L
+        foreach ($member in $recording.members) {
+            $files = if ($null -ne $member.segments) { @($member.segments) } else { @($member) }
+            $size = 0L
+            foreach ($file in $files) { $size += $file.size }
+            $end += (512 - $end % 512) % 512 + 512
+            $starts = $member
+            foreach ($file in $files) {
+                $end += $file.size
+                $pieces += @{ Name = $file.name; Member = $starts; Size = $size; End = $end }
+                $starts = $null
             }
-            # Two zero blocks end the archive, padded to whole 10240-byte records as Python's tarfile writes it.
+        }
+        $resume = 0
+        while ($resume -lt $pieces.Count -and -not (Test-Path -LiteralPath (Join-Path $staging $pieces[$resume].Name))) { $resume++ }
+        for ($i = $resume + 1; $i -lt $pieces.Count; $i++) {
+            if (-not (Test-Path -LiteralPath (Join-Path $staging $pieces[$i].Name))) { throw "$($recording.scan_id): its tar resumes at $($pieces[$resume].Name), but $($pieces[$i].Name) after it is missing from $staging" }
+        }
+        $offset = if ($resume -gt 0) { $pieces[$resume - 1].End } else { 0L }
+        $time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $out = [IO.File]::Open($part, 'OpenOrCreate', 'Write')
+        try {
+            if ($out.Length -lt $offset) { throw "$part is $($out.Length) bytes, but the files already moved into it from $staging end at byte $offset" }
+            $out.SetLength($offset)
+            $out.Position = $offset
+            for ($i = $resume; $i -lt $pieces.Count; $i++) {
+                $piece = $pieces[$i]
+                if ($piece.Member) {
+                    $out.Write((New-Object byte[] 512), 0, (512 - $out.Length % 512) % 512)
+                    $out.Write((New-TarHeader "$($recording.scan_id)/$($piece.Member.name)" $piece.Size $time), 0, 512)
+                }
+                $staged = Join-Path $staging $piece.Name
+                $in = [IO.File]::OpenRead($staged)
+                try { $in.CopyTo($out, $ChunkBytes) } finally { $in.Close() }
+                $out.Flush($true)
+                Remove-Item -LiteralPath $staged
+                Remove-Item -LiteralPath "$staged.sha256"
+                Reset-IdleSleep
+                if ($sinceRequest.Elapsed.TotalSeconds -ge $KeepAwakeSeconds) {
+                    # The one error let pass: a phone that does not answer leaves the tar to finish, the phone being needed again only to hear the recording is stored, which waits for it.
+                    try { $null = Invoke-PhoneJson $deviceId 'GET' '/recordings' $null } catch { }
+                }
+            }
+            # The last member's padding, then two zero blocks end the archive, padded to whole 10240-byte records as Python's tarfile writes it.
+            $out.Write((New-Object byte[] 512), 0, (512 - $out.Length % 512) % 512)
             $out.Write((New-Object byte[] 1024), 0, 1024)
             $out.Write((New-Object byte[] 10240), 0, (10240 - $out.Length % 10240) % 10240)
+            $out.Flush($true)
         } finally {
             $out.Close()
         }
-        Move-Item -LiteralPath $part -Destination $archive
     }
 
     # Takes what the phone holds of one recording: its files, each segment acknowledged once kept, and, once it is finished, its tar, after which the phone deletes it.
@@ -210,21 +273,24 @@
         $folder = if ($recording.path) { $recording.path } else { Get-DownloadsFolder }
         if (-not (Test-Path -LiteralPath $folder -PathType Container)) { throw "$label goes to $folder, which does not exist on this computer: create it, or change the Wired transfer folder on the phone" }
         $staging = Join-Path $folder ".$($recording.key).staging"
-        $null = New-Item -ItemType Directory -Force -Path $staging
-        foreach ($file in $recording.files) {
-            $taken[$recording.key] += Save-PhoneFile $deviceId $recording.key $file $staging
-            Write-Host -NoNewline "`r$label`: $('{0:N2}' -f ($taken[$recording.key] / 1GB)) GB taken "
-            if ($file.name -match '\.[0-9]{6}$') { $null = Invoke-PhoneJson $deviceId 'POST' "/acknowledged/$($recording.key)/$($file.name)" $file.sha256 }
+        if ($null -eq $recording.members) {
+            Save-RecordingFiles $deviceId $recording $staging $label $taken
+            return
         }
-        if ($null -eq $recording.members) { return }
         $archive = Join-Path $folder "$($recording.scan_id).tar"
+        $part = Join-Path $staging "$($recording.scan_id).tar.part"
         if (-not (Test-Path -LiteralPath $archive)) {
-            foreach ($member in $recording.members) {
-                foreach ($file in $(if ($null -ne $member.segments) { @($member.segments) } else { @($member) })) {
-                    if (-not (Test-Kept $staging $file)) { throw "$label lacks $($file.name), which neither this computer nor the phone holds" }
+            # Once its tar is begun, nothing more of the recording is fetched.
+            if (-not (Test-Path -LiteralPath $part)) {
+                Save-RecordingFiles $deviceId $recording $staging $label $taken
+                foreach ($member in $recording.members) {
+                    foreach ($file in $(if ($null -ne $member.segments) { @($member.segments) } else { @($member) })) {
+                        if (-not (Test-Kept $staging $file)) { throw "$label lacks $($file.name), which neither this computer nor the phone holds" }
+                    }
                 }
             }
-            Write-RecordingTar $recording $staging $archive
+            Write-RecordingTar $deviceId $recording $staging $part
+            Move-Item -LiteralPath $part -Destination $archive
             Write-Host "`n$label`: stored as $archive"
         }
         $null = Invoke-PhoneJson $deviceId 'POST' "/stored/$($recording.scan_id)" $null
