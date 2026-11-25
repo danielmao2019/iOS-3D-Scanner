@@ -1,4 +1,4 @@
-"""Checks an RGBD Scanner recording (.tar, format_version "4.0" to "4.8" or "5.0.0" to "5.2") and prints its statistics, then each check as PASS or FAIL.
+"""Checks an RGBD Scanner recording (.tar, format 1.4.0 to 1.4.8, 1.5.0.0 to 1.5.2 or 1.6.0) and prints its statistics, then each check as PASS or FAIL.
 
 Usage: python tools/inspect_recording.py <recording.tar>
 """
@@ -46,7 +46,7 @@ CHUNK = 8 << 20
 
 
 def metres(depth: np.ndarray) -> np.ndarray:
-    """Depth readings, Float32 or a 4.8 recording's Float16 metres as recorded, as float32 metres."""
+    """Depth readings, Float32 or a 1.4.8 recording's Float16 metres as recorded, as float32 metres."""
     assert depth.dtype in (np.float32, np.float16), depth.dtype
     return depth.astype(np.float32, copy=False)
 
@@ -255,7 +255,7 @@ def calibration_complete(calibration: Dict) -> bool:
 
 
 def measured_frame_members(rec: Recording) -> Dict[str, Tuple[int, str]]:
-    """Each format 4.8 frame member's size in the tar and the SHA-256 of its bytes, read from inside the tar CHUNK bytes at a time, by file name."""
+    """Each format 1.4.8 frame member's size in the tar and the SHA-256 of its bytes, read from inside the tar CHUNK bytes at a time, by file name."""
     measured = {}
     with tarfile.open(rec.path, "r:") as tar:
         for member in tar.getmembers():
@@ -270,21 +270,21 @@ def measured_frame_members(rec: Recording) -> Dict[str, Tuple[int, str]]:
 
 
 def frame_counts_match(rec: Recording, measured: Dict[str, Tuple[int, str]]) -> bool:
-    """Whether a format 4.8 recording's color_frames.bin, depth_frames.bin and rear depth_frames_confidence.bin each hold, by their measured size in the tar, their frames metadata's frame_count frames, one per frames entry: frame_count frames' bytes, or for an encoded recording (from 5.0.2) the frames' compressed sizes summed."""
+    """Whether a format 1.4.8 recording's color_frames.bin, depth_frames.bin and rear depth_frames_confidence.bin each hold, by their measured size in the tar, their frames metadata's frame_count frames, one per frames entry: frame_count frames' bytes, or for an encoded recording (from 1.5.0.2) the frames' compressed sizes summed."""
     color, depth = rec.color_frames_metadata, rec.depth_frames_metadata
     files = [(color["file"], rec.color, color, "compressed_size"), (depth["file"], rec.depth, depth, "compressed_size")] + ([(depth["confidence"]["file"], rec.confidence, depth, "confidence_compressed_size")] if rec.confidence is not None else [])
     return all(measured[name][0] == (sum(f[size_key] for f in metadata["frames"]) if rec.encoded else frames.nbytes) and frames.shape[0] == metadata["frame_count"] == len(metadata["frames"]) for name, frames, metadata, size_key in files)
 
 
 def frames_decode_to_raw(rec: Recording) -> bool:
-    """Whether every color frame, depth map and rear confidence map of a recording with encoded frames (from 5.0.2) decodes to the bytes the app hashed before encoding it: each decoded frame's SHA-256 is its frames entry's raw_sha256."""
+    """Whether every color frame, depth map and rear confidence map of a recording with encoded frames (from 1.5.0.2) decodes to the bytes the app hashed before encoding it: each decoded frame's SHA-256 is its frames entry's raw_sha256."""
     color, depth = rec.color_frames_metadata["frames"], rec.depth_frames_metadata["frames"]
     streams = [(rec.color, color, "raw_sha256"), (rec.depth, depth, "raw_sha256")] + ([(rec.confidence, depth, "confidence_raw_sha256")] if rec.confidence is not None else [])
     return all(hashlib.sha256(np.ascontiguousarray(frames[n]).tobytes()).hexdigest() == entry[key] for frames, entries, key in streams for n, entry in enumerate(entries))
 
 
 def stored_ratios(rec: Recording) -> str:
-    """How many times smaller than its frames' raw bytes each frame member of a recording with encoded frames (from 5.0.2) is stored."""
+    """How many times smaller than its frames' raw bytes each frame member of a recording with encoded frames (from 1.5.0.2) is stored."""
     color, depth = rec.color_frames_metadata, rec.depth_frames_metadata
     members = [(color["file"], len(rec.color) * rec.color.shape[1] * rec.color.shape[2]), (depth["file"], rec.depth.nbytes)] + ([(depth["confidence"]["file"], rec.confidence.nbytes)] if rec.confidence is not None else [])
     raw, stored = sum(r for _, r in members), sum(rec.frame_files[name][0] for name, _ in members)
@@ -314,8 +314,8 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     rec = Recording(tar_path)
     meta = rec.meta
     rear = rec.camera == "rear"
-    # Format 4.8 holds JSON files and frame files; 4.0 to 4.7 tables, its meta the metadata.json.
-    format_4_8 = rec.format_minor >= 8
+    # Format 1.4.8 holds JSON files and frame files; 1.4.0 to 1.4.7 tables, its meta the metadata.json.
+    format_1_4_8 = rec.format_patch >= 8
     h, w = rec.depth.shape[1:]
     grads = [luma_gradient(rec, i) for i in range(rec.color.shape[0])]
 
@@ -334,7 +334,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     spatial = spatial_alignment(rec)
     coverage = is_valid.mean(axis=(1, 2)) * 100
 
-    if format_4_8:
+    if format_1_4_8:
         scan = rec.scan_metadata
         print(f"phone {scan['phone_model']} iOS {scan['ios_version']} camera {rec.camera}")
         print(f"color {rec.color_width}x{rec.color_height} 420f {rec.ycbcr_matrix}, depth {w}x{h} {rec.depth_frames_metadata['pixel_format']}")
@@ -347,11 +347,11 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     print(f"depth frames outside the color stream's time span: {len(rec.depths) - len(depth_in_span)}")
     print(f"upright rotations used: {sorted({r['upright_rotation_deg'] for r in rec.colors})}; |gravity| mean {np.linalg.norm(gravity, axis=1).mean():.3f} g")
     print(f"fx: color {fx_range(rec.colors)}, depth {fx_range(rec.depths)}")
-    if rec.format_minor >= 3:
+    if rec.format_patch >= 3:
         exposure = np.array([float(r["exposure_duration_s"]) for r in rec.colors])
         line = f"color exposure_duration_s {exposure.min() * 1e3:.3f}..{exposure.max() * 1e3:.3f} ms, median {np.median(exposure) * 1e3:.3f} ms"
-        # Minors 3 to 7 also recorded each color frame's lens position and when the app received it.
-        if not format_4_8:
+        # Formats 1.4.3 to 1.4.7 also recorded each color frame's lens position and when the app received it.
+        if not format_1_4_8:
             lens = np.array([float(r["lens_position"]) for r in rec.colors])
             latency = np.array([float(r["received_ts"]) - float(r["timestamp"]) for r in rec.colors])
             line += f"; lens_position {lens.min():.3f}..{lens.max():.3f}; delivery latency received_ts - timestamp median {np.median(latency) * 1e3:.1f} ms, max {latency.max() * 1e3:.1f} ms"
@@ -363,7 +363,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         print("confidence of valid pixels: " + " ".join(f"{level}:{(rec.confidence[is_valid] == level).mean() * 100:.1f}%" for level in range(3)))
         states = Counter(r["tracking_state"] for r in rec.colors)
         print("tracking state of color frames: " + " ".join(f"{state}:{n / len(rec.colors) * 100:.1f}%" for state, n in sorted(states.items())))
-    if not format_4_8:
+    if not format_1_4_8:
         bytes_per_row = sorted({int(r["bytes_per_row"]) for r in rec.depths})
         print(f"depth map bytes per row: {bytes_per_row} (packed: {w * meta['depth_bytes_per_pixel']})")
     print("edge alignment of depth to color frame at offset: " + " ".join(f"{o:+d}:{s:.3f}" for o, s in offsets.items()))
@@ -372,7 +372,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
     print(f"spatial alignment of depth to its same-instant color frame through their intrinsics, over {spatial['frames']} frames: residual scale k median {spatial['k_median']:.4f} (IQR {spatial['k_iqr']:.4f}), shift median dx {spatial['dx_median']:+.3f} (95% {dx_low:+.3f}..{dx_high:+.3f}) dy {spatial['dy_median']:+.3f} (95% {dy_low:+.3f}..{dy_high:+.3f}) depth px, depth edge fattening median x {spatial['fattening_x_median']:+.3f} y {spatial['fattening_y_median']:+.3f} depth px, edge correlation median {spatial['corr_median']:.3f}")
 
     has_intrinsics = all(r[k] for r in rec.colors + rec.depths for k in INTRINSICS)
-    if format_4_8:
+    if format_1_4_8:
         measured = measured_frame_members(rec)
         checks = {
             "color_frames.bin, depth_frames.bin and the rear's depth_frames_confidence.bin each hold, by their size in the tar, frame_count frames, one per frames entry": frame_counts_match(rec, measured),
@@ -380,7 +380,7 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         if all(sha256 is not None for _, sha256 in rec.frame_files.values()):
             checks["each frame member's size and SHA-256, read from inside the tar, are those its frames metadata records"] = measured == rec.frame_files
         else:
-            # 5.0.3 records each frame member's size only; frames_decode_to_raw checks its every byte.
+            # 1.5.0.3 records each frame member's size only; frames_decode_to_raw checks its every byte.
             checks["each frame member's size, read from inside the tar, is the one its frames metadata records"] = {name: size for name, (size, _) in measured.items()} == {name: size for name, (size, _) in rec.frame_files.items()}
         if rec.encoded:
             print("stored smaller than raw by: " + stored_ratios(rec))
@@ -397,39 +397,39 @@ def inspect(tar_path: Path) -> Dict[str, bool]:
         "depth aligns best with its same-instant color frame": best_offset == 0,
         "depth edges land on the same-instant color frame's edges through the two frames' intrinsics: median residual scale within 0.005 of 1 and median shifts within 0.15 depth px, over at least 10 frames": spatial["aligned"],
     }
-    if not format_4_8:
+    if not format_1_4_8:
         checks["metadata's depth_filtering_enabled is false"] = meta["depth_filtering_enabled"] is False
     if not rear:
         checks["every depth map unfiltered"] = all(r["filtered"] == "0" for r in rec.depths)
     checks["every color and depth frame has intrinsics"] = has_intrinsics
-    if format_4_8:
+    if format_1_4_8:
         checks["color_intrinsics.json and depth_intrinsics.json have one frames entry per frame"] = len(rec.color_intrinsics["frames"]) == rec.color.shape[0] and len(rec.depth_intrinsics["frames"]) == rec.depth.shape[0]
     if rear:
         checks["every depth frame's intrinsics are its same-instant color frame's carried as ARKit's depth grid lies on the color image, f * s, cx * sx and (cy + 0.5) * sy - 0.5"] = has_intrinsics and carried_intrinsics_match(rec, arkit_carried)
-    elif format_4_8:
+    elif format_1_4_8:
         checks["every depth frame's intrinsics are its same-instant color frame's scaled to the depth map, f * s and c * s, both measured from the frame's corner"] = has_intrinsics and carried_intrinsics_match(rec, plainly_scaled)
     else:
         lines_match = len(rec.calibrations) == len(rec.depths) and all(line["index"] == int(d["index"]) and abs(line["timestamp"] - float(d["timestamp"])) < SAME_INSTANT_S for line, d in zip(rec.calibrations, rec.depths, strict=True))
         checks["calibration.jsonl has one line per depth frame, with its index and timestamp"] = lines_match
         checks["every depth frame's intrinsics are its calibration's scaled to the depth map, f * s and c * s"] = lines_match and has_intrinsics and scaled_to_depth(rec)
-    if not format_4_8:
+    if not format_1_4_8:
         checks["every depth map has its bytes per row, at least a packed row"] = all(r["bytes_per_row"] and int(r["bytes_per_row"]) >= w * meta["depth_bytes_per_pixel"] for r in rec.depths) and all(r["bytes_per_row"] == "" for r in rec.depth_rows if r["index"] == "-1")
         checks["every frame has orientation and gravity"] = all(r[k] for r in rec.colors + rec.depths for k in ORIENTATION)
     else:
         checks["every color frame has orientation and gravity"] = all(r[k] for r in rec.colors for k in ORIENTATION)
-    if format_4_8 and not rear:
+    if format_1_4_8 and not rear:
         # The reader has checked that no frame is in two runs.
         checks["every color and depth frame has a distortion and every depth frame a depth_to_color, the runs covering each frame exactly once"] = all(x is not None for x in rec.color_distortions + rec.depth_distortions + rec.depth_to_color)
-    if rear and format_4_8:
+    if rear and format_1_4_8:
         checks["extrinsics.json has one camera pose per color frame, each a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = len(rec.extrinsics["camera_poses"]) == rec.color.shape[0] and all(is_pose(rec, r) for r in rec.colors)
         checks["depth_frames_confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
     elif rear:
         checks["every color frame has a tracking state and a world_from_camera with an orthonormal rotation of determinant +1"] = all(is_pose(rec, r) for r in rec.colors)
         checks["confidence.bin holds one map per depth map, each level 0, 1 or 2"] = rec.confidence.shape == rec.depth.shape and bool(np.all(rec.confidence <= HIGH_CONFIDENCE))
-    # Apps 4.4 to 4.6 recorded it.
-    if rear and 4 <= rec.format_minor <= 6:
+    # Apps 1.4.4 to 1.4.6 recorded it.
+    if rear and 4 <= rec.format_patch <= 6:
         checks["metadata has avfoundation_calibration with both lens distortion lookup tables, of one length, and its reference dimensions"] = "avfoundation_calibration" in meta and calibration_complete(meta["avfoundation_calibration"])
-    if format_4_8:
+    if format_1_4_8:
         checks["scan_metadata.json has exactly the format's keys, a name and a positive duration"] = set(rec.scan_metadata) == scan_metadata_keys(rec.format_version) and bool(rec.scan_metadata["name"]) and rec.scan_metadata["duration_s"] > 0
     else:
         checks["metadata has a name and a duration"] = all(k in meta for k in ("name", "named_by_user", "duration_s")) and bool(meta["name"]) and meta["duration_s"] > 0

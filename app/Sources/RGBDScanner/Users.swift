@@ -6,19 +6,25 @@ struct UploadDestination: Codable, Hashable {
     var dataRoot: String
 }
 
-// Where a recording goes: kept on this phone, never uploaded, or uploaded to a destination while it records and deleted from the phone once the receiver has stored it.
+// Where a recording goes: kept on this phone, never uploaded; taken by a computer it is plugged into by cable (server/pull.ps1), its segments while it records and the rest once it is finished, into the folder path on that computer, nil for that computer's Downloads folder, and deleted from the phone once that computer has stored it; or uploaded to a destination while it records and deleted from the phone once the receiver has stored it.
 enum RecordingTarget: Codable, Hashable {
     case phone
+    case wired(path: String?)
     case upload(destination: UploadDestination)
 
-    private enum CodingKeys: String, CodingKey { case phone, upload }
+    private enum CodingKeys: String, CodingKey { case phone, wired, upload }
+    private enum WiredCodingKeys: String, CodingKey { case path }
     private enum UploadCodingKeys: String, CodingKey { case destination }
 
-    // 5.0.3 and 5.1 saved an upload by its server alone, which no receiver from 5.2 takes without a data root: such a recording stays on this phone.
+    // 1.5.0.3 and 1.5.1 saved an upload by its server alone, which no receiver from 1.5.2 takes without a data root: such a recording stays on this phone.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         if container.contains(.phone) {
             self = .phone
+            return
+        }
+        if container.contains(.wired) {
+            self = .wired(path: try container.nestedContainer(keyedBy: WiredCodingKeys.self, forKey: .wired).decodeIfPresent(String.self, forKey: .path))
             return
         }
         let upload = try container.nestedContainer(keyedBy: UploadCodingKeys.self, forKey: .upload)
@@ -75,23 +81,35 @@ enum UsersFile {
 // A user: a name grouping its configs; there is no sign-in.
 struct ScannerUser: Identifiable {
     let name: String
-    // Keeping recordings on this phone, then uploading to those server/users.json gives it, and to those added on this phone, which can be removed.
+    // Keeping recordings on this phone, then wired transfer, into the folder the user set, then uploading to those server/users.json gives it, and to those added on this phone, which can be removed.
     let configs: [RecordingTarget]
     let added: [UploadDestination]
     var id: String { name }
 }
 
-// The users with their configs: server/users.json's, and those added on this phone, saved in UserDefaults.
+// The users with their configs: server/users.json's, and those added on this phone and each user's wired transfer folder, saved in UserDefaults.
 final class UserStore: ObservableObject {
     // By user.
     @Published private var added: [String: [UploadDestination]]
+    // By user; a user with none has the computer's Downloads folder.
+    @Published private var wiredPaths: [String: String]
     private static let key = "addedConfigs"
+    private static let wiredPathsKey = "wiredPaths"
 
     init() {
         added = UserDefaults.standard.data(forKey: Self.key).flatMap { try? JSONDecoder().decode([String: [UploadDestination]].self, from: $0) } ?? [:]
+        wiredPaths = UserDefaults.standard.dictionary(forKey: Self.wiredPathsKey) as? [String: String] ?? [:]
     }
 
-    var users: [ScannerUser] { UsersFile.users.map { ScannerUser(name: $0.name, configs: [.phone] + $0.configs.map { .upload(destination: $0) }, added: added[$0.name] ?? []) } }
+    var users: [ScannerUser] { UsersFile.users.map { ScannerUser(name: $0.name, configs: [.phone, .wired(path: wiredPaths[$0.name])] + $0.configs.map { .upload(destination: $0) }, added: added[$0.name] ?? []) } }
+
+    // The folder on the computer the user's wired transfer recordings go to; nil for the computer's Downloads folder.
+    func wiredPath(of user: String) -> String? { wiredPaths[user] }
+
+    func setWiredPath(_ path: String?, of user: String) {
+        wiredPaths[user] = path
+        UserDefaults.standard.set(wiredPaths, forKey: Self.wiredPathsKey)
+    }
 
     func add(_ config: UploadDestination, to user: String) {
         added[user, default: []].append(config)
@@ -114,6 +132,8 @@ struct ConfigSelectionView: View {
     @ObservedObject var store: UserStore
     // The user a config is being added to.
     @State private var addingTo: String?
+    // The user whose wired transfer folder is being changed.
+    @State private var changingFolderOf: String?
 
     var body: some View {
         NavigationStack {
@@ -122,7 +142,15 @@ struct ConfigSelectionView: View {
                     Section(user.name) {
                         // Two configs of one user may be equal, so they are told apart by position.
                         ForEach(Array(user.configs.enumerated()), id: \.offset) { _, config in
-                            Button { model.select(user: user.name, target: config) } label: { TargetLabel(target: config) }
+                            HStack {
+                                Button { model.select(user: user.name, target: config) } label: { TargetLabel(target: config) }
+                                if case .wired = config {
+                                    Spacer()
+                                    Button("Folder") { changingFolderOf = user.name }
+                                }
+                            }
+                            // Two buttons in one row each take their own taps.
+                            .buttonStyle(.borderless)
                         }
                         ForEach(Array(user.added.enumerated()), id: \.offset) { _, config in
                             Button { model.select(user: user.name, target: .upload(destination: config)) } label: { TargetLabel(target: .upload(destination: config)) }
@@ -135,6 +163,9 @@ struct ConfigSelectionView: View {
             .navigationTitle("Choose a config")
             .sheet(isPresented: Binding(get: { addingTo != nil }, set: { if !$0 { addingTo = nil } })) {
                 if let user = addingTo { AddConfigView(user: user) { store.add($0, to: user) } }
+            }
+            .sheet(isPresented: Binding(get: { changingFolderOf != nil }, set: { if !$0 { changingFolderOf = nil } })) {
+                if let user = changingFolderOf { WiredFolderView(user: user, path: store.wiredPath(of: user) ?? "") { store.setWiredPath($0, of: user) } }
             }
         }
     }
@@ -176,7 +207,40 @@ struct AddConfigView: View {
     }
 }
 
-// A config as the selection page shows it: This phone, or the server's name, then the data root.
+// The folder on the computer that a user's wired transfer recordings go to: a path, written as that computer writes it, or none for its Downloads folder.
+struct WiredFolderView: View {
+    let user: String
+    @State var path: String
+    let save: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var trimmedPath: String { path.trimmingCharacters(in: .whitespaces) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Downloads folder", text: $path)
+                        .autocorrectionDisabled().textInputAutocapitalization(.never)
+                } footer: {
+                    Text("A folder on the computer, such as C:\\Users\\you\\scans or /Users/you/scans, which must already exist there. Leave it empty for the computer's Downloads folder. Recordings already made keep the folder they were made with.")
+                }
+            }
+            .navigationTitle("Wired transfer folder for \(user)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save(trimmedPath.isEmpty ? nil : trimmedPath)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A config as the selection page shows it: This phone, Wired transfer, or the server's name, then where its recordings go.
 struct TargetLabel: View {
     let target: RecordingTarget
 
@@ -192,6 +256,7 @@ extension RecordingTarget {
     var title: String {
         switch self {
         case .phone: return "This phone"
+        case .wired: return "Wired transfer"
         case .upload(let destination): return destination.server
         }
     }
@@ -199,6 +264,7 @@ extension RecordingTarget {
     var detail: String {
         switch self {
         case .phone: return "kept here, not uploaded"
+        case .wired(let path): return "by cable to \(path ?? "the computer's Downloads folder")"
         case .upload(let destination): return destination.dataRoot
         }
     }
